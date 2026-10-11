@@ -1,0 +1,182 @@
+name: gbrain
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app-environment: &app-environment
+  GBRAIN_ENVIRONMENT: ${GBRAIN_ENVIRONMENT:-development}
+  GBRAIN_LOG_LEVEL: ${GBRAIN_LOG_LEVEL:-INFO}
+  GBRAIN_PUBLIC_URL: ${GBRAIN_PUBLIC_URL:-http://localhost:8000}
+  GBRAIN_DEMO_MODE: ${GBRAIN_DEMO_MODE:-false}
+  GBRAIN_DATA_DIR: /var/lib/gbrain/data
+  GBRAIN_CACHE_DIR: /var/lib/gbrain/cache
+  GBRAIN_IMPORT_DIR: /var/lib/gbrain/import
+  GBRAIN_BACKUP_DIR: /var/lib/gbrain/backup
+  GBRAIN_FRONTEND_DIR: /app/frontend/dist
+  GBRAIN_POSTGRES_HOST: postgres
+  GBRAIN_POSTGRES_PORT: "5432"
+  GBRAIN_POSTGRES_DB: ${POSTGRES_DB:-gbrain}
+  GBRAIN_POSTGRES_USER: ${POSTGRES_USER:-gbrain}
+  GBRAIN_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+  GBRAIN_AUTH_SECRET_FILE: /run/secrets/auth_secret
+  GBRAIN_SESSION_TTL_SECONDS: ${GBRAIN_SESSION_TTL_SECONDS:-43200}
+  GBRAIN_SESSION_SECURE_COOKIE: ${GBRAIN_SESSION_SECURE_COOKIE:-false}
+  GBRAIN_NEO4J_URI: bolt://neo4j:7687
+  GBRAIN_NEO4J_USER: neo4j
+  GBRAIN_NEO4J_PASSWORD_FILE: /run/secrets/neo4j_password
+  GBRAIN_NEO4J_DATABASE: neo4j
+  GBRAIN_WORKER_CONCURRENCY: "1"
+
+x-app-volumes: &app-volumes
+  - type: bind
+    source: ${DATA_DIR:-./runtime/data}
+    target: /var/lib/gbrain/data
+  - type: bind
+    source: ${CACHE_DIR:-./runtime/cache}
+    target: /var/lib/gbrain/cache
+  - type: bind
+    source: ${IMPORT_DIR:-./runtime/import}
+    target: /var/lib/gbrain/import
+    read_only: true
+  - type: bind
+    source: ${BACKUP_DIR:-./runtime/backup}
+    target: /var/lib/gbrain/backup
+
+services:
+  app:
+    profiles: [ "compact" ]
+    image: gbrain:${GBRAIN_IMAGE_TAG:-0.1.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: [ "web" ]
+    environment: *app-environment
+    secrets:
+      - postgres_password
+      - auth_secret
+      - neo4j_password
+    volumes: *app-volumes
+    ports:
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8000}:8000"
+    networks:
+      - edge
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: 512m
+    cpus: 0.50
+    init: true
+    restart: unless-stopped
+    logging: *default-logging
+
+  worker:
+    profiles: [ "compact" ]
+    image: gbrain:${GBRAIN_IMAGE_TAG:-0.1.0}
+    command: [ "worker" ]
+    environment: *app-environment
+    secrets:
+      - postgres_password
+      - auth_secret
+      - neo4j_password
+    volumes: *app-volumes
+    networks:
+      - backend
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import os; os.kill(1, 0)" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 1024m
+    cpus: 1.00
+    init: true
+    restart: unless-stopped
+    logging: *default-logging
+
+  postgres:
+    profiles: [ "compact" ]
+    image: postgres:16.10-bookworm@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gbrain}
+      POSTGRES_USER: ${POSTGRES_USER:-gbrain}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 1.00
+    shm_size: 128m
+    restart: unless-stopped
+    logging: *default-logging
+
+  neo4j:
+    profiles: [ "compact" ]
+    image: neo4j:5.26.12-community@sha256:9f75e8df4325a24f00fdd7a8c0bcce650a58375049b1058e496e8b43d6c36b37
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - export NEO4J_AUTH="neo4j/$$(cat /run/secrets/neo4j_password)"; exec /startup/docker-entrypoint.sh neo4j
+    environment:
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_server_default__listen__address: 0.0.0.0
+    secrets:
+      - neo4j_password
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - backend
+    healthcheck:
+      test: [ "CMD-SHELL", "cypher-shell -u neo4j -p \"$$(cat /run/secrets/neo4j_password)\" 'RETURN 1' >/dev/null 2>&1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    mem_limit: 1536m
+    cpus: 1.50
+    restart: unless-stopped
+    logging: *default-logging
+
+secrets:
+  postgres_password:
+    environment: GBRAIN_POSTGRES_PASSWORD
+  auth_secret:
+    environment: GBRAIN_AUTH_SECRET
+  neo4j_password:
+    environment: GBRAIN_NEO4J_PASSWORD
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  edge:
+  backend:
+    internal: true

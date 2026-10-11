@@ -1,0 +1,1 @@
+"""Adattatori infrastrutturali GBrain."""
