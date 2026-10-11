@@ -80,8 +80,11 @@ class GmailUnitOfWork(Protocol):
         account_id: str,
         messages: Sequence[NormalizedGmailMessage],
         checkpoint: GmailCheckpointState,
+        *,
+        removed_external_ids: frozenset[str] = frozenset(),
+        out_of_scope_external_ids: frozenset[str] = frozenset(),
     ) -> tuple[GmailPersistOutcome, ...]:
-        """Persiste batch e checkpoint nella stessa transazione durevole."""
+        """Persiste batch, stati sorgente e checkpoint nella stessa transazione durevole."""
 
     def mark_reconciliation_required(self, checkpoint: GmailCheckpointState) -> None: ...
 
@@ -235,60 +238,60 @@ class GmailSyncEngine:
         checkpoint: GmailCheckpointState,
         budget: RequestBudget,
     ) -> GmailSyncResult:
+        # La pagina è il confine di commit. Ridurla al batch massimo evita di
+        # avanzare un page token prima che tutti gli elementi della pagina siano durevoli.
+        effective_selection = GmailSelection(
+            after=selection.after,
+            before=selection.before,
+            limit=selection.limit,
+            page_size=min(selection.page_size, self._batch_size),
+        )
         cursor = GmailCursor(checkpoint.page_token) if checkpoint.page_token else None
-        batch: list[NormalizedGmailMessage] = []
         counters = _Counters()
         state = PageState.COMPLETE
         current_checkpoint = checkpoint
         try:
             while True:
-                page = self._connector.enumerate_page(selection, cursor, budget)
+                page = self._connector.enumerate_page(effective_selection, cursor, budget)
                 counters.pages += 1
                 state = page.state
+                page_messages: list[NormalizedGmailMessage] = []
+                out_of_scope_ids: set[str] = set()
                 for locator in page.items:
                     try:
-                        normalized = self._connector.normalize_item(
-                            self._connector.fetch_item(locator, budget)
+                        page_messages.append(
+                            self._connector.normalize_item(
+                                self._connector.fetch_item(locator, budget)
+                            )
                         )
                     except ConnectorError as exc:
                         if exc.category == ConnectorErrorCategory.PERIMETER:
                             counters.rejected += 1
+                            out_of_scope_ids.add(locator.message_id)
                             continue
                         raise
-                    batch.append(normalized)
-                    if len(batch) >= self._batch_size:
-                        current_checkpoint = _checkpoint_after_page(
-                            current_checkpoint,
-                            selection,
-                            page.next_cursor,
-                            batch,
-                            self._connector._now(),
-                        )
-                        self._commit_batch(batch, current_checkpoint, counters)
-                        batch = []
-                cursor = page.next_cursor
-                if cursor is None:
-                    if batch:
-                        current_checkpoint = _checkpoint_after_page(
-                            current_checkpoint,
-                            selection,
-                            None,
-                            batch,
-                            self._connector._now(),
-                        )
-                        self._commit_batch(batch, current_checkpoint, counters)
-                    break
-        except BudgetExhaustedError:
-            state = PageState.PARTIAL_BUDGET
-            if batch:
                 current_checkpoint = _checkpoint_after_page(
                     current_checkpoint,
-                    selection,
-                    cursor,
-                    batch,
+                    effective_selection,
+                    page.next_cursor,
+                    page_messages,
                     self._connector._now(),
                 )
-                self._commit_batch(batch, current_checkpoint, counters)
+                # Anche una pagina contenente soli rifiuti deve avanzare solo in
+                # una transazione checkpoint esplicita.
+                self._commit_batch(
+                    page_messages,
+                    current_checkpoint,
+                    counters,
+                    out_of_scope_external_ids=frozenset(out_of_scope_ids),
+                )
+                cursor = page.next_cursor
+                if cursor is None:
+                    break
+        except BudgetExhaustedError:
+            # Nessun checkpoint viene avanzato per una pagina non completamente
+            # fetchata: il replay riparte dal suo token precedente senza skip.
+            state = PageState.PARTIAL_BUDGET
         return counters.result(GmailSyncMode.FULL, state, current_checkpoint)
 
     def incremental_sync(
@@ -306,6 +309,7 @@ class GmailSyncEngine:
                 page = self._connector._gateway.list_history_page(cursor, budget)
                 counters.pages += 1
                 batch: list[NormalizedGmailMessage] = []
+                out_of_scope_ids: set[str] = set()
                 for locator in page.locators:
                     try:
                         # Ogni evento history viene rifetchato e riverificato SENT dal gateway.
@@ -314,6 +318,7 @@ class GmailSyncEngine:
                     except ConnectorError as exc:
                         if exc.category == ConnectorErrorCategory.PERIMETER:
                             counters.rejected += 1
+                            out_of_scope_ids.add(locator.message_id)
                             continue
                         if (
                             exc.category == ConnectorErrorCategory.PERMANENT
@@ -321,7 +326,7 @@ class GmailSyncEngine:
                         ):
                             continue
                         raise
-                current_checkpoint = GmailCheckpointState(
+                next_checkpoint = GmailCheckpointState(
                     account_id=checkpoint.account_id,
                     policy_id=checkpoint.policy_id,
                     history_id=page.latest_history_id,
@@ -332,11 +337,33 @@ class GmailSyncEngine:
                     reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
                     version=checkpoint.version,
                 )
-                if batch:
-                    self._commit_batch(batch, current_checkpoint, counters)
-                elif page.next_cursor is None:
-                    # Anche un history page vuoto richiede una transazione checkpoint durevole.
-                    self._uow.persist_batch(checkpoint.account_id, (), current_checkpoint)
+                # I chunk intermedi usano il checkpoint precedente: un crash li
+                # ripete idempotentemente. Solo il commit finale avanza historyId.
+                for offset in range(0, len(batch), self._batch_size):
+                    chunk = batch[offset : offset + self._batch_size]
+                    is_final_chunk = offset + self._batch_size >= len(batch)
+                    chunk_checkpoint = next_checkpoint if is_final_chunk else current_checkpoint
+                    self._commit_batch(
+                        chunk,
+                        chunk_checkpoint,
+                        counters,
+                        removed_external_ids=(
+                            frozenset(page.deleted_message_ids) if is_final_chunk else frozenset()
+                        ),
+                        out_of_scope_external_ids=(
+                            frozenset(out_of_scope_ids) if is_final_chunk else frozenset()
+                        ),
+                    )
+                if not batch:
+                    self._commit_batch(
+                        (),
+                        next_checkpoint,
+                        counters,
+                        removed_external_ids=frozenset(page.deleted_message_ids),
+                        out_of_scope_external_ids=frozenset(out_of_scope_ids),
+                    )
+                counters.removed += len(page.deleted_message_ids)
+                current_checkpoint = next_checkpoint
                 cursor = page.next_cursor
         except ConnectorError as exc:
             if exc.category != ConnectorErrorCategory.HISTORY_EXPIRED:
@@ -377,13 +404,12 @@ class GmailSyncEngine:
             counters.pages += 1
             state = page.state
             batch: list[NormalizedGmailMessage] = []
+            snapshot_index = {
+                item.external_id: item for item in self._uow.list_snapshots(checkpoint.account_id)
+            }
             for locator in page.items:
                 observed.add(locator.message_id)
-                snapshots = {
-                    snapshot.external_id: snapshot
-                    for snapshot in self._uow.list_snapshots(checkpoint.account_id)
-                }
-                snapshot = snapshots.get(locator.message_id)
+                snapshot = snapshot_index.get(locator.message_id)
                 if snapshot is not None and snapshot.state == "active":
                     counters.unchanged += 1
                     continue
@@ -417,11 +443,11 @@ class GmailSyncEngine:
             if cursor is None:
                 break
         if state == PageState.COMPLETE:
-            snapshots = self._uow.list_snapshots(checkpoint.account_id)
+            persisted_snapshots = self._uow.list_snapshots(checkpoint.account_id)
             missing = frozenset(
-                snapshot.external_id
-                for snapshot in snapshots
-                if snapshot.external_id not in observed and snapshot.state == "active"
+                item.external_id
+                for item in persisted_snapshots
+                if item.external_id not in observed and item.state == "active"
             )
             removed, excluded_preserved = self._uow.mark_missing(
                 checkpoint.account_id,
@@ -438,8 +464,17 @@ class GmailSyncEngine:
         batch: Sequence[NormalizedGmailMessage],
         checkpoint: GmailCheckpointState,
         counters: _Counters,
+        *,
+        removed_external_ids: frozenset[str] = frozenset(),
+        out_of_scope_external_ids: frozenset[str] = frozenset(),
     ) -> None:
-        outcomes = self._uow.persist_batch(checkpoint.account_id, batch, checkpoint)
+        outcomes = self._uow.persist_batch(
+            checkpoint.account_id,
+            batch,
+            checkpoint,
+            removed_external_ids=removed_external_ids,
+            out_of_scope_external_ids=out_of_scope_external_ids,
+        )
         for outcome in outcomes:
             counters.persisted += int(outcome.inserted)
             counters.revised += int(outcome.revised)
@@ -491,7 +526,9 @@ def _checkpoint_after_page(
     return GmailCheckpointState(
         account_id=checkpoint.account_id,
         policy_id=checkpoint.policy_id,
-        history_id=messages[-1].history_id or checkpoint.history_id,
+        history_id=(
+            messages[-1].history_id or checkpoint.history_id if messages else checkpoint.history_id
+        ),
         page_token=cursor.page_token if cursor else None,
         coverage_after=selection.after,
         coverage_before=selection.before,
@@ -517,6 +554,9 @@ class InMemoryGmailUnitOfWork:
         account_id: str,
         messages: Sequence[NormalizedGmailMessage],
         checkpoint: GmailCheckpointState,
+        *,
+        removed_external_ids: frozenset[str] = frozenset(),
+        out_of_scope_external_ids: frozenset[str] = frozenset(),
     ) -> tuple[GmailPersistOutcome, ...]:
         staged_messages = dict(self.messages)
         staged_revisions = dict(self.revisions)
@@ -525,8 +565,9 @@ class InMemoryGmailUnitOfWork:
         for message in messages:
             identity = (account_id, message.external_id)
             existing = staged_messages.get(identity)
-            revision_id = str(uuid.uuid5(uuid.NAMESPACE_URL, message.idempotency_key))
-            if message.idempotency_key in staged_revisions:
+            idempotency_key = message.idempotency_key_for(account_id)
+            revision_id = str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key))
+            if idempotency_key in staged_revisions:
                 outcomes.append(
                     GmailPersistOutcome(False, False, True, message.external_id, revision_id)
                 )
@@ -537,7 +578,7 @@ class InMemoryGmailUnitOfWork:
                 staged_states[identity] = "active"
                 continue
             staged_messages[identity] = message
-            staged_revisions[message.idempotency_key] = message
+            staged_revisions[idempotency_key] = message
             staged_states[identity] = "active"
             outcomes.append(
                 GmailPersistOutcome(
@@ -548,6 +589,12 @@ class InMemoryGmailUnitOfWork:
                     revision_id=revision_id,
                 )
             )
+        for external_id in removed_external_ids:
+            identity = (account_id, external_id)
+            staged_states[identity] = "excluded" if identity in self.excluded else "removed"
+        for external_id in out_of_scope_external_ids:
+            identity = (account_id, external_id)
+            staged_states[identity] = "excluded" if identity in self.excluded else "out_of_scope"
         self.messages = staged_messages
         self.revisions = staged_revisions
         self.states = staged_states

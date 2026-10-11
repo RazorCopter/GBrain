@@ -203,13 +203,17 @@ class NormalizedGmailMessage:
     gmail_link: str
     untrusted_content: bool = True
 
-    @property
-    def idempotency_key(self) -> str:
+    def idempotency_key_for(self, account_id: str) -> str:
         material = (
-            f"{GMAIL_SOURCE_KIND}\0{self.external_id}\0{self.revision_hash}"
+            f"{GMAIL_SOURCE_KIND}\0{account_id}\0{self.external_id}\0{self.revision_hash}"
             f"\0{self.pipeline_version}"
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @property
+    def idempotency_key(self) -> str:
+        """Chiave logica senza account, utile solo per fixture e rappresentazione."""
+        return self.idempotency_key_for("unbound-account")
 
     def provenance_payload(self) -> dict[str, Any]:
         return {

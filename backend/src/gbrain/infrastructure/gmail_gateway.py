@@ -11,8 +11,10 @@ from typing import Any, Protocol, TypeVar, cast
 
 from google.auth.credentials import Credentials
 from google.auth.exceptions import RefreshError, TransportError
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from httplib2 import Http
 
 from gbrain.domain.connectors import (
     BudgetExhaustedError,
@@ -109,20 +111,26 @@ class OfficialGmailGateway:
         *,
         retry_policy: RetryPolicy | None = None,
     ) -> OfficialGmailGateway:
-        scopes = frozenset(credentials.scopes or ())
+        scopes_value = getattr(credentials, "scopes", None)
+        scopes = frozenset(scopes_value or ())
         if scopes != frozenset({GMAIL_READONLY_SCOPE}):
             raise ConnectorError(
                 ConnectorErrorCategory.AUTH,
                 "Le credenziali Gmail devono avere esclusivamente lo scope readonly",
             )
+        effective_retry = retry_policy or RetryPolicy()
+        authorized_http = AuthorizedHttp(
+            credentials,
+            http=Http(timeout=effective_retry.timeout_seconds),
+        )
         service = build(
             "gmail",
             "v1",
-            credentials=credentials,
+            http=authorized_http,
             cache_discovery=False,
             static_discovery=True,
         )
-        return cls(cast(GmailService, service), retry_policy=retry_policy)
+        return cls(cast(GmailService, service), retry_policy=effective_retry)
 
     def get_profile(self, budget: RequestBudget) -> Mapping[str, Any]:
         response = self._execute(
@@ -320,7 +328,7 @@ class OfficialGmailGateway:
                 return response
             except ConnectorError:
                 raise
-            except BaseException as exc:
+            except Exception as exc:
                 error = _classify_error(exc, operation, history_operation=history_operation)
                 if not error.retryable or attempt + 1 >= self._retry.max_attempts:
                     raise error from exc

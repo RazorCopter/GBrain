@@ -202,6 +202,12 @@ def upgrade() -> None:
     op.create_index(
         "ix_source_items_connector_account_id", "source_items", ["connector_account_id"]
     )
+    op.drop_constraint("uq_source_item_identity", "source_items", type_="unique")
+    op.create_unique_constraint(
+        "uq_source_item_account_identity",
+        "source_items",
+        ["connector_account_id", "source_kind", "external_id"],
+    )
 
     op.add_column(
         "source_revisions",
@@ -249,6 +255,10 @@ def downgrade() -> None:
     op.drop_column("source_revisions", "evidence")
     op.drop_column("source_revisions", "normalized_content")
 
+    op.drop_constraint("uq_source_item_account_identity", "source_items", type_="unique")
+    op.create_unique_constraint(
+        "uq_source_item_identity", "source_items", ["source_kind", "external_id"]
+    )
     op.drop_index("ix_source_items_connector_account_id", table_name="source_items")
     op.drop_constraint("fk_source_items_connector_account_id", "source_items", type_="foreignkey")
     op.drop_column("source_items", "last_observed_at")

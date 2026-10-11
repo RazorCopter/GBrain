@@ -95,7 +95,7 @@ def test_official_gateway_hardcodes_sent_and_full_format() -> None:
     resource = _Resource()
     resource.queue("list", {"messages": [{"id": "message-1", "threadId": "thread-1"}]})
     resource.queue("get", _message())
-    gateway = OfficialGmailGateway(_Service(resource))  # type: ignore[arg-type]
+    gateway = OfficialGmailGateway(_Service(resource))
     selection = GmailSelection(
         datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 2, 1, tzinfo=UTC), 10
     )
@@ -114,7 +114,7 @@ def test_official_gateway_hardcodes_sent_and_full_format() -> None:
 def test_official_gateway_rejects_non_sent_direct_fetch() -> None:
     resource = _Resource()
     resource.queue("get", _message(labels=["INBOX"]))
-    gateway = OfficialGmailGateway(_Service(resource))  # type: ignore[arg-type]
+    gateway = OfficialGmailGateway(_Service(resource))
 
     with pytest.raises(ConnectorError) as captured:
         gateway.fetch_sent_message(GmailLocator("message-1"), RequestBudget(2, 2))
@@ -128,7 +128,7 @@ def test_retry_is_bounded_for_quota_and_transient_statuses(status: int) -> None:
     resource.queue("profile", _http_error(status), _http_error(status), {"emailAddress": "x"})
     delays: list[float] = []
     gateway = OfficialGmailGateway(
-        _Service(resource),  # type: ignore[arg-type]
+        _Service(resource),
         retry_policy=RetryPolicy(max_attempts=3, initial_delay_seconds=1, jitter_ratio=0),
         sleep=delays.append,
     )
@@ -143,7 +143,7 @@ def test_budget_stops_retry_before_an_extra_request() -> None:
     resource = _Resource()
     resource.queue("profile", _http_error(500), {"emailAddress": "never"})
     gateway = OfficialGmailGateway(
-        _Service(resource),  # type: ignore[arg-type]
+        _Service(resource),
         retry_policy=RetryPolicy(max_attempts=3),
         sleep=lambda _: None,
     )
@@ -156,7 +156,7 @@ def test_budget_stops_retry_before_an_extra_request() -> None:
 def test_auth_is_not_retried() -> None:
     resource = _Resource()
     resource.queue("profile", _http_error(401), {"emailAddress": "never"})
-    gateway = OfficialGmailGateway(_Service(resource))  # type: ignore[arg-type]
+    gateway = OfficialGmailGateway(_Service(resource))
 
     with pytest.raises(ConnectorError) as captured:
         gateway.get_profile(RequestBudget(5, 1))
@@ -167,7 +167,7 @@ def test_auth_is_not_retried() -> None:
 def test_history_404_is_checkpoint_expired_and_history_args_are_sent_only() -> None:
     resource = _Resource()
     resource.queue("history", _http_error(404))
-    gateway = OfficialGmailGateway(_Service(resource))  # type: ignore[arg-type]
+    gateway = OfficialGmailGateway(_Service(resource))
 
     with pytest.raises(ConnectorError) as captured:
         gateway.list_history_page(GmailHistoryCursor("old"), RequestBudget(2, 2))
@@ -197,7 +197,7 @@ def test_history_mixed_events_return_locators_for_refetch_not_payloads() -> None
             ],
         },
     )
-    gateway = OfficialGmailGateway(_Service(resource))  # type: ignore[arg-type]
+    gateway = OfficialGmailGateway(_Service(resource))
 
     page = gateway.list_history_page(GmailHistoryCursor("100"), RequestBudget(2, 10))
 

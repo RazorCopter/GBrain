@@ -1,4 +1,4 @@
-# Dipendenze e pin — fondazione Fase 1
+# Dipendenze e pin — fondazione Fase 1 e nucleo Gmail Fase 2
 
 L'inventario verificabile di immagini, dipendenze dirette, versioni e stato licenze è mantenuto in [`COMPONENTI_LICENZE.md`](COMPONENTI_LICENZE.md). Questa pagina riassume la politica tecnica.
 
@@ -14,6 +14,7 @@ Non usare `latest` e non aggiornare un pin senza rigenerare il relativo lockfile
 
 - Python `>=3.12,<3.15`; immagine runtime 3.12.12 slim Bookworm.
 - FastAPI/Starlette/Pydantic, SQLAlchemy/Alembic, psycopg, Procrastinate e driver Neo4j con versioni esatte nel lockfile.
+- Client Gmail ufficiale: `google-api-python-client==2.201.0`, `google-auth==2.61.0`, `google-auth-oauthlib==1.5.0`; scope applicativo ammesso soltanto `gmail.readonly`.
 - Node 24.12.0 solo nello stage builder.
 - React 18.3.1 compilato come asset statico; nessun server Node in produzione.
 - PostgreSQL 16.10 Bookworm e Neo4j 5.26.12 Community fissati per digest.
@@ -22,7 +23,7 @@ Il build Python usa `uv sync --frozen --no-dev --no-editable`; il frontend usa `
 
 ## Componenti non presenti
 
-Graphiti, SDK/connettore Gmail, Immich, OmniRoute, MCP e connector NAS non sono dipendenze del codice corrente. Versione, compatibilità e licenze sono input futuri e non devono essere descritti come approvati o testati. Il prossimo passo previsto è il contratto/connettore Fase 2 per Gmail `SENT`, inizialmente senza accesso a un servizio reale.
+Graphiti, Immich, OmniRoute, MCP e connector NAS non sono dipendenze del codice corrente. Non è presente alcun MCP Gmail. Il client ufficiale e il nucleo Gmail sono implementati fixture-first, ma OAuth reale, account Gmail reale, API web e integrazione worker non sono stati collaudati né completati in questo sottocompito.
 
 ## Decisione sincronizzatore Gmail — 11 ottobre 2026
 

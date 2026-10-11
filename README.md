@@ -1,6 +1,6 @@
-# GBrain — fondazione Fase 1
+# GBrain — Fondazione Fase 1 e Integrazione Gmail Fase 2
 
-GBrain è un second brain autobiografico self-hosted. Questo repository contiene **solo la fondazione Fase 1**: API FastAPI, UI React statica, autenticazione single-owner, PostgreSQL autorevole, worker Procrastinate e una proiezione Neo4j ancora priva di sink applicativo. Gmail, Immich, NAS, OmniRoute, Graphiti, MCP e funzioni autobiografiche/LLM **non sono implementati**. Il codice ha superato i check deterministici locali descritti in [`docs/VERIFICHE_FASE1.md`](docs/VERIFICHE_FASE1.md), ma migrazione, persistenza, limiti e backup/restore non sono ancora collaudati con Docker/Linux reale: lo stato ufficiale è in [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+GBrain è un second brain autobiografico self-hosted. Questo repository contiene la **fondazione Fase 1** consolidata e l'integrazione connettore **Fase 2 Gmail `SENT`** (nucleo sync/MIME, OAuth web server-side, cifratura AES-256-GCM, worker Procrastinate, ricerca testuale PostgreSQL FTS e pagina Fonti). Immich, NAS, OmniRoute, Graphiti (Fase 3), MCP e funzioni autobiografiche/LLM non sono ancora implementati. Il codice ha superato tutti i controlli deterministici e di audit (Ruff, Mypy, build React e 93 test unitari/funzionali superati), mentre il collaudo su demone Docker/Linux reale e l'accesso con credenziali Google Cloud reali rimangono intenzionalmente pendenti: lo stato ufficiale è in [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
 
 ## Prerequisiti
 

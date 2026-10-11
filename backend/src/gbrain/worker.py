@@ -9,14 +9,15 @@ import procrastinate
 from sqlalchemy import select
 
 from gbrain.application.auth import purge_expired_sessions
+from gbrain.application.gmail_jobs import GmailJobTransientError, execute_gmail_job
 from gbrain.config import get_settings
-from gbrain.domain.models import OutboxEvent, OutboxStatus
+from gbrain.domain.models import ImportJob, ImportJobStatus, OutboxEvent, OutboxStatus
 from gbrain.infrastructure.database import Database
+from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME, create_procrastinate_app
 from gbrain.logging import configure_logging
 
 settings = get_settings()
-connector = procrastinate.PsycopgConnector(conninfo=settings.procrastinate_dsn)
-procrastinate_app = procrastinate.App(connector=connector)
+procrastinate_app = create_procrastinate_app(settings)
 logger = logging.getLogger(__name__)
 
 
@@ -50,6 +51,45 @@ async def consume_outbox_placeholder(event_id: str) -> None:
             event.status = OutboxStatus.COMPLETED
             event.processed_at = datetime.now(UTC)
             await session.commit()
+    finally:
+        await database.close()
+
+
+@procrastinate_app.task(
+    name=GMAIL_TASK_NAME,
+    queue="gmail",
+    lock="gmail-heavy-global",
+    retry=procrastinate.RetryStrategy(
+        max_attempts=settings.gmail_job_retry_budget,
+        exponential_wait=2,
+        retry_exceptions=(GmailJobTransientError,),
+    ),
+)
+async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
+    """Payload privo di token: il worker carica e decifra credenziali dal DB."""
+    database = Database(settings)
+    try:
+        try:
+            await execute_gmail_job(
+                database,
+                settings,
+                job_id=job_id,
+                account_id=account_id,
+                mode=mode,
+            )
+        except GmailJobTransientError:
+            async with database.session_factory() as session:
+                job = await session.get(ImportJob, uuid.UUID(job_id))
+                if job is not None:
+                    job.retry_count += 1
+                    if job.retry_count <= settings.gmail_job_retry_budget:
+                        # Il job deve tornare eseguibile prima che Procrastinate
+                        # programmi il tentativo successivo consentito.
+                        job.status = ImportJobStatus.PENDING
+                        job.finished_at = None
+                        job.checkpoint = {**job.checkpoint, "phase": "retry_scheduled"}
+                    await session.commit()
+            raise
     finally:
         await database.close()
 

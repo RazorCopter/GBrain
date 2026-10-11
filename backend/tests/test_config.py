@@ -51,6 +51,24 @@ def test_settings_rejects_duplicate_secret_sources(tmp_path: Path) -> None:
         )
 
 
+def test_gmail_token_key_requires_separate_32_byte_hex_secret_file(tmp_path: Path) -> None:
+    key_file = tmp_path / "gmail-token-key"
+    key_file.write_text("ab" * 32, encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        postgres_password=SecretStr("pg-secret"),
+        auth_secret=SecretStr("a" * 40),
+        neo4j_password=SecretStr("neo-secret"),
+        gmail_token_encryption_key_file=key_file,
+    )
+
+    assert settings.gmail_token_encryption_key == bytes.fromhex("ab" * 32)
+
+    key_file.write_text("troppo-corta", encoding="utf-8")
+    with pytest.raises(ValueError, match="esadecimale"):
+        _ = settings.gmail_token_encryption_key
+
+
 def test_production_requires_secure_cookie() -> None:
     with pytest.raises(ValidationError, match="SECURE_COOKIE"):
         Settings(

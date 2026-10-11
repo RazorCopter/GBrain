@@ -17,7 +17,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
     font: inherit;
 }
 
@@ -26,7 +27,8 @@ button {
 }
 
 button:focus-visible,
-input:focus-visible {
+input:focus-visible,
+select:focus-visible {
     outline: 3px solid #48cae4;
     outline-offset: 2px;
 }
@@ -85,7 +87,8 @@ label {
     font-weight: 700;
 }
 
-input {
+input,
+select {
     width: 100%;
     border: 1px solid #bcccdc;
     border-radius: .6rem;
@@ -343,6 +346,112 @@ dd {
     overflow-wrap: anywhere;
 }
 
+.wide-card,
+.policy-card,
+.source-list-card {
+    margin: 1rem 0;
+}
+
+.row-between,
+.button-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: .8rem;
+}
+
+.button-row {
+    justify-content: flex-start;
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 1rem;
+}
+
+.warning {
+    border-left-color: #dd6b20;
+    background: #fffaf0;
+    color: #744210;
+}
+
+button.danger {
+    background: #9b2c2c;
+}
+
+.status-pill {
+    display: inline-flex;
+    border-radius: 999px;
+    padding: .25rem .65rem;
+    background: #e2e8f0;
+    color: #334e68;
+    font-size: .78rem;
+    font-weight: 800;
+}
+
+.status-connesso,
+.status-completed,
+.status-active {
+    color: #22543d;
+    background: #c6f6d5;
+}
+
+.status-running,
+.status-pending {
+    color: #744210;
+    background: #feebc8;
+}
+
+.status-failed,
+.status-revoked,
+.status-reauth-required,
+.status-cancelled {
+    color: #742a2a;
+    background: #fed7d7;
+}
+
+.preview-box {
+    display: grid;
+    gap: .35rem;
+    margin-top: 1rem;
+    padding: 1rem;
+    border-left: 4px solid #0b7285;
+    background: #edf8f9;
+}
+
+.search-form {
+    display: flex;
+    flex-direction: row;
+    align-items: end;
+    margin: 0;
+}
+
+.source-list {
+    display: grid;
+    gap: .8rem;
+    margin-top: 1rem;
+}
+
+.source-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 1rem;
+    padding: 1rem;
+    border: 1px solid #d9e2ec;
+    border-radius: .75rem;
+}
+
+.citation {
+    display: grid;
+    justify-items: end;
+    gap: .3rem;
+    max-width: 30rem;
+    overflow-wrap: anywhere;
+    font-size: .75rem;
+}
+
 @media (max-width: 42rem) {
     .demo-status {
         grid-template-columns: 1fr;
@@ -364,5 +473,13 @@ dd {
     .settings-list div {
         grid-template-columns: 1fr;
         gap: .2rem;
+    }
+
+    .source-item {
+        grid-template-columns: 1fr;
+    }
+
+    .citation {
+        justify-items: start;
     }
 }

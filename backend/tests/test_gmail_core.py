@@ -223,6 +223,50 @@ def test_full_sync_is_idempotent_and_received_thread_item_never_enters() -> None
     assert len(repository.messages) == 7
 
 
+def test_unchanged_item_is_not_renormalized_on_controlled_reconcile() -> None:
+    gateway = FakeGmailGateway(_fixture())
+    repository = InMemoryGmailUnitOfWork()
+    engine = GmailSyncEngine(_connector(gateway), repository)
+    engine.full_sync(_SELECTION, _checkpoint(), RequestBudget(40, 100))
+    gateway.calls.clear()
+
+    result = engine.full_reconcile(
+        _SELECTION, repository.checkpoints["account-1"], RequestBudget(20, 100)
+    )
+
+    assert result.unchanged_items == 7
+    assert not [name for name, _ in gateway.calls if name == "messages.get"]
+
+
+def test_history_revised_message_creates_revision_but_source_identity_is_stable() -> None:
+    fixture = _fixture()
+    gateway = FakeGmailGateway(fixture)
+    repository = InMemoryGmailUnitOfWork()
+    engine = GmailSyncEngine(_connector(gateway), repository)
+    engine.full_sync(_SELECTION, _checkpoint(), RequestBudget(40, 100))
+    revised = next(
+        message.copy() for message in fixture["messages"] if message["id"] == "sent-plain-1"
+    )
+    revised["historyId"] = "950"
+    revised["snippet"] = "Revisione osservabile"
+    revised["payload"] = dict(revised["payload"])
+    revised["payload"]["body"] = {
+        "size": 24,
+        "data": "Q29ycG8gbnVvdm8gcmV2aXNpb25hdG8u",
+    }
+    gateway.queue_fetch_override("sent-plain-1", revised)
+    gateway.history_pages = [{"history_id": "950", "changed": ["sent-plain-1"]}]
+
+    result = engine.incremental_sync(repository.checkpoints["account-1"], RequestBudget(10, 10))
+
+    assert result.revised_items == 1
+    assert len(repository.messages) == 7
+    assert len(repository.revisions) == 8
+    assert repository.messages[("account-1", "sent-plain-1")].body_new == (
+        "Corpo nuovo revisionato."
+    )
+
+
 def test_crash_after_commit_replay_does_not_duplicate_or_skip() -> None:
     repository = InMemoryGmailUnitOfWork()
     crashes = 0
@@ -256,7 +300,11 @@ def test_crash_after_commit_replay_does_not_duplicate_or_skip() -> None:
 def test_history_mixed_refetches_every_event_and_rejects_non_sent() -> None:
     gateway = FakeGmailGateway(_fixture())
     gateway.history_pages = [
-        {"history_id": "910", "changed": ["sent-plain-1", "received-same-thread"]},
+        {
+            "history_id": "910",
+            "changed": ["sent-plain-1", "received-same-thread"],
+            "deleted": ["identical-a"],
+        },
         {"history_id": "911", "changed": ["sent-alias-html"]},
     ]
     repository = InMemoryGmailUnitOfWork()
@@ -268,6 +316,7 @@ def test_history_mixed_refetches_every_event_and_rejects_non_sent() -> None:
     assert result.persisted_items == 2
     assert result.rejected_items == 1
     assert result.checkpoint.history_id == "911"
+    assert repository.states[("account-1", "received-same-thread")] == "out_of_scope"
     get_ids = [args["id"] for name, args in gateway.calls if name == "messages.get"]
     assert get_ids == ["sent-plain-1", "received-same-thread", "sent-alias-html"]
 
@@ -319,19 +368,22 @@ def test_reconcile_marks_missing_and_preserves_exclusion() -> None:
 
 
 def test_schema_has_sent_policy_encryption_version_and_revision_idempotency() -> None:
+    policy_table = SourcePolicy.__table__
+    account_table = ConnectorAccount.__table__
+    revision_table = SourceRevision.__table__
     policy_constraints = {
         constraint.name
-        for constraint in SourcePolicy.__table__.constraints
+        for constraint in policy_table.constraints  # type: ignore[attr-defined]
         if isinstance(constraint, CheckConstraint)
     }
     account_constraints = {
         constraint.name
-        for constraint in ConnectorAccount.__table__.constraints
+        for constraint in account_table.constraints  # type: ignore[attr-defined]
         if isinstance(constraint, CheckConstraint)
     }
     revision_uniques = {
         tuple(column.name for column in constraint.columns)
-        for constraint in SourceRevision.__table__.constraints
+        for constraint in revision_table.constraints  # type: ignore[attr-defined]
         if isinstance(constraint, UniqueConstraint)
     }
 

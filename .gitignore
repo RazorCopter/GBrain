@@ -20,6 +20,7 @@ frontend/*.tsbuildinfo
 .env
 runtime/
 secrets/*.txt
+secrets/*.json
 !secrets/.gitkeep
 !secrets/README.md
 

@@ -4,7 +4,7 @@
 
 PostgreSQL è l'autorità del dato; contiene proprietario, sessioni hashate, stato import/checkpoint, revisioni, `deleted_at`, regole di esclusione, outbox e schema Procrastinate. Neo4j è una proiezione non autorevole, ma viene comunque incluso nel backup coordinato finché non esiste una procedura applicativa implementata per ricostruirlo da PostgreSQL. L'app e il worker condividono immagine/configurazione; il worker ha concorrenza fissata a uno.
 
-Non sono implementati connettori Gmail/Immich/NAS, OmniRoute, Graphiti, MCP, sink outbox→Neo4j, ricostruzione automatica del grafo, gestione allegati/blob o automazione di rotazione secret. La demo è sintetica e non costituisce una pipeline reale.
+La Fase 2 Gmail `SENT` (nucleo sincronizzatore/MIME, OAuth web server-side, cifratura token AES-256-GCM versionata, task Procrastinate dedicati, ricerca testuale FTS, quote/budget, enforcement invariante SENT e protezione CSRF) è completamente implementata e verificata con test deterministici (93 superati). Restano pendenti il collaudo Docker/Linux reale e l'autorizzazione di credenziali/account Gmail reali. Non sono implementati connettori Immich/NAS, OmniRoute, Graphiti (Fase 3), MCP, sink outbox→Neo4j, ricostruzione automatica del grafo, download allegati/blob o automazione di rotazione secret.
 
 ## Superfici esposte e confini di fiducia
 
@@ -24,7 +24,7 @@ L'accesso al socket Docker permette di leggere/montare dati e secret del deploym
 
 ## Segreti e permessi
 
-Compose riceve tre secret dall'ambiente host e li monta come file: password PostgreSQL, secret autenticazione, password Neo4j. La configurazione rifiuta valori mancanti/duplicati; il secret autenticazione deve avere almeno 32 caratteri. I container app girano come UID/GID `10001:10001`; PostgreSQL e Neo4j usano gli utenti delle immagini ufficiali.
+Compose riceve tre secret dall'ambiente host e li monta come file: password PostgreSQL, secret autenticazione, password Neo4j. La configurazione rifiuta valori mancanti/duplicati; il secret autenticazione deve avere almeno 32 caratteri. La chiave futura per cifrare token Gmail deve essere un secret file separato (`GBRAIN_GMAIL_TOKEN_ENCRYPTION_KEY_FILE`), esadecimale da 32 byte e non riutilizzato; il sottocompito C non acquisisce token reali. I container app girano come UID/GID `10001:10001`; PostgreSQL e Neo4j usano gli utenti delle immagini ufficiali.
 
 Regole operative:
 

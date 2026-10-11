@@ -88,7 +88,7 @@ async def public_config(settings: AppSettings) -> PublicConfigResponse:
         demo_mode=settings.demo_mode,
         environment=settings.environment,
         session_ttl_seconds=settings.session_ttl_seconds,
-        implemented_sources=[],
+        implemented_sources=["gmail_sent"],
     )
 
 

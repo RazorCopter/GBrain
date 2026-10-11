@@ -29,6 +29,10 @@ Versioni bloccate da [`pyproject.toml`](../pyproject.toml) e [`uv.lock`](../uv.l
 | Alembic | 1.20.0 | migrazioni | verifica primaria pendente |
 | argon2-cffi | 25.1.0 | hashing password | verifica primaria pendente |
 | FastAPI | 0.143.0 | API | MIT nota dal progetto; verifica primaria versione/notice pendente |
+| google-api-python-client | 2.201.0 | client ufficiale Gmail API | metadata installato: Apache 2.0; verifica primaria testo/notice pendente |
+| google-auth | 2.61.0 | credenziali e autenticazione Google | metadata installato: Apache 2.0; verifica primaria testo/notice pendente |
+| google-auth-oauthlib | 1.5.0 | OAuth Web Google server-side | metadata installato: Apache 2.0; verifica primaria testo/notice pendente |
+| cryptography | 50.0.2 (transitiva, lockfile) | AES-GCM per token OAuth cifrati/versionati | metadata/licenza primaria e notice da verificare nel gate release |
 | driver Neo4j Python | 6.4.0 | health/proiezione futura | verifica primaria pendente |
 | Procrastinate | 3.10.0 | coda PostgreSQL | MIT nota dal progetto; verifica primaria versione/notice pendente |
 | psycopg `[binary,pool]` | 3.3.6 | PostgreSQL sync/async/pool | verifica primaria e componenti binary pendente |
@@ -38,7 +42,7 @@ Versioni bloccate da [`pyproject.toml`](../pyproject.toml) e [`uv.lock`](../uv.l
 | SQLAlchemy `[asyncio]` | 2.1.4 | ORM | MIT nota dal progetto; verifica primaria pendente |
 | Uvicorn `[standard]` | 0.54.0 | ASGI server | BSD-3-Clause nota dal progetto; extra/transitive e verifica primaria pendenti |
 
-Dipendenza transitiva rilevante: Starlette `1.7.0` nel lockfile. Dev: httpx `0.28.1`, mypy `2.4.0`, pytest `9.1.1`, pytest-asyncio `1.4.0`, Ruff `0.17.0`; licenze primarie e transitivi da verificare prima di redistribuire tool/artefatti che li includano. Il runtime viene costruito con `uv sync --frozen --no-dev`, quindi il gruppo dev non è intenzionalmente incluso nell'immagine runtime.
+Dipendenza transitiva rilevante: Starlette `1.7.0` nel lockfile. Dev: httpx `0.28.1`, mypy `2.4.0`, pytest `9.1.1`, pytest-asyncio `1.4.0`, Ruff `0.17.0`; licenze primarie e transitivi da verificare prima di redistribuire tool/artefatti che li includano. Il runtime viene costruito con `uv sync --frozen --no-dev`, quindi il gruppo dev non è intenzionalmente incluso nell'immagine runtime. Le tre licenze Google sopra sono state lette dai metadata della distribuzione installata l'11 ottobre 2026, non da una revisione legale o dalla fonte primaria upstream.
 
 Il lockfile registra hash/sorgenti PyPI, ma non campi licenza affidabili per ogni pacchetto. Non si dichiara quindi una conferma primaria sulla sola base di [`uv.lock`](../uv.lock).
 
@@ -62,7 +66,7 @@ React e React DOM sono compilati nel bundle distribuito; Vite/TypeScript/plugin 
 
 | Componente | Stato codice | Versione/licenza |
 |---|---|---|
-| Gmail API / connettore `SENT` | non implementato; sincronizzatore scelto: client ufficiale `google-api-python-client` + `google-auth` — ADR [`003`](../docs/adr/003-sincronizzatore-gmail-fase2.md) | Apache-2.0 verificata dalla documentazione Google; versioni da pinnare al momento dell'adozione |
+| Gmail API / connettore `SENT` | implementato senza collaudo account reale; client ufficiale `google-api-python-client` + `google-auth` — ADR [`003`](../docs/adr/003-sincronizzatore-gmail-fase2.md) | librerie pinnate; metadata installato Apache 2.0, verifica primaria/termini servizio pendente |
 | MCP `jimsimoy/gmail-mcp` | **NON adottato**; ispezione codice sorgente non eseguita | licenza, versione e dipendenze SCONOSCIUTE — non verificate da fonte primaria |
 | MCP `klodr/gmail-mcp` | **NON adottato**; ispezione codice sorgente non eseguita | licenza, versione e dipendenze SCONOSCIUTE — non verificate da fonte primaria |
 | Immich | non integrato | URL/versione/API/licenza dell'istanza sono input futuri, non noti |

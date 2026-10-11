@@ -1,0 +1,442 @@
+from __future__ import annotations
+
+import asyncio
+import hmac
+import json
+import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from gbrain.config import ConfigurationError, Settings
+from gbrain.domain.gmail import GMAIL_READONLY_SCOPE, normalize_email_address
+from gbrain.domain.models import (
+    AuthSession,
+    ConnectorAccount,
+    ConnectorAccountStatus,
+    GmailOAuthState,
+    OwnerAccount,
+)
+
+_TOKEN_FORMAT_VERSION = 1
+_TOKEN_ASSOCIATED_DATA = b"gbrain:gmail-oauth-token:v1"
+_STATE_ASSOCIATED_DATA = b"gbrain:gmail-oauth-state:v1"
+_GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+
+
+class GmailOAuthError(RuntimeError):
+    def __init__(self, code: str, safe_message: str) -> None:
+        super().__init__(safe_message)
+        self.code = code
+        self.safe_message = safe_message
+
+
+class GmailOAuthNotConfiguredError(GmailOAuthError):
+    def __init__(self) -> None:
+        super().__init__(
+            "oauth_not_configured",
+            "OAuth Gmail richiede il client secret e la chiave token montati come secret file.",
+        )
+
+
+class GmailOAuthStateError(GmailOAuthError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthStart:
+    authorization_url: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StoredToken:
+    token: str
+    refresh_token: str | None
+    token_uri: str
+    client_id: str
+    client_secret: str
+    scopes: tuple[str, ...]
+    expiry: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthIdentity:
+    external_account_id: str
+    primary_email: str
+    available_aliases: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RevocationResult:
+    attempted: bool
+    remote_revoked: bool
+    detail_code: str
+
+
+class OAuthFlowLike(Protocol):
+    credentials: Credentials
+
+    def authorization_url(self, **kwargs: object) -> tuple[str, str]: ...
+
+    def fetch_token(self, **kwargs: object) -> None: ...
+
+
+FlowFactory = Callable[[str], OAuthFlowLike]
+IdentityResolver = Callable[[Credentials], OAuthIdentity]
+Revoker = Callable[[str], bool]
+
+
+def _urlsafe_digest(value: str, secret: str) -> bytes:
+    return hmac.digest(secret.encode("utf-8"), value.encode("utf-8"), "sha256")
+
+
+def _derive_encryption_key(secret: bytes) -> bytes:
+    if len(secret) != 32:
+        raise ConfigurationError("La chiave di cifratura Gmail deve contenere 32 byte")
+    return secret
+
+
+def encrypt_secret(plaintext: bytes, key_secret: bytes, *, context: bytes) -> bytes:
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(_derive_encryption_key(key_secret)).encrypt(nonce, plaintext, context)
+    return bytes([_TOKEN_FORMAT_VERSION]) + nonce + ciphertext
+
+
+def decrypt_secret(ciphertext: bytes, key_secret: bytes, *, context: bytes) -> bytes:
+    if len(ciphertext) < 30 or ciphertext[0] != _TOKEN_FORMAT_VERSION:
+        raise GmailOAuthError("token_format_invalid", "Formato delle credenziali Gmail non valido")
+    try:
+        return AESGCM(_derive_encryption_key(key_secret)).decrypt(
+            ciphertext[1:13], ciphertext[13:], context
+        )
+    except InvalidTag as exc:
+        raise GmailOAuthError(
+            "token_authentication_failed", "Integrità delle credenziali Gmail non verificata"
+        ) from exc
+
+
+def serialize_credentials(credentials: Credentials) -> bytes:
+    scopes = frozenset(credentials.scopes or credentials.granted_scopes or ())
+    if scopes != frozenset({GMAIL_READONLY_SCOPE}):
+        raise GmailOAuthError(
+            "scope_mismatch", "Google deve concedere esclusivamente lo scope gmail.readonly"
+        )
+    if not credentials.token or not credentials.refresh_token:
+        raise GmailOAuthError(
+            "offline_token_missing",
+            "Google non ha restituito un refresh token; revocare il consenso e riprovare.",
+        )
+    payload = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": sorted(scopes),
+        "expiry": credentials.expiry.astimezone(UTC).isoformat() if credentials.expiry else None,
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def deserialize_credentials(payload: bytes) -> StoredToken:
+    try:
+        value = json.loads(payload)
+        scopes = tuple(str(scope) for scope in value["scopes"])
+        expiry_value = value.get("expiry")
+        result = StoredToken(
+            token=str(value["token"]),
+            refresh_token=(str(value["refresh_token"]) if value.get("refresh_token") else None),
+            token_uri=str(value["token_uri"]),
+            client_id=str(value["client_id"]),
+            client_secret=str(value["client_secret"]),
+            scopes=scopes,
+            expiry=datetime.fromisoformat(str(expiry_value)) if expiry_value else None,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise GmailOAuthError(
+            "token_payload_invalid", "Credenziali Gmail memorizzate non valide"
+        ) from exc
+    if frozenset(result.scopes) != frozenset({GMAIL_READONLY_SCOPE}):
+        raise GmailOAuthError(
+            "scope_mismatch", "Le credenziali Gmail non hanno lo scope readonly esatto"
+        )
+    return result
+
+
+def credentials_from_stored(stored: StoredToken) -> Credentials:
+    return Credentials(  # type: ignore[no-untyped-call]
+        token=stored.token,
+        refresh_token=stored.refresh_token,
+        token_uri=stored.token_uri,
+        client_id=stored.client_id,
+        client_secret=stored.client_secret,
+        scopes=list(stored.scopes),
+        expiry=stored.expiry,
+    )
+
+
+def encrypt_credentials(credentials: Credentials, settings: Settings) -> bytes:
+    return encrypt_secret(
+        serialize_credentials(credentials),
+        settings.gmail_token_encryption_key,
+        context=_TOKEN_ASSOCIATED_DATA,
+    )
+
+
+def decrypt_credentials(account: ConnectorAccount, settings: Settings) -> Credentials:
+    if (
+        account.oauth_token_ciphertext is None
+        or account.oauth_token_format_version != _TOKEN_FORMAT_VERSION
+    ):
+        raise GmailOAuthError("credentials_missing", "Credenziali Gmail non disponibili")
+    stored = deserialize_credentials(
+        decrypt_secret(
+            account.oauth_token_ciphertext,
+            settings.gmail_token_encryption_key,
+            context=_TOKEN_ASSOCIATED_DATA,
+        )
+    )
+    return credentials_from_stored(stored)
+
+
+def refresh_credentials(credentials: Credentials, settings: Settings) -> Credentials:
+    scopes = frozenset(credentials.scopes or ())
+    if scopes != frozenset({GMAIL_READONLY_SCOPE}):
+        raise GmailOAuthError("scope_mismatch", "Refresh Gmail rifiutato: scope non esatto")
+    try:
+        credentials.refresh(GoogleAuthRequest())  # type: ignore[no-untyped-call]
+    except Exception as exc:
+        raise GmailOAuthError(
+            "refresh_failed", "Rinnovo autorizzazione Gmail non riuscito"
+        ) from exc
+    refreshed_scopes = frozenset(credentials.scopes or credentials.granted_scopes or ())
+    if refreshed_scopes != frozenset({GMAIL_READONLY_SCOPE}):
+        raise GmailOAuthError("scope_mismatch", "Refresh Gmail ha restituito scope non valido")
+    return credentials
+
+
+def _default_flow_factory(settings: Settings, code_verifier: str) -> OAuthFlowLike:
+    if settings.gmail_oauth_client_secret_file is None or settings.gmail_oauth_redirect_uri is None:
+        raise GmailOAuthNotConfiguredError
+    flow = Flow.from_client_secrets_file(
+        str(settings.gmail_oauth_client_secret_file),
+        scopes=[GMAIL_READONLY_SCOPE],
+        redirect_uri=settings.gmail_oauth_redirect_uri,
+        autogenerate_code_verifier=False,
+        code_verifier=code_verifier,
+    )
+    return cast(OAuthFlowLike, flow)
+
+
+def _identity_from_credentials(credentials: Credentials) -> OAuthIdentity:
+    # L'identità arriva da users.getProfile, non dal campo From dei messaggi.
+    from gbrain.domain.connectors import RequestBudget
+    from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
+
+    profile = OfficialGmailGateway.from_credentials(credentials).get_profile(
+        RequestBudget(max_requests=1, max_items=1)
+    )
+    if not isinstance(profile, Mapping):
+        raise GmailOAuthError("profile_invalid", "Profilo Gmail non valido")
+    raw_email = str(profile.get("emailAddress") or "")
+    email_address = normalize_email_address(raw_email)
+    if email_address is None:
+        raise GmailOAuthError("profile_email_invalid", "Google non ha restituito un account valido")
+    return OAuthIdentity(
+        external_account_id=email_address,
+        primary_email=email_address,
+        available_aliases=(email_address,),
+    )
+
+
+async def begin_oauth(
+    session: AsyncSession,
+    settings: Settings,
+    owner: OwnerAccount,
+    auth_session: AuthSession,
+    *,
+    now: datetime | None = None,
+    flow_factory: FlowFactory | None = None,
+) -> OAuthStart:
+    if not settings.gmail_oauth_configured:
+        raise GmailOAuthNotConfiguredError
+    current = now or datetime.now(UTC)
+    raw_state = secrets.token_urlsafe(48)
+    code_verifier = secrets.token_urlsafe(64)
+    flow = (flow_factory or (lambda verifier: _default_flow_factory(settings, verifier)))(
+        code_verifier
+    )
+    authorization_url, returned_state = flow.authorization_url(
+        state=raw_state,
+        access_type="offline",
+        include_granted_scopes="false",
+        prompt="consent",
+    )
+    if not hmac.compare_digest(returned_state, raw_state):
+        raise GmailOAuthError("state_generation_failed", "State OAuth non coerente")
+    expires_at = current + timedelta(seconds=settings.gmail_oauth_state_ttl_seconds)
+    session.add(
+        GmailOAuthState(
+            owner_id=owner.id,
+            auth_session_id=auth_session.id,
+            state_hash=_urlsafe_digest(raw_state, settings.auth_signing_secret),
+            code_verifier_ciphertext=encrypt_secret(
+                code_verifier.encode("ascii"),
+                settings.gmail_token_encryption_key,
+                context=_STATE_ASSOCIATED_DATA,
+            ),
+            expires_at=expires_at,
+        )
+    )
+    await session.commit()
+    return OAuthStart(authorization_url=authorization_url, expires_at=expires_at)
+
+
+async def complete_oauth(
+    session: AsyncSession,
+    settings: Settings,
+    owner: OwnerAccount,
+    auth_session: AuthSession,
+    *,
+    state: str,
+    code: str,
+    now: datetime | None = None,
+    flow_factory: FlowFactory | None = None,
+    identity_resolver: IdentityResolver = _identity_from_credentials,
+) -> tuple[ConnectorAccount, OAuthIdentity]:
+    if not state or not code:
+        raise GmailOAuthStateError("oauth_callback_invalid", "Callback OAuth incompleta")
+    current = now or datetime.now(UTC)
+    state_row = await session.scalar(
+        select(GmailOAuthState)
+        .where(
+            GmailOAuthState.state_hash == _urlsafe_digest(state, settings.auth_signing_secret),
+            GmailOAuthState.owner_id == owner.id,
+            GmailOAuthState.auth_session_id == auth_session.id,
+        )
+        .with_for_update()
+    )
+    if state_row is None:
+        raise GmailOAuthStateError("state_invalid", "State OAuth non valido per questa sessione")
+    if state_row.consumed_at is not None:
+        raise GmailOAuthStateError("state_replayed", "State OAuth già utilizzato")
+    if state_row.expires_at <= current:
+        raise GmailOAuthStateError("state_expired", "State OAuth scaduto")
+    # Consumo prima dello scambio: anche un callback fallito non può essere riprodotto.
+    state_row.consumed_at = current
+    await session.commit()
+    verifier = decrypt_secret(
+        state_row.code_verifier_ciphertext,
+        settings.gmail_token_encryption_key,
+        context=_STATE_ASSOCIATED_DATA,
+    ).decode("ascii")
+    flow = (flow_factory or (lambda value: _default_flow_factory(settings, value)))(verifier)
+    try:
+        await asyncio.to_thread(flow.fetch_token, code=code)
+    except Exception as exc:
+        raise GmailOAuthError("token_exchange_failed", "Scambio OAuth Gmail non riuscito") from exc
+    credentials = flow.credentials
+    identity = await asyncio.to_thread(identity_resolver, credentials)
+    encrypted_token = encrypt_credentials(credentials, settings)
+    account = await session.scalar(
+        select(ConnectorAccount).where(
+            ConnectorAccount.owner_id == owner.id,
+            ConnectorAccount.connector_kind == "gmail",
+            ConnectorAccount.external_account_id == identity.external_account_id,
+        )
+    )
+    if account is None:
+        account = ConnectorAccount(
+            owner_id=owner.id,
+            connector_kind="gmail",
+            external_account_id=identity.external_account_id,
+            primary_email=identity.primary_email,
+        )
+        session.add(account)
+    account.primary_email = identity.primary_email
+    account.status = ConnectorAccountStatus.ACTIVE
+    account.oauth_reference = f"google:{identity.external_account_id}"
+    account.oauth_token_ciphertext = encrypted_token
+    account.oauth_token_format_version = _TOKEN_FORMAT_VERSION
+    account.oauth_scopes = [GMAIL_READONLY_SCOPE]
+    account.confirmed_aliases = []
+    account.alias_set_version = (account.alias_set_version or 0) + 1
+    account.authorized_at = current
+    account.revoked_at = None
+    await session.commit()
+    await session.refresh(account)
+    return account, identity
+
+
+def revoke_google_token(token: str, *, timeout_seconds: float = 20.0) -> bool:
+    body = urllib.parse.urlencode({"token": token}).encode("ascii")
+    request = urllib.request.Request(
+        _GOOGLE_REVOKE_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
+            status = getattr(response, "status", None)
+            return isinstance(status, int) and 200 <= status < 300
+    except (urllib.error.URLError, TimeoutError):
+        return False
+
+
+async def disconnect_account(
+    session: AsyncSession,
+    settings: Settings,
+    account: ConnectorAccount,
+    *,
+    revoker: Revoker | None = None,
+    now: datetime | None = None,
+) -> RevocationResult:
+    current = now or datetime.now(UTC)
+    attempted = False
+    remote_revoked = False
+    if account.oauth_token_ciphertext is not None:
+        try:
+            credentials = decrypt_credentials(account, settings)
+            token_to_revoke = credentials.refresh_token or credentials.token
+            if token_to_revoke:
+                attempted = True
+                remote_revoked = await asyncio.to_thread(
+                    revoker or revoke_google_token, token_to_revoke
+                )
+        except GmailOAuthError:
+            attempted = False
+    account.oauth_token_ciphertext = None
+    account.oauth_token_format_version = None
+    account.oauth_scopes = []
+    account.confirmed_aliases = []
+    account.alias_set_version = (account.alias_set_version or 0) + 1
+    account.status = ConnectorAccountStatus.REVOKED
+    account.revoked_at = current
+    await session.commit()
+    if remote_revoked:
+        detail = "remote_and_local_revoked"
+    elif attempted:
+        detail = "remote_revocation_failed_local_disconnected"
+    else:
+        detail = "local_disconnected_remote_not_attempted"
+    return RevocationResult(attempted, remote_revoked, detail)
+
+
+def safe_oauth_error(exc: BaseException) -> dict[str, str]:
+    if isinstance(exc, GmailOAuthError):
+        return {"code": exc.code, "detail": exc.safe_message}
+    return {"code": "gmail_oauth_error", "detail": "Operazione OAuth Gmail non riuscita"}

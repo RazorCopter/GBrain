@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated, cast
 
+import procrastinate
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +32,10 @@ def get_graph(request: Request) -> GraphProjection:
     return cast(GraphProjection, request.app.state.graph)
 
 
+def get_procrastinate(request: Request) -> procrastinate.App:
+    return cast(procrastinate.App, request.app.state.procrastinate)
+
+
 async def get_db_session(request: Request):  # type: ignore[no-untyped-def]
     database = cast(Database, request.app.state.database)
     async for session in database.session():
@@ -39,6 +44,7 @@ async def get_db_session(request: Request):  # type: ignore[no-untyped-def]
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
+ProcrastinateApp = Annotated[procrastinate.App, Depends(get_procrastinate)]
 
 
 async def require_principal(

@@ -8,9 +8,11 @@ from fastapi.middleware.gzip import GZipMiddleware
 from gbrain.config import get_settings
 from gbrain.infrastructure.database import Database
 from gbrain.infrastructure.graph import GraphProjection
+from gbrain.infrastructure.task_queue import create_procrastinate_app
 from gbrain.logging import configure_logging
 from gbrain.presentation.api import api_router
 from gbrain.presentation.frontend import frontend_router
+from gbrain.presentation.gmail_api import gmail_router
 from gbrain.presentation.health import health_router
 
 
@@ -27,8 +29,10 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     app.state.settings = settings
     app.state.database = Database(settings)
     app.state.graph = GraphProjection(settings)
+    app.state.procrastinate = create_procrastinate_app(settings)
     try:
-        yield
+        async with app.state.procrastinate.open_async():
+            yield
     finally:
         await app.state.graph.close()
         await app.state.database.close()
@@ -48,6 +52,7 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.include_router(health_router)
     app.include_router(api_router)
+    app.include_router(gmail_router)
     app.include_router(frontend_router)
     return app
 

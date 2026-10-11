@@ -8,6 +8,7 @@ import {
     StatusState,
     api,
 } from './api'
+import { GmailSourcesPage } from './GmailSourcesPage'
 
 type View = 'dashboard' | 'sources' | 'settings'
 
@@ -205,7 +206,7 @@ function PrivateShell({
                     <DemoStatusPanel status={demoStatus} />
                 )}
                 {view === 'dashboard' && <Dashboard status={statusState} imports={imports} />}
-                {view === 'sources' && <Sources imports={imports} />}
+                {view === 'sources' && <GmailSourcesPage demoMode={Boolean(config?.demo_mode)} />}
                 {view === 'settings' && <Settings config={config} session={session} />}
             </main>
         </div>
@@ -259,24 +260,6 @@ function StatusCard({ title, state }: { title: string; state?: { status: string;
             <span className={`status status-${state?.status ?? 'loading'}`}>{state?.status ?? 'verifica'}</span>
             <p>{state?.detail ?? 'Verifica in corso…'}</p>
         </article>
-    )
-}
-
-function Sources({ imports }: { imports: ImportJobs | null }) {
-    return (
-        <section aria-labelledby="sources-title">
-            <p className="eyebrow">Provenienza controllata</p>
-            <h1 id="sources-title">Fonti e stato lavori</h1>
-            <div className="notice">Nessun connettore Gmail, Immich o NAS è ancora implementato. Non sono effettuate chiamate esterne.</div>
-            <h2>Job di importazione</h2>
-            {!imports || imports.items.length === 0 ? (
-                <p className="empty">Nessun job presente.</p>
-            ) : (
-                <div className="table-wrap"><table><thead><tr><th>Fonte</th><th>Stato</th><th>Elementi</th><th>Creato</th></tr></thead><tbody>
-                    {imports.items.map((job) => <tr key={job.id}><td>{job.source_kind}</td><td>{job.status}</td><td>{job.processed_items}</td><td>{new Date(job.created_at).toLocaleString('it-IT')}</td></tr>)}
-                </tbody></table></div>
-            )}
-        </section>
     )
 }
 

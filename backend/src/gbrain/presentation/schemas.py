@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class BootstrapRequest(BaseModel):
@@ -53,14 +53,99 @@ class PublicConfigResponse(BaseModel):
     implemented_sources: list[str] = Field(default_factory=list)
 
 
+class GmailAccountResponse(BaseModel):
+    id: UUID
+    primary_email: str
+    status: str
+    confirmed_aliases: list[str]
+    aliases_ready: bool
+    authorized_at: datetime | None
+    revoked_at: datetime | None
+
+
+class GmailStatusResponse(BaseModel):
+    configured: bool
+    connected: bool
+    account: GmailAccountResponse | None
+    scope: str
+    scope_notice: str
+    sent_only: bool
+    capabilities: list[str]
+    configuration_action: str | None = None
+
+
+class GmailOAuthStartResponse(BaseModel):
+    authorization_url: str
+    expires_at: datetime
+
+
+class GmailDisconnectResponse(BaseModel):
+    remote_attempted: bool
+    remote_revoked: bool
+    detail_code: str
+
+
+class GmailAliasesRequest(BaseModel):
+    aliases: list[str] = Field(min_length=1, max_length=50)
+
+
+class GmailPolicyRequest(BaseModel):
+    after: datetime
+    before: datetime
+    item_limit: int = Field(ge=1, le=100_000)
+    request_budget: int = Field(ge=1, le=200_000)
+    batch_size: int = Field(default=25, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> GmailPolicyRequest:
+        if self.after.tzinfo is None or self.before.tzinfo is None or self.after >= self.before:
+            raise ValueError("after deve precedere before e includere il fuso orario")
+        return self
+
+
+class GmailPolicyResponse(GmailPolicyRequest):
+    id: UUID
+    status: str
+    concurrency: int
+
+
+class GmailPreviewResponse(BaseModel):
+    job_id: UUID
+    selected_items: int
+    pages_read: int
+    requests_used: int
+    state: str
+    truncated: bool
+    policy: dict[str, str | int]
+    persisted_messages: int = 0
+    checkpoint_advanced: bool = False
+
+
+class GmailImportConfirmRequest(BaseModel):
+    policy_id: UUID
+    mode: Literal["full", "incremental", "reconciliation"]
+    confirmed_policy: dict[str, str | int]
+    confirm_import: Literal[True]
+
+
 class ImportJobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
     source_kind: str
+    connector_account_id: UUID | None
+    source_policy_id: UUID | None
+    queue_job_id: int | None
+    mode: str | None
     status: str
     processed_items: int
+    total_items: int | None
+    checkpoint: dict[str, Any]
+    policy_snapshot: dict[str, Any]
     error_code: str | None
+    error_detail: str | None
+    retry_count: int
+    cancel_requested_at: datetime | None
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None
@@ -70,6 +155,30 @@ class ImportJobResponse(BaseModel):
 class ImportJobListResponse(BaseModel):
     items: list[ImportJobResponse]
     total: int
+
+
+class GmailCitationResponse(BaseModel):
+    source_item_id: UUID
+    source_revision_id: UUID
+    account_id: UUID
+    occurred_at: datetime | None
+    subject: str | None
+    snippet: str | None
+    evidence: dict[str, Any]
+    proof_url: str
+    source_limit: str = "solo posta inviata (SENT)"
+
+
+class GmailSourceListResponse(BaseModel):
+    items: list[GmailCitationResponse]
+    total: int
+    source_limit: str = "solo posta inviata (SENT)"
+
+
+class GmailLiveEvidenceResponse(BaseModel):
+    source_item_id: UUID
+    source_limit: str = "solo posta inviata (SENT), verificato dal wrapper server-side"
+    message: dict[str, Any]
 
 
 class DemoFixtureStatusResponse(BaseModel):

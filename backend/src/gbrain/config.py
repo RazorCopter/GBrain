@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 from pydantic import BeforeValidator, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,9 +67,14 @@ class Settings(BaseSettings):
     neo4j_password_file: OptionalPath = None
     neo4j_database: str = "neo4j"
 
-    # Richiesto soltanto dal sottocompito OAuth successivo se i token vengono
-    # cifrati applicativamente nel DB; deve essere un secret file separato.
+    # I secret OAuth sono accettati esclusivamente tramite file montati. Il
+    # setup Gmail può restare assente senza impedire l'avvio dell'applicazione.
+    gmail_oauth_client_secret_file: OptionalPath = None
     gmail_token_encryption_key_file: OptionalPath = None
+    gmail_oauth_redirect_uri: str | None = None
+    gmail_oauth_state_ttl_seconds: int = Field(default=600, ge=300, le=900)
+    gmail_oauth_timeout_seconds: float = Field(default=20.0, ge=1.0, le=60.0)
+    gmail_job_retry_budget: int = Field(default=3, ge=0, le=5)
 
     worker_concurrency: int = Field(default=1, ge=1, le=1)
 
@@ -108,8 +113,36 @@ class Settings(BaseSettings):
 
         if self.demo_mode and self.environment == "production":
             raise ConfigurationError("GBRAIN_DEMO_MODE non può essere abilitata in production")
-        if self.environment == "production" and not self.public_url.startswith("https://"):
+        public = urlsplit(self.public_url)
+        if (
+            public.scheme not in {"http", "https"}
+            or not public.netloc
+            or public.query
+            or public.fragment
+        ):
+            raise ConfigurationError("GBRAIN_PUBLIC_URL deve essere un URL HTTP(S) assoluto")
+        if self.environment == "production" and public.scheme != "https":
             raise ConfigurationError("In produzione GBRAIN_PUBLIC_URL deve usare HTTPS")
+
+        expected_redirect = f"{self.public_url.rstrip('/')}/api/gmail/oauth/callback"
+        if self.gmail_oauth_redirect_uri is None:
+            self.gmail_oauth_redirect_uri = expected_redirect
+        elif self.gmail_oauth_redirect_uri != expected_redirect:
+            raise ConfigurationError(
+                "GBRAIN_GMAIL_OAUTH_REDIRECT_URI deve coincidere con la callback del PUBLIC_URL"
+            )
+        redirect = urlsplit(self.gmail_oauth_redirect_uri)
+        if redirect.scheme not in {"http", "https"} or not redirect.netloc:
+            raise ConfigurationError("La redirect URI Gmail deve essere un URL HTTP(S) assoluto")
+        if self.environment == "production" and redirect.scheme != "https":
+            raise ConfigurationError("In produzione la redirect URI Gmail deve usare HTTPS")
+
+        for path, label in (
+            (self.gmail_oauth_client_secret_file, "client OAuth Gmail"),
+            (self.gmail_token_encryption_key_file, "cifratura token Gmail"),
+        ):
+            if path is not None:
+                self._read_secret_file(path, label)
 
         auth_secret = self.require_secret(self.auth_secret, "autenticazione")
         if len(auth_secret) < 32:
@@ -160,6 +193,13 @@ class Settings(BaseSettings):
     @property
     def auth_signing_secret(self) -> str:
         return self.require_secret(self.auth_secret, "autenticazione")
+
+    @property
+    def gmail_oauth_configured(self) -> bool:
+        return (
+            self.gmail_oauth_client_secret_file is not None
+            and self.gmail_token_encryption_key_file is not None
+        )
 
     @property
     def neo4j_secret(self) -> str:

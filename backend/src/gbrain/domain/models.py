@@ -132,6 +132,14 @@ class ImportJob(TimestampMixin, Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    connector_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("connector_accounts.id", ondelete="CASCADE"), index=True
+    )
+    source_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_policies.id", ondelete="RESTRICT"), index=True
+    )
+    queue_job_id: Mapped[int | None] = mapped_column(Integer, unique=True)
+    mode: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[ImportJobStatus] = mapped_column(
         Enum(
             ImportJobStatus,
@@ -143,8 +151,13 @@ class ImportJob(TimestampMixin, Base):
         default=ImportJobStatus.PENDING,
     )
     checkpoint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     processed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_items: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(80))
+    error_detail: Mapped[str | None] = mapped_column(String(500))
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -152,7 +165,12 @@ class ImportJob(TimestampMixin, Base):
 class SourceItem(TimestampMixin, Base):
     __tablename__ = "source_items"
     __table_args__ = (
-        UniqueConstraint("source_kind", "external_id", name="uq_source_item_identity"),
+        UniqueConstraint(
+            "connector_account_id",
+            "source_kind",
+            "external_id",
+            name="uq_source_item_account_identity",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -286,6 +304,25 @@ class SystemState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class GmailOAuthState(Base):
+    __tablename__ = "gmail_oauth_states"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("owner_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    auth_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("auth_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    state_hash: Mapped[bytes] = mapped_column(LargeBinary(32), unique=True, nullable=False)
+    code_verifier_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ConnectorAccount(TimestampMixin, Base):

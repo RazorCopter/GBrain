@@ -35,6 +35,9 @@ class AsyncPostgresGmailRepository:
         policy_id: uuid.UUID,
         messages: Sequence[NormalizedGmailMessage],
         checkpoint: GmailCheckpointState,
+        *,
+        removed_external_ids: frozenset[str] = frozenset(),
+        out_of_scope_external_ids: frozenset[str] = frozenset(),
     ) -> tuple[GmailPersistOutcome, ...]:
         outcomes: list[GmailPersistOutcome] = []
         now = datetime.now(UTC)
@@ -43,6 +46,7 @@ class AsyncPostgresGmailRepository:
                 item = await self._session.scalar(
                     select(SourceItem)
                     .where(
+                        SourceItem.connector_account_id == account_id,
                         SourceItem.source_kind == GMAIL_SOURCE_KIND,
                         SourceItem.external_id == message.external_id,
                     )
@@ -66,10 +70,9 @@ class AsyncPostgresGmailRepository:
                     item.source_state = SourceItemState.ACTIVE
                     item.state_reason = None
                     item.last_observed_at = now
+                idempotency_key = message.idempotency_key_for(str(account_id))
                 existing_revision = await self._session.scalar(
-                    select(SourceRevision).where(
-                        SourceRevision.idempotency_key == message.idempotency_key
-                    )
+                    select(SourceRevision).where(SourceRevision.idempotency_key == idempotency_key)
                 )
                 if existing_revision is not None:
                     outcomes.append(
@@ -108,7 +111,7 @@ class AsyncPostgresGmailRepository:
                     normalized_content=payload,
                     evidence=evidence if isinstance(evidence, dict) else {},
                     pipeline_version=message.pipeline_version,
-                    idempotency_key=message.idempotency_key,
+                    idempotency_key=idempotency_key,
                     source_history_id=message.history_id,
                     storage_ref=None,
                     captured_at=message.acquired_at,
@@ -126,8 +129,69 @@ class AsyncPostgresGmailRepository:
                         revision_id=str(revision.id),
                     )
                 )
+            await self._mark_source_states(
+                account_id,
+                removed_external_ids=removed_external_ids,
+                out_of_scope_external_ids=out_of_scope_external_ids,
+            )
             await self._upsert_checkpoint(account_id, policy_id, checkpoint)
         return tuple(outcomes)
+
+    async def load_checkpoint(
+        self,
+        account_id: uuid.UUID,
+        policy_id: uuid.UUID,
+    ) -> GmailCheckpointState:
+        row = await self._session.scalar(
+            select(GmailCheckpoint).where(
+                GmailCheckpoint.connector_account_id == account_id,
+                GmailCheckpoint.source_policy_id == policy_id,
+            )
+        )
+        if row is None:
+            return GmailCheckpointState(
+                account_id=str(account_id),
+                policy_id=str(policy_id),
+                history_id=None,
+                page_token=None,
+                coverage_after=None,
+                coverage_before=None,
+                last_synced_at=None,
+                reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
+            )
+        return GmailCheckpointState(
+            account_id=str(account_id),
+            policy_id=str(policy_id),
+            history_id=row.history_id,
+            page_token=row.page_token,
+            coverage_after=row.coverage_after,
+            coverage_before=row.coverage_before,
+            last_synced_at=row.last_sync_at,
+            reconciliation_state=GmailReconciliationState(row.reconciliation_state.value),
+            last_error_code=row.last_error_code,
+            version=row.version,
+        )
+
+    async def list_snapshots(self, account_id: uuid.UUID) -> tuple[object, ...]:
+        from gbrain.application.gmail_sync import PersistedSnapshot
+
+        rows = await self._session.execute(
+            select(SourceItem.external_id, SourceItem.canonical_hash, SourceItem.source_state)
+            .where(
+                SourceItem.connector_account_id == account_id,
+                SourceItem.source_kind == GMAIL_SOURCE_KIND,
+            )
+            .order_by(SourceItem.external_id)
+        )
+        return tuple(
+            PersistedSnapshot(
+                external_id=external_id,
+                revision_hash=revision_hash,
+                state=state.value,
+                excluded=state == SourceItemState.EXCLUDED,
+            )
+            for external_id, revision_hash, state in rows
+        )
 
     async def mark_reconciliation_required(
         self,
@@ -167,6 +231,40 @@ class AsyncPostgresGmailRepository:
                 removed += 1
             await self._upsert_checkpoint(account_id, policy_id, checkpoint)
         return removed, preserved
+
+    async def _mark_source_states(
+        self,
+        account_id: uuid.UUID,
+        *,
+        removed_external_ids: frozenset[str],
+        out_of_scope_external_ids: frozenset[str],
+    ) -> None:
+        transitions = (
+            (removed_external_ids, SourceItemState.REMOVED, "gmail_history_deleted"),
+            (
+                out_of_scope_external_ids,
+                SourceItemState.OUT_OF_SCOPE,
+                "gmail_sent_label_absent",
+            ),
+        )
+        for external_ids, state, reason in transitions:
+            if not external_ids:
+                continue
+            items = tuple(
+                await self._session.scalars(
+                    select(SourceItem)
+                    .where(
+                        SourceItem.connector_account_id == account_id,
+                        SourceItem.external_id.in_(external_ids),
+                    )
+                    .with_for_update()
+                )
+            )
+            for item in items:
+                if item.source_state == SourceItemState.EXCLUDED:
+                    continue
+                item.source_state = state
+                item.state_reason = reason
 
     async def _upsert_checkpoint(
         self,

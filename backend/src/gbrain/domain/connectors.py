@@ -5,13 +5,13 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Protocol, TypeVar
 
-SelectionT = TypeVar("SelectionT")
+SelectionT_contra = TypeVar("SelectionT_contra", contravariant=True)
 CursorT = TypeVar("CursorT")
 LocatorT = TypeVar("LocatorT")
 RawT = TypeVar("RawT")
-NormalizedT = TypeVar("NormalizedT")
+NormalizedT_co = TypeVar("NormalizedT_co", covariant=True)
 CheckpointT = TypeVar("CheckpointT")
-ReconcileT = TypeVar("ReconcileT")
+ReconcileT_co = TypeVar("ReconcileT_co", covariant=True)
 
 
 class ConnectorErrorCategory(StrEnum):
@@ -144,7 +144,15 @@ class ReconcileResult:
 
 
 class ConnectorContract(
-    Protocol[SelectionT, CursorT, LocatorT, RawT, NormalizedT, CheckpointT, ReconcileT]
+    Protocol[
+        SelectionT_contra,
+        CursorT,
+        LocatorT,
+        RawT,
+        NormalizedT_co,
+        CheckpointT,
+        ReconcileT_co,
+    ]
 ):
     """Contratto semantico comune; non espone oggetti SDK proprietari."""
 
@@ -152,24 +160,26 @@ class ConnectorContract(
 
     def inspect_capabilities(self) -> ConnectorCapabilities: ...
 
-    def preview_selection(self, selection: SelectionT, budget: RequestBudget) -> PreviewResult: ...
+    def preview_selection(
+        self, selection: SelectionT_contra, budget: RequestBudget
+    ) -> PreviewResult: ...
 
     def enumerate_page(
         self,
-        selection: SelectionT,
+        selection: SelectionT_contra,
         cursor: CursorT | None,
         budget: RequestBudget,
     ) -> ConnectorPage[LocatorT, CursorT]: ...
 
     def fetch_item(self, locator: LocatorT, budget: RequestBudget) -> RawT: ...
 
-    def normalize_item(self, raw_data: RawT) -> NormalizedT: ...
+    def normalize_item(self, raw_data: RawT) -> NormalizedT_co: ...
 
     def checkpoint(self, state: CheckpointT) -> CheckpointT: ...
 
     def reconcile(
         self,
-        selection: SelectionT,
+        selection: SelectionT_contra,
         checkpoint: CheckpointT,
         budget: RequestBudget,
-    ) -> ReconcileT: ...
+    ) -> ReconcileT_co: ...

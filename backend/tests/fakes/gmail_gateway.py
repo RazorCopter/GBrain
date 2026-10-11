@@ -41,9 +41,13 @@ class FakeGmailGateway:
         self.failures: dict[str, list[ConnectorError]] = {}
         self.history_pages: list[dict[str, Any]] = []
         self.history_expired = False
+        self.fetch_overrides: dict[str, list[dict[str, Any]]] = {}
 
     def queue_failure(self, operation: str, error: ConnectorError) -> None:
         self.failures.setdefault(operation, []).append(error)
+
+    def queue_fetch_override(self, message_id: str, *messages: dict[str, Any]) -> None:
+        self.fetch_overrides.setdefault(message_id, []).extend(copy.deepcopy(messages))
 
     def get_profile(self, budget: RequestBudget) -> Mapping[str, Any]:
         budget.consume_request()
@@ -123,7 +127,8 @@ class FakeGmailGateway:
                 {"userId": "me", "id": locator.message_id, "format": format},
             )
         )
-        message = self.messages.get(locator.message_id)
+        overrides = self.fetch_overrides.get(locator.message_id)
+        message = overrides.pop(0) if overrides else self.messages.get(locator.message_id)
         if message is None:
             raise ConnectorError(
                 ConnectorErrorCategory.PERMANENT,

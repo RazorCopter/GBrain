@@ -53,7 +53,14 @@ mypy_path = "backend/src"
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["procrastinate.*"]
+module = [
+  "procrastinate.*",
+  "googleapiclient.*",
+  "google_auth_httplib2.*",
+  "google_auth_oauthlib.*",
+  "google.oauth2.*",
+  "httplib2.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

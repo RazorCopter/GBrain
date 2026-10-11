@@ -1,12 +1,12 @@
-# Contratto prospettico dei connettori
+# Contratto dei connettori
 
-> **Non implementato nella Fase 1.** Questa è una specifica per le fasi successive, non documentazione di API o MCP disponibili. Il primo passo previsto è Gmail `SENT` con fixture/stub deterministici; Immich, NAS, MCP e accessi reali restano fuori dal codice corrente.
+> **Stato 11 ottobre 2026:** contratto, nucleo e integrazione Gmail `SENT` (OAuth web server-side, token cifrati AES-256-GCM, worker Procrastinate, API private con CSRF, ricerca FTS, pagina Fonti UI e audit consolidato Sottocompito E con 93 test deterministici) sono implementati e verificabili senza rete. Collaudi reali con Docker/Linux e Google Cloud restano pendenti; nessuna credenziale reale è stata usata.
 
-L'interfaccia futura verso Gmail, Immich e Network Attached Storage dovrà usare logica pull, batch controllati, idempotenza e checkpoint persistenti per riprendere pipeline lunghe dopo un arresto.
+Il contratto in [`backend/src/gbrain/domain/connectors.py`](../backend/src/gbrain/domain/connectors.py) usa protocolli e dataclass generici senza esporre oggetti dinamici Google. Gmail specializza selezione, cursor, locator, raw message, checkpoint e risultato in [`backend/src/gbrain/domain/gmail.py`](../backend/src/gbrain/domain/gmail.py). Setup operativo e restrizioni sono in [`docs/GMAIL_OAUTH_SETUP.md`](GMAIL_OAUTH_SETUP.md).
 
 ## Operazioni e Interfacce
 
-Ogni futuro connettore dovrà implementare la seguente specifica funzionale minima:
+Ogni connettore deve implementare la seguente specifica funzionale minima:
 
 1. `test_connection() -> status`  
    Ping a un endpoint protetto utile per misurare l'identità o stabilire permessi.
@@ -34,3 +34,17 @@ Ogni futuro connettore dovrà implementare la seguente specifica funzionale mini
 
 ## Idempotenza
 Nessun connettore sa nulla di Neo4j. L'assunzione dei connettori è d'inserimento o merge condizionato in base a chiavi uniche (hash sha256 + ID sistema) verso gli endpoints di ingestione centrali di PostgreSQL.
+
+## Gmail `SENT` implementato fixture-first
+
+Il nucleo implementato comprende:
+
+- scope esatto `https://www.googleapis.com/auth/gmail.readonly`; l'interfaccia non contiene send, modify, drafts o threads;
+- gateway ufficiale in [`backend/src/gbrain/infrastructure/gmail_gateway.py`](../backend/src/gbrain/infrastructure/gmail_gateway.py), con `labelIds=["SENT"]`, query temporale costruita internamente, fetch `full`/`metadata`, verifica post-fetch della label e history sempre rifetchata;
+- preview senza fetch/persistenza/checkpoint, paginazione `nextPageToken`, limite elementi, budget richieste/elementi, stato completo/parziale/troncato e concorrenza dichiarata uno;
+- motore full/incrementale/reconcile in [`backend/src/gbrain/application/gmail_sync.py`](../backend/src/gbrain/application/gmail_sync.py), con batch/pagina transazionale, replay idempotente, history scaduta marcata per riconciliazione e rimozione logica senza cancellare Gmail;
+- parser MIME limitato in [`backend/src/gbrain/application/gmail_mime.py`](../backend/src/gbrain/application/gmail_mime.py): multipart, base64url, charset, HTML convertito in testo senza fetch remoti, metadata allegati e separazione euristica deterministica tra nuovo testo, firma, citazione e inoltro;
+- attribuzione certa soltanto quando il solo mittente coincide con un alias owner confermato; il solo `From` non registra nuovi alias;
+- contenuti marcati non fidati: URL e prompt injection restano dati citabili e non influenzano policy o strumenti.
+
+L'OAuth UX, la creazione/refresh/revoca reale delle credenziali e il collegamento al worker sono punti di integrazione successivi. Nessun token reale è presente o collaudato.

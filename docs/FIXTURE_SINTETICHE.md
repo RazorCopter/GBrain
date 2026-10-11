@@ -2,7 +2,7 @@
 
 La modalità demo serve a mostrare e collaudare la fondazione GBrain esclusivamente con dati inventati. È **disabilitata per default**, viene rifiutata in `production` e non modifica autenticazione, autorizzazione, sessioni o protezione CSRF.
 
-Non esistono connettori demo: l'attivazione non apre connessioni verso Gmail, Immich, OmniRoute o altri servizi esterni. Il caricatore scrive direttamente nel modello di provenienza PostgreSQL già disponibile.
+Il comando demo non apre connessioni verso Gmail, Immich, OmniRoute o altri servizi esterni e scrive direttamente nel modello di provenienza PostgreSQL. Separatamente, il nucleo Gmail dispone di fixture e fake gateway di test che non sono esposti dalla UI e non effettuano rete.
 
 ## Attivazione e comandi
 
@@ -59,4 +59,10 @@ Tutti i soggetti sono dichiarati fittizi, gli indirizzi usano `example.test` e i
 
 Lo schema corrente normalizza provenienza, revisioni, cancellazione e import job, ma non dispone ancora di entità normalizzate per persone/alias, thread e singoli messaggi, media/EXIF, preferenze temporali, risoluzione delle date, deduplicazione semantica, opinioni o claim epistemici. Questi aspetti sono quindi payload strutturati di fixture in `SourceRevision.normalized_metadata`, marcati `normalization_status=future_case_payload`.
 
-Il dataset non simula estrazione LLM, Graphiti, grafi, sincronizzazioni o connettori. Non viene creato alcun claim autobiografico e il testo di prompt injection non viene mai promosso a istruzione. Questi payload sono contratti di test prospettici, non dichiarazioni di funzionalità già implementate.
+Il dataset demo non simula estrazione LLM, Graphiti, grafi, sincronizzazioni o connettori. Non viene creato alcun claim autobiografico e il testo di prompt injection non viene mai promosso a istruzione. Questi payload demo sono contratti di test prospettici.
+
+## Corpus Gmail fixture-first
+
+[`backend/tests/fixtures/gmail/messages.json`](../backend/tests/fixtures/gmail/messages.json) e il fake contrattuale [`backend/tests/fakes/gmail_gateway.py`](../backend/tests/fakes/gmail_gateway.py) coprono dati inventati per alias confermati, thread misto SENT/ricevuto, fetch diretto ricevuto, inoltro, quote/firma, HTML con tracker e script, prompt injection, charset, multipart/allegato, ID distinti con testo identico e alias non confermato. I test aggiungono scenari a più pagine, history mista/scaduta, 429/5xx/revoca, crash dopo commit, revisione, preview troncata, rimozione ed exclusion preservata.
+
+Le fixture non contengono token, dati personali reali né claim autobiografici; le email restano materiale di fonte non elevato a fatto autobiografico.

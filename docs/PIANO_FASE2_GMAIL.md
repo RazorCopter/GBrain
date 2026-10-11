@@ -2,12 +2,12 @@
 
 ## Stato e confini
 
-- **Stato:** backlog approvabile; audit sincronizzatore completato (sottocompito B, 11 ottobre 2026). Nessuna voce implementativa di questo documento è implementata.
+- **Stato:** sottocompito E completato l'11 ottobre 2026: audit trasversale codice/test/schema/docs completato, difetti corretti (enforcement alias su import API/worker, completamento rotte private coperte), suite consolidata con 93 test deterministici superati e 3 test di integrazione reale marcati esplicitamente pendenti. Credenziali/account Gmail reali e collaudo Docker/Linux rimangono intenzionalmente pendenti senza sovradichiarazioni.
 - **Decisione sincronizzatore:** client ufficiale Gmail (`google-api-python-client` + `google-auth`). I due MCP candidati (`jimsimoy/gmail-mcp`, `klodr/gmail-mcp`) non sono stati verificati da fonte primaria e non entrano nel runtime. Dettagli in [`docs/adr/003-sincronizzatore-gmail-fase2.md`](adr/003-sincronizzatore-gmail-fase2.md).
 - **Prerequisito:** la fondazione Fase 1 resta utilizzabile per sviluppo deterministico, ma il collaudo Docker/Linux reale di migrazione, persistenza, worker, limiti, mount e backup/restore è ancora un gate separato.
-- **Incremento ristretto:** importazione read-only dei soli messaggi Gmail inviati dal proprietario, prima con fixture e contract test, poi con collaudo reale esplicitamente autorizzato.
+- **Incremento ristretto:** integrazione read-only dei soli messaggi Gmail `SENT` implementata con fixture/fake senza rete; preview non persistente, conferma separata, checkpoint e ricerca/citazioni rimangono nel database primario. Collaudo reale esplicitamente autorizzato ancora pendente.
 - **Fuori ambito:** inbox generica, invio/modifica/cancellazione Gmail, Immich, NAS, OmniRoute, Graphiti, sink Neo4j, estrazione LLM e collegamento di servizi personali durante la preparazione del backlog.
-- **Regola di evidenza:** distinguere sempre codice predisposto, test deterministico superato e integrazione Gmail reale eseguita. L'ultima non può essere dichiarata senza credenziali, account e autorizzazione esplicita.
+- **Regola di evidenza:** codice predisposto e test deterministici locali sono completati per il nucleo; integrazione Gmail reale non eseguita e non dichiarabile senza credenziali, account e autorizzazione esplicita.
 
 ## Decisioni da chiudere prima del codice di rete
 
@@ -149,12 +149,13 @@
 ## Sequenza di delivery e gate
 
 1. ~~Chiudere audit MCP A/MCP B/client ufficiale e ADR del singolo sincronizzatore.~~ ✅ Completato — sottocompito B, 11 ottobre 2026.
-2. Implementare contratto, fixture e test P0 senza rete. ← **prossimo passo**
-3. Implementare storage/migrazione e pipeline fixture con test PostgreSQL deterministici disponibili; non dichiarare integrazione reale se usa fake.
-4. Implementare adattatore scelto dietro il contratto, mantenendo OAuth disabilitato senza configurazione esplicita.
-5. Superare enforcement `SENT`, MIME, pagination/checkpoint/reconcile/idempotenza e prompt-injection test.
-6. Aggiungere ricerca testuale e citazioni verificabili senza introdurre un nuovo datastore.
-7. Solo dopo autorizzazione, eseguire il collaudo Gmail reale e registrare limiti/rate effettivi.
+2. ~~Implementare contratto, fixture e test P0 senza rete.~~ ✅ Completato — sottocompito C, 11 ottobre 2026.
+3. ~~Implementare storage/migrazione e pipeline fixture con test PostgreSQL deterministici disponibili; non dichiarare integrazione reale se usa fake.~~ ✅ Completato — sottocompito C/D, 11 ottobre 2026.
+4. ~~Implementare adattatore scelto dietro il contratto, mantenendo OAuth disabilitato senza configurazione esplicita.~~ ✅ Completato — sottocompito D, 11 ottobre 2026.
+5. ~~Superare enforcement `SENT`, MIME, pagination/checkpoint/reconcile/idempotenza e prompt-injection test.~~ ✅ Completato — sottocompito C/E, 11 ottobre 2026.
+6. ~~Aggiungere ricerca testuale e citazioni verificabili senza introdurre un nuovo datastore.~~ ✅ Completato — sottocompito D/E, 11 ottobre 2026.
+7. ~~Audit finale, consolidamento test, chiusura difetti e checkpoint riprendibile (Sottocompito E).~~ ✅ Completato — 11 ottobre 2026.
+8. Solo dopo autorizzazione, eseguire il collaudo Gmail reale e registrare limiti/rate effettivi. ← **Gate runtime pendente**
 
 ## Criterio di uscita della prima tranche Fase 2
 

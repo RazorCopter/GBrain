@@ -1,6 +1,6 @@
 # Modello Dati Concettuale Minimo
 
-> **Stato:** modello target concettuale della Fase 0, non schema fisico già implementato. Nella fondazione Fase 1 esistono `owner_accounts`, `auth_sessions`, `system_state`, `import_jobs`, `source_items`, `source_revisions`, `outbox_events`, `exclusions`, `deletion_records` e le tabelle Procrastinate. I nomi `Source`, `RawMaterial`, `Artifact` ed `EpistemicNode` sotto descrivono concetti futuri e non devono essere usati come prova di tabelle o funzionalità presenti.
+> **Stato:** modello target concettuale della Fase 0. Nella fondazione Fase 1 esistono `owner_accounts`, `auth_sessions`, `system_state`, `import_jobs`, `source_items`, `source_revisions`, `outbox_events`, `exclusions`, `deletion_records` e le tabelle Procrastinate. Il sottocompito C Gmail aggiunge `connector_accounts`, `source_policies`, `gmail_checkpoints` e campi Gmail/provenienza/evidence/stato alle source item/revisioni tramite migrazione incrementale. I nomi `Source`, `RawMaterial`, `Artifact` ed `EpistemicNode` sotto restano concetti futuri e non provano tabelle o funzionalità ulteriori.
 
 Il Modello definisce un approccio duale tra l'immagazzinamento solido e coerente (PostgreSQL) e l'interrogazione associativa-semantica (Grafo, tramite Neo4j).
 
