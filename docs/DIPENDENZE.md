@@ -24,6 +24,20 @@ Il build Python usa `uv sync --frozen --no-dev --no-editable`; il frontend usa `
 
 Graphiti, SDK/connettore Gmail, Immich, OmniRoute, MCP e connector NAS non sono dipendenze del codice corrente. Versione, compatibilità e licenze sono input futuri e non devono essere descritti come approvati o testati. Il prossimo passo previsto è il contratto/connettore Fase 2 per Gmail `SENT`, inizialmente senza accesso a un servizio reale.
 
+## Decisione sincronizzatore Gmail — 11 ottobre 2026
+
+Il sottocompito B ha stabilito che il sincronizzatore Fase 2 utilizzerà il **client ufficiale Gmail** (`google-api-python-client` + `google-auth` + `google-auth-oauthlib`), non un MCP di terze parti. Vedere [`docs/adr/003-sincronizzatore-gmail-fase2.md`](adr/003-sincronizzatore-gmail-fase2.md).
+
+Le dipendenze future da aggiungere a `pyproject.toml` al momento dell'implementazione:
+
+| Pacchetto | Versione | Stato |
+|---|---|---|
+| `google-api-python-client` | da pinnare | non ancora nel lockfile; licenza Apache-2.0 verificata dalla documentazione |
+| `google-auth` | da pinnare | non ancora nel lockfile; licenza Apache-2.0 verificata dalla documentazione |
+| `google-auth-oauthlib` | da pinnare | non ancora nel lockfile; licenza Apache-2.0 verificata dalla documentazione |
+
+I due MCP candidati (`jimsimoy/gmail-mcp`, `klodr/gmail-mcp`) non sono dipendenze e non vanno aggiunti. La loro ispezione del codice sorgente non è stata possibile in questo sottocompito.
+
 ## Verifica e aggiornamento
 
 Per ogni aggiornamento:

@@ -62,12 +62,13 @@ React e React DOM sono compilati nel bundle distribuito; Vite/TypeScript/plugin 
 
 | Componente | Stato codice | Versione/licenza |
 |---|---|---|
-| Gmail API / connettore `SENT` | non implementato; prossimo passo Fase 2 | versione API, SDK, termini OAuth e licenze da inventariare prima dell'adozione |
+| Gmail API / connettore `SENT` | non implementato; sincronizzatore scelto: client ufficiale `google-api-python-client` + `google-auth` — ADR [`003`](../docs/adr/003-sincronizzatore-gmail-fase2.md) | Apache-2.0 verificata dalla documentazione Google; versioni da pinnare al momento dell'adozione |
+| MCP `jimsimoy/gmail-mcp` | **NON adottato**; ispezione codice sorgente non eseguita | licenza, versione e dipendenze SCONOSCIUTE — non verificate da fonte primaria |
+| MCP `klodr/gmail-mcp` | **NON adottato**; ispezione codice sorgente non eseguita | licenza, versione e dipendenze SCONOSCIUTE — non verificate da fonte primaria |
 | Immich | non integrato | URL/versione/API/licenza dell'istanza sono input futuri, non noti |
 | OmniRoute | non integrato | versione/protocollo/licenza/termini non noti |
 | Graphiti | non dipendenza del lockfile, non implementato | compatibilità e licenza primaria pendenti |
 | NAS/document connector | non implementato | tecnologia mount/protocollo/versione non noti |
-| MCP | non implementato | nessuna dipendenza presente |
 
 Non presentare tali componenti come installati, testati o approvati.
 

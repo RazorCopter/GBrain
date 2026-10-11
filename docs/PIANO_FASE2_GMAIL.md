@@ -2,7 +2,8 @@
 
 ## Stato e confini
 
-- **Stato:** backlog approvabile; nessuna voce di questo documento è implementata.
+- **Stato:** backlog approvabile; audit sincronizzatore completato (sottocompito B, 11 ottobre 2026). Nessuna voce implementativa di questo documento è implementata.
+- **Decisione sincronizzatore:** client ufficiale Gmail (`google-api-python-client` + `google-auth`). I due MCP candidati (`jimsimoy/gmail-mcp`, `klodr/gmail-mcp`) non sono stati verificati da fonte primaria e non entrano nel runtime. Dettagli in [`docs/adr/003-sincronizzatore-gmail-fase2.md`](adr/003-sincronizzatore-gmail-fase2.md).
 - **Prerequisito:** la fondazione Fase 1 resta utilizzabile per sviluppo deterministico, ma il collaudo Docker/Linux reale di migrazione, persistenza, worker, limiti, mount e backup/restore è ancora un gate separato.
 - **Incremento ristretto:** importazione read-only dei soli messaggi Gmail inviati dal proprietario, prima con fixture e contract test, poi con collaudo reale esplicitamente autorizzato.
 - **Fuori ambito:** inbox generica, invio/modifica/cancellazione Gmail, Immich, NAS, OmniRoute, Graphiti, sink Neo4j, estrazione LLM e collegamento di servizi personali durante la preparazione del backlog.
@@ -10,11 +11,14 @@
 
 ## Decisioni da chiudere prima del codice di rete
 
-1. **Identificare i candidati:** registrare repository, versione/commit, maintainer e licenza dei due MCP candidati citati nella specifica. Nel repository corrente non sono nominati; sono quindi indicati come MCP A e MCP B, senza assumerne identità.
-2. **Audit MCP A e MCP B:** per ciascuno verificare provenienza, manutenzione, licenza, dipendenze transitive, modalità di custodia token, scope richiesti, supporto a paginazione/history/MIME, telemetria, esecuzione di comandi, superficie prompt/tool e comportamento su retry/rate limit.
-3. **Audit client Gmail ufficiale:** valutare libreria Google supportata, versioni compatibili, licenza, dipendenze, flusso OAuth installato/web appropriato al deployment, gestione refresh token, timeout/retry e copertura delle API necessarie.
-4. **Decisione unica del sincronizzatore:** scegliere **un solo** percorso di produzione tra MCP A, MCP B e client ufficiale. Vietare sincronizzatori paralleli sullo stesso account/checkpoint; gli altri possono restare esclusivamente adattatori sperimentali isolati o essere scartati.
-5. **ADR obbligatoria:** documentare confronto, decisione, versione pin, modello di minaccia, modalità di rollback e motivazione. Nessuna nuova dipendenza entra nei lockfile prima di questa decisione.
+> **Stato aggiornato 11 ottobre 2026 — sottocompito B completato.**
+> I punti 1-5 sono stati risolti. Vedere [`docs/adr/003-sincronizzatore-gmail-fase2.md`](adr/003-sincronizzatore-gmail-fase2.md).
+
+1. ~~**Identificare i candidati:**~~ ✅ Candidati identificati: `jimsimoy/gmail-mcp`, `klodr/gmail-mcp`, client ufficiale `google-api-python-client` + `google-auth`.
+2. ~~**Audit MCP A e MCP B:**~~ ✅ Audit tentato; **ispezione del codice sorgente NON possibile** — nessun clone locale, nessun accesso diretto ai repository GitHub, vincolo di non installazione. Tutti gli aspetti risultano SCONOSCIUTI e NON VERIFICATI da fonte primaria.
+3. ~~**Audit client Gmail ufficiale:**~~ ✅ Verificato dalla documentazione pubblica ufficiale Google: paginazione `nextPageToken`, `messages.get` full/raw, `history.list`, scope `gmail.readonly`, `sendAs.list`, retry/backoff, flusso OAuth device/web, refresh/revoca. Apache-2.0.
+4. ~~**Decisione unica del sincronizzatore:**~~ ✅ Scelto **client ufficiale Gmail**. Motivazione capacità per capacità nell'ADR. MCP esclusi dal runtime; restano candidati futuri previa ispezione sorgente.
+5. ~~**ADR obbligatoria:**~~ ✅ Creata [`docs/adr/003-sincronizzatore-gmail-fase2.md`](adr/003-sincronizzatore-gmail-fase2.md) con matrice comparativa, contratto, minacce e 30 test contrattuali.
 
 ## Backlog prioritizzato
 
@@ -144,8 +148,8 @@
 
 ## Sequenza di delivery e gate
 
-1. Chiudere audit MCP A/MCP B/client ufficiale e ADR del singolo sincronizzatore.
-2. Implementare contratto, fixture e test P0 senza rete.
+1. ~~Chiudere audit MCP A/MCP B/client ufficiale e ADR del singolo sincronizzatore.~~ ✅ Completato — sottocompito B, 11 ottobre 2026.
+2. Implementare contratto, fixture e test P0 senza rete. ← **prossimo passo**
 3. Implementare storage/migrazione e pipeline fixture con test PostgreSQL deterministici disponibili; non dichiarare integrazione reale se usa fake.
 4. Implementare adattatore scelto dietro il contratto, mantenendo OAuth disabilitato senza configurazione esplicita.
 5. Superare enforcement `SENT`, MIME, pagination/checkpoint/reconcile/idempotenza e prompt-injection test.

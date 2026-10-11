@@ -1,9 +1,9 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
-**Data checkpoint:** 11 ottobre 2026  
-**Checkpoint:** sottocompito A — ricognizione runtime, correzioni backup/restore isolato e procedura one-shot
-**Fase corrente:** Fase 0 consolidata; fondazione Fase 1 verificata staticamente e localmente; collaudo Docker/Linux reale ancora pendente perché il daemon non era operativo
-**Giudizio di prontezza:** pronta per prosecuzione controllata e per lo sviluppo fixture-first della Fase 2, non pronta per dichiarare Fase 1 integralmente collaudata o per un deployment reale  
+**Data checkpoint:** 11 ottobre 2026
+**Checkpoint:** sottocompito B — audit comparativo Gmail MCP vs client ufficiale e decisione vincolante sincronizzatore
+**Fase corrente:** Fase 0 consolidata; fondazione Fase 1 verificata staticamente e localmente; collaudo Docker/Linux reale ancora pendente. Audit sincronizzatore Gmail completato; client ufficiale scelto.
+**Giudizio di prontezza:** pronta per implementazione fixture-first del contratto Gmail Fase 2. Non pronta per dichiarare Fase 1 integralmente collaudata o per un deployment reale.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
 ## Regola di lettura dello stato
@@ -119,7 +119,7 @@ Dettagli e storico dei comandi sono in [`docs/VERIFICHE_FASE1.md`](docs/VERIFICH
 - **Neo4j:** PostgreSQL è autorevole per design, ma il rebuild non esiste; entrambi i dump restano necessari.
 - **Storage:** cache non è backup; futuri `storage_ref` richiederanno una policy file coerente aggiuntiva.
 - **Operazioni:** RPO/RTO, retention, off-site, capacità, monitoraggio e soglie backpressure richiedono decisioni ambientali.
-- **Fase 2:** i due MCP candidati non sono identificati nel repository; non va inventata una scelta. Occorrono URL/versione/licenza e audit prima della selezione.
+- **Fase 2:** ~~i due MCP candidati non sono identificati nel repository; non va inventata una scelta.~~ Audit completato nel sottocompito B. Decisione: client ufficiale Gmail. Vedere [`docs/adr/003-sincronizzatore-gmail-fase2.md`](docs/adr/003-sincronizzatore-gmail-fase2.md).
 
 ## Accessi e input mancanti
 
@@ -128,7 +128,7 @@ Dettagli e storico dei comandi sono in [`docs/VERIFICHE_FASE1.md`](docs/VERIFICH
 - Percorsi/filesystem/capacità effettivi dei quattro mount e del Docker data root.
 - DNS, URL pubblico, reverse proxy, certificati TLS e policy firewall.
 - Vault/configuration recovery, registry/digest immutabile, RPO/RTO, retention e destinazione off-site.
-- Identità verificabili dei due MCP Gmail candidati e criteri organizzativi per scegliere un solo sincronizzatore.
+- ~~Identità verificabili dei due MCP Gmail candidati e criteri organizzativi per scegliere un solo sincronizzatore.~~ ✅ Risolto — sottocompito B.
 - OAuth client, account Gmail di prova, owner/alias e autorizzazione esplicita; nessun secret va aggiunto prima del gate reale.
 
 ## Procedura di ripresa del gate Fase 1
@@ -141,13 +141,23 @@ Dettagli e storico dei comandi sono in [`docs/VERIFICHE_FASE1.md`](docs/VERIFICH
 6. Predisporre target isolato con volumi nuovi, eseguire integralmente [`docs/BACKUP_RIPRISTINO.md`](docs/BACKUP_RIPRISTINO.md) e verificare i criteri dati/applicativi.
 7. Registrare risultati reali senza trasformare un check statico in prova runtime; correggere soltanto difetti riprodotti.
 
+## Checkpoint sottocompito B — 11 ottobre 2026
+
+- Audit comparativo completato tra MCP A (`jimsimoy/gmail-mcp`), MCP B (`klodr/gmail-mcp`) e client ufficiale Gmail.
+- **Ispezione MCP:** non è stato possibile ispezionare il codice sorgente dei due MCP; tutti gli aspetti risultano SCONOSCIUTI. Limite dichiarato senza colmare i vuoti.
+- **Client ufficiale:** capacità verificate dalla documentazione Google: `messages.list/get`, `history.list`, `sendAs.list`, paginazione, scope `gmail.readonly`, retry/429, OAuth device/web, refresh/revoca. Licenza Apache-2.0.
+- **Decisione:** client ufficiale Gmail scelto come unico sincronizzatore. MCP esclusi dal runtime; candidati futuri previa ispezione sorgente.
+- **ADR:** [`docs/adr/003-sincronizzatore-gmail-fase2.md`](docs/adr/003-sincronizzatore-gmail-fase2.md) — contiene matrice comparativa, contratto tipizzato, invarianti SENT, categorie errore, checkpoint/reconcile, 20 minacce e 30 test contrattuali.
+- **File aggiornati:** `PIANO_FASE2_GMAIL.md`, `DIPENDENZE.md`, `COMPONENTI_LICENZE.md`, `PROJECT_STATUS.md`.
+- **Nessun codice applicativo modificato**, nessuna dipendenza aggiunta, nessuna configurazione runtime alterata.
+
 ## Prossimo incremento ristretto — Fase 2 Gmail `SENT`
 
 Il backlog ufficiale è [`docs/PIANO_FASE2_GMAIL.md`](docs/PIANO_FASE2_GMAIL.md). Ordine immediato:
 
-1. identificare e auditare i due MCP candidati e il client Gmail ufficiale;
-2. decidere tramite ADR un **solo sincronizzatore** e i pin, senza credenziali;
-3. definire contratto e fixture/contract test deterministici;
+1. ~~identificare e auditare i due MCP candidati e il client Gmail ufficiale;~~ ✅
+2. ~~decidere tramite ADR un **solo sincronizzatore** e i pin, senza credenziali;~~ ✅
+3. definire contratto e fixture/contract test deterministici; ← **prossimo passo**
 4. modellare OAuth read-only, owner/alias e custodia token;
 5. imporre `SENT` su list, fetch e history;
 6. coprire MIME, limiti, paginazione, checkpoint, reconcile e idempotenza;

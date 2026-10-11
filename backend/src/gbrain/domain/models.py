@@ -51,6 +51,35 @@ class OutboxStatus(enum.StrEnum):
     FAILED = "failed"
 
 
+class ConnectorAccountStatus(enum.StrEnum):
+    PENDING_AUTHORIZATION = "pending_authorization"
+    ACTIVE = "active"
+    REAUTH_REQUIRED = "reauth_required"
+    REVOKED = "revoked"
+    DISABLED = "disabled"
+
+
+class SourcePolicyStatus(enum.StrEnum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    DISABLED = "disabled"
+
+
+class ReconciliationState(enum.StrEnum):
+    NOT_REQUIRED = "not_required"
+    REQUIRED_HISTORY_EXPIRED = "required_history_expired"
+    RUNNING = "running"
+    COMPLETE = "complete"
+
+
+class SourceItemState(enum.StrEnum):
+    ACTIVE = "active"
+    REMOVED = "removed"
+    OUT_OF_SCOPE = "out_of_scope"
+    EXCLUDED = "excluded"
+
+
 def _enum_values(members: type[enum.Enum]) -> list[str]:
     return [str(member.value) for member in members]
 
@@ -70,6 +99,9 @@ class OwnerAccount(TimestampMixin, Base):
     )
 
     sessions: Mapped[list[AuthSession]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
+    )
+    connector_accounts: Mapped[list[ConnectorAccount]] = relationship(
         back_populates="owner", cascade="all, delete-orphan"
     )
 
@@ -129,6 +161,21 @@ class SourceItem(TimestampMixin, Base):
     canonical_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    connector_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("connector_accounts.id", ondelete="RESTRICT"), index=True
+    )
+    source_state: Mapped[SourceItemState] = mapped_column(
+        Enum(
+            SourceItemState,
+            name="source_item_state",
+            native_enum=True,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+        default=SourceItemState.ACTIVE,
+    )
+    state_reason: Mapped[str | None] = mapped_column(String(120))
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     revisions: Mapped[list[SourceRevision]] = relationship(
         back_populates="source_item", cascade="all, delete-orphan"
@@ -149,6 +196,13 @@ class SourceRevision(Base):
     revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     normalized_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    normalized_content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    pipeline_version: Mapped[str] = mapped_column(
+        String(80), nullable=False, default="foundation-v1"
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    source_history_id: Mapped[str | None] = mapped_column(String(64))
     storage_ref: Mapped[str | None] = mapped_column(Text)
     captured_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -232,6 +286,122 @@ class SystemState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class ConnectorAccount(TimestampMixin, Base):
+    __tablename__ = "connector_accounts"
+    __table_args__ = (
+        UniqueConstraint("connector_kind", "external_account_id", name="uq_connector_account"),
+        CheckConstraint(
+            "oauth_token_ciphertext IS NULL OR oauth_token_format_version IS NOT NULL",
+            name="ck_connector_encrypted_token_versioned",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("owner_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    connector_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_account_id: Mapped[str] = mapped_column(String(320), nullable=False)
+    primary_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    status: Mapped[ConnectorAccountStatus] = mapped_column(
+        Enum(
+            ConnectorAccountStatus,
+            name="connector_account_status",
+            native_enum=True,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+        default=ConnectorAccountStatus.PENDING_AUTHORIZATION,
+    )
+    oauth_reference: Mapped[str | None] = mapped_column(String(512))
+    oauth_token_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary)
+    oauth_token_format_version: Mapped[int | None] = mapped_column(Integer)
+    oauth_scopes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    confirmed_aliases: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    alias_set_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_connection_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    owner: Mapped[OwnerAccount] = relationship(back_populates="connector_accounts")
+    policies: Mapped[list[SourcePolicy]] = relationship(
+        back_populates="connector_account", cascade="all, delete-orphan"
+    )
+    checkpoint_state: Mapped[GmailCheckpoint | None] = relationship(
+        back_populates="connector_account", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class SourcePolicy(TimestampMixin, Base):
+    __tablename__ = "source_policies"
+    __table_args__ = (
+        CheckConstraint("selection_label = 'SENT'", name="ck_gmail_policy_sent_only"),
+        CheckConstraint("item_limit > 0", name="ck_source_policy_item_limit"),
+        CheckConstraint("request_budget > 0", name="ck_source_policy_request_budget"),
+        CheckConstraint("batch_size > 0 AND batch_size <= 500", name="ck_source_policy_batch_size"),
+        CheckConstraint("concurrency = 1", name="ck_source_policy_concurrency_one"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    selection_label: Mapped[str] = mapped_column(String(32), nullable=False, default="SENT")
+    period_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_before: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    item_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=25)
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[SourcePolicyStatus] = mapped_column(
+        Enum(
+            SourcePolicyStatus,
+            name="source_policy_status",
+            native_enum=True,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+        default=SourcePolicyStatus.DRAFT,
+    )
+
+    connector_account: Mapped[ConnectorAccount] = relationship(back_populates="policies")
+
+
+class GmailCheckpoint(TimestampMixin, Base):
+    __tablename__ = "gmail_checkpoints"
+
+    connector_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    source_policy_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("source_policies.id", ondelete="RESTRICT"), nullable=False
+    )
+    history_id: Mapped[str | None] = mapped_column(String(64))
+    page_token: Mapped[str | None] = mapped_column(String(1024))
+    coverage_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    coverage_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconciliation_state: Mapped[ReconciliationState] = mapped_column(
+        Enum(
+            ReconciliationState,
+            name="gmail_reconciliation_state",
+            native_enum=True,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+        default=ReconciliationState.NOT_REQUIRED,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    connector_account: Mapped[ConnectorAccount] = relationship(back_populates="checkpoint_state")
 
 
 class AppConfiguration(Base):

@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     neo4j_password_file: OptionalPath = None
     neo4j_database: str = "neo4j"
 
+    # Richiesto soltanto dal sottocompito OAuth successivo se i token vengono
+    # cifrati applicativamente nel DB; deve essere un secret file separato.
+    gmail_token_encryption_key_file: OptionalPath = None
+
     worker_concurrency: int = Field(default=1, ge=1, le=1)
 
     @staticmethod
@@ -121,6 +125,24 @@ class Settings(BaseSettings):
         if secret is None:  # pragma: no cover - garantito dal validatore
             raise ConfigurationError(f"Secret mancante per {label}")
         return secret.get_secret_value()
+
+    @property
+    def gmail_token_encryption_key(self) -> bytes:
+        path = self.gmail_token_encryption_key_file
+        if path is None:
+            raise ConfigurationError(
+                "Gmail token encryption key non configurata: usare un secret file separato"
+            )
+        value = self._read_secret_file(path, "cifratura token Gmail").get_secret_value()
+        try:
+            decoded = bytes.fromhex(value)
+        except ValueError as exc:
+            raise ConfigurationError(
+                "La chiave di cifratura token Gmail deve essere esadecimale"
+            ) from exc
+        if len(decoded) != 32:
+            raise ConfigurationError("La chiave di cifratura token Gmail deve contenere 32 byte")
+        return decoded
 
     @property
     def database_url(self) -> str:
