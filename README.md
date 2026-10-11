@@ -4,7 +4,7 @@ GBrain è un second brain autobiografico self-hosted. Questo repository contiene
 
 ## Prerequisiti
 
-Per l'avvio supportato servono un host Linux x86_64, Git, Docker Engine e Docker Compose v2 (`docker compose`). Lo stack richiede circa 3,8 GiB di limiti memoria complessivi più margine per host, build e filesystem; i limiti effettivi vanno verificati sul runtime. Per LXC completare prima il runbook in [`docs/OPERAZIONI_LXC.md`](docs/OPERAZIONI_LXC.md).
+Per l'avvio supportato servono un host Linux x86_64, Git, Docker Engine e Docker Compose v2 (`docker compose`). Lo stack richiede circa 3,8 GiB di limiti memoria complessivi più margine per host, build e filesystem; i limiti effettivi vanno verificati sul runtime. Per LXC completare prima il runbook in [`docs/OPERAZIONI_LXC.md`](docs/OPERAZIONI_LXC.md). Per il deployment guidato tramite Portainer su Linux/LXC/NAS consultare la guida operativa dedicata in [`docs/DEPLOY_PORTAINER.md`](docs/DEPLOY_PORTAINER.md).
 
 Su Windows è possibile eseguire controlli e sviluppo con Docker Desktop Linux, ma la destinazione operativa prevista resta Linux/LXC. Gli script di backup/ripristino richiedono una shell POSIX e utility GNU/Linux; non sono script nativi Windows.
 
@@ -137,4 +137,4 @@ Problemi comuni:
 - OOM o throttling: confrontare limiti dichiarati e cgroup effettivi; non alzare limiti senza verificare risorse host;
 - disco pieno/backpressure: arrestare ingestion futura, non cancellare dati/volumi alla cieca, conservare dump verificati e analizzare volumi/log/code.
 
-Runbook operativi: [`docs/OPERAZIONI_LXC.md`](docs/OPERAZIONI_LXC.md), [`docs/SICUREZZA.md`](docs/SICUREZZA.md), [`docs/BACKUP_RIPRISTINO.md`](docs/BACKUP_RIPRISTINO.md), [`docs/COMPONENTI_LICENZE.md`](docs/COMPONENTI_LICENZE.md). Stato verificato e limiti: [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+Runbook operativi: [`docs/DEPLOY_PORTAINER.md`](docs/DEPLOY_PORTAINER.md), [`docs/OPERAZIONI_LXC.md`](docs/OPERAZIONI_LXC.md), [`docs/SICUREZZA.md`](docs/SICUREZZA.md), [`docs/BACKUP_RIPRISTINO.md`](docs/BACKUP_RIPRISTINO.md), [`docs/COMPONENTI_LICENZE.md`](docs/COMPONENTI_LICENZE.md). Stato verificato e limiti: [`PROJECT_STATUS.md`](PROJECT_STATUS.md).

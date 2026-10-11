@@ -32,17 +32,17 @@ x-app-environment: &app-environment
 
 x-app-volumes: &app-volumes
   - type: bind
-    source: ${DATA_DIR:-./runtime/data}
+    source: ${DATA_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/data}
     target: /var/lib/gbrain/data
   - type: bind
-    source: ${CACHE_DIR:-./runtime/cache}
+    source: ${CACHE_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/cache}
     target: /var/lib/gbrain/cache
   - type: bind
-    source: ${IMPORT_DIR:-./runtime/import}
+    source: ${IMPORT_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/import}
     target: /var/lib/gbrain/import
     read_only: true
   - type: bind
-    source: ${BACKUP_DIR:-./runtime/backup}
+    source: ${BACKUP_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/backup}
     target: /var/lib/gbrain/backup
 
 services:
@@ -118,7 +118,7 @@ services:
     secrets:
       - postgres_password
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/postgres}:/var/lib/postgresql/data
     networks:
       - backend
     healthcheck:
@@ -148,8 +148,8 @@ services:
     secrets:
       - neo4j_password
     volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
+      - ${NEO4J_DATA_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/neo4j}:/data
+      - ${NEO4J_LOGS_DIR:-${GBRAIN_HOST_STORAGE_PATH:-./runtime}/neo4j/logs}:/logs
     networks:
       - backend
     healthcheck:
