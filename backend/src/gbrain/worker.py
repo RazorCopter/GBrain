@@ -107,13 +107,14 @@ async def purge_sessions() -> None:
 
 async def run_worker() -> None:
     configure_logging(settings.log_level)
-    await procrastinate_app.run_worker_async(
-        concurrency=settings.worker_concurrency,
-        queues=["maintenance", "outbox"],
-        wait=True,
-        listen_notify=True,
-        name="gbrain-worker",
-    )
+    async with procrastinate_app.open_async():
+        await procrastinate_app.run_worker_async(
+            concurrency=settings.worker_concurrency,
+            queues=["maintenance", "outbox"],
+            wait=True,
+            listen_notify=True,
+            name="gbrain-worker",
+        )
 
 
 if __name__ == "__main__":
