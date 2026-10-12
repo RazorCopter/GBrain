@@ -180,7 +180,12 @@ POSTGRES_USER=gbrain
 GBRAIN_POSTGRES_PASSWORD=CAMBIA_CON_PASSWORD_POSTGRES_GENERATA
 GBRAIN_AUTH_SECRET=CAMBIA_CON_SECRET_MIN_32_CARATTERI_GENERATO
 GBRAIN_NEO4J_PASSWORD=CAMBIA_CON_PASSWORD_NEO4J_GENERATA
+
+# Cifratura credenziali fonti e token (opzionale, consigliata)
+GBRAIN_ENCRYPTION_MASTER_KEY=CAMBIA_CON_HEX_64_CARATTERI_GENERATO
 ```
+
+> **Nota sui Segreti Gmail e Fonti:** Non è più necessario montare file di secret o JSON di Google nel filesystem per collegare Gmail o altre fonti. Le credenziali vengono configurate, validate e salvate in forma cifrata AES-256-GCM direttamente dall'interfaccia utente di GBrain tramite il **Source Connection Wizard**.
 
 5. Cliccare su **Deploy the stack**. Portainer clonerà il repo, compilerà l'immagine tramite [`Dockerfile`](Dockerfile:1) senza tentare il pull remoto di `gbrain`, e avvierà tutti i 4 servizi.
 
@@ -489,13 +494,40 @@ In Portainer -> **Stacks** -> `gbrain`:
 - Tutti i 4 container (`app`, `worker`, `postgres`, `neo4j`) devono essere nello stato **running**.
 - I servizi `app` e `postgres` devono mostrare lo stato **healthy**.
 
-### 7.2 Verifica della Pagina Fonti
-Nella dashboard principale, cliccare sulla scheda **Fonti**. Se non sono state inserite credenziali Gmail in `secrets`, la scheda mostrerà l'integrazione Gmail nello stato **Non configurato**, confermando che lo stack è pienamente integro e operativo.
+### 7.2 Verifica della Pagina Fonti e Connessione con il Source Connection Wizard
+Nella dashboard principale di GBrain, navigare nella scheda **Fonti** (`/sources`):
+- Il sistema mostra il nuovo catalogo connettori ([`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1)) con lo stato di ciascun connettore (Gmail `SENT`, Immich, Directory/NAS, OmniRoute).
+- In assenza di configurazione precedente, Gmail apparirà come **Non configurato**.
+- È possibile fare clic su **Configura** per aprire il **Source Connection Wizard** ([`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1)), caricare il file `.json` scaricato dalla Google Cloud Console (oppure inserire `Client ID` e `Client Secret` manualmente) e cliccare su **Salva e attiva fonte**. Nessun riavvio dei container o montaggio di file è richiesto.
 
-### 7.3 Aggiornamenti Futuri dello Stack
-- **Se si è usato il Metodo A (Repository)**: in Portainer -> Stack `gbrain` -> premere **Pull and redeploy**. Portainer scaricherà i nuovi commit dal repository Git e ricompilerà automaticamente l'immagine sul server, mantenendo intatte le policy senza interrogare registri esterni.
-- **Se si è usata l'Alternativa Shell diretta**: eseguire da terminale sul server `cd /opt/gbrain && git pull && docker compose --profile compact up -d --build`.
-- **Se si è usato il Metodo B (Web editor)**: eseguire da shell `git pull && docker build -t gbrain:0.1.0 .` nella cartella di build e in Portainer premere **Redeploy**.
+### 7.3 Aggiornamenti Futuri dello Stack e Persistenza dei Dati
+
+L'aggiornamento dello stack preserva integralmente lo stato dei database relazionali, del grafo Neo4j e dei file archiviati purché vengano rispettati i volumi persistenti:
+
+1. **Persistenza Garantita:** I dati di PostgreSQL risiedono in `/mnt/synology_docker/GBrain/postgres`, i dati di Neo4j in `/mnt/synology_docker/GBrain/neo4j` e i dati applicativi in `/mnt/synology_docker/GBrain/data`. La ricreazione o l'aggiornamento dei container `app` e `worker` **non tocca** né resetta queste directory.
+2. **Migrazioni Automatiche dello Schema:** All'avvio del container `app`, l'entrypoint esegue automaticamente `alembic upgrade head`, applicando in modo trasparente e ordinato eventuali nuove migrazioni (inclusa la migrazione `20261012_0004_source_credentials` per la gestione delle credenziali cifrate a database).
+3. **Procedura di Aggiornamento per Metodo:**
+   - **Metodo A (Stack da Repository in Portainer):**
+     1. Accedere a Portainer -> **Stacks** -> `gbrain`;
+     2. Cliccare sulla scheda **Editor** o sul pulsante **Pull and redeploy**;
+     3. Attivare l'opzione **Re-pull image** o **Re-build image** se richiesta dal contesto;
+     4. Confermare l'aggiornamento. Portainer scaricherà i nuovi commit da `origin/main` e ricompilerà l'immagine locale mantenendo invariati i bind mount e i volumi.
+   - **Alternativa Shell diretta (Clone Git):**
+     ```bash
+     cd /opt/gbrain
+     git pull origin main
+     docker compose --profile compact build
+     docker compose --profile compact up -d
+     docker compose --profile compact ps
+     ```
+   - **Metodo B (Web Editor con build locale):**
+     Eseguire da shell nella directory di build del server:
+     ```bash
+     cd /opt/gbrain-build
+     git pull origin main
+     docker build -t gbrain:0.1.0 .
+     ```
+     e in Portainer premere **Redeploy** sullo stack.
 
 ### 7.4 Backup e Ripristino dei Dati
 I comandi e le procedure formali di backup dei volumi e dei dump database sono documentati in [`docs/BACKUP_RIPRISTINO.md`](docs/BACKUP_RIPRISTINO.md:1) ed eseguibili mediante [`scripts/backup.sh`](scripts/backup.sh:1) e [`scripts/restore.sh`](scripts/restore.sh:1).

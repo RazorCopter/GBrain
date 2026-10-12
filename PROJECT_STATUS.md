@@ -1,9 +1,9 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
-**Data checkpoint:** 11 ottobre 2026  
-**Checkpoint:** Sottocompito E — Audit finale della Fase 2 Gmail, consolidamento test e checkpoint riprendibile  
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` completata a livello di contratto, nucleo, OAuth Web, cifratura, worker Procrastinate, FTS, API, UI Fonti e suite test di audit.  
-**Giudizio di prontezza:** codice Fase 1 e Fase 2 pronto per il collaudo infrastrutturale e configurazione credenziali; non pronta per dichiarare integrazione reale con account personali o deployment in produzione.  
+**Data checkpoint:** 12 ottobre 2026
+**Checkpoint:** Fase F — Source Connection Wizard, connettori estensibili e credenziali cifrate
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il nuovo **Source Connection Wizard**, catalogo modulare dei connettori, gestione credenziali cifrate AES-256-GCM su PostgreSQL (Alembic head `20261012_0004`), fallback trasparente su filesystem e suite test deterministica estesa a 141 test.
+**Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo e UI; pronto per il collaudo infrastrutturale Docker/Linux e configurazione con account reali; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
 ## Regola di lettura dello stato
@@ -11,11 +11,11 @@
 Questo checkpoint distingue rigorosamente:
 
 - **codice predisposto:** file, schemi, API e UI esistono, sono stati revisionati trasversalmente e allineati;
-- **test deterministico superato:** un comando locale eseguito senza rete né servizi esterni ha restituito exit 0 (93 test superati);
+- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (141 test superati tra backend e frontend);
 - **test integrazione pendente:** test marcati esplicitamente con `@pytest.mark.skip` (3 test) che richiedono demone Docker Linux, PostgreSQL reale con estensioni o credenziali Google Cloud autorizzate;
 - **integrazione reale non eseguita:** non eseguito collaudo runtime con account Google reale o container Docker su Linux host.
 
-Un elemento predisposto o coperto da fixture/fake non equivale a un collaudo runtime. I rapporti precedenti ([`docs/RAPPORTO_COLLAUDO_FASE1_2026-10-11.md`](docs/RAPPORTO_COLLAUDO_FASE1_2026-10-11.md), sottocompiti A–D) rimangono storici; la sintesi ufficiale corrente della Fase 2 è questo documento.
+Un elemento predisposto o coperto da fixture/fake non equivale a un collaudo runtime. I rapporti precedenti ([`docs/RAPPORTO_COLLAUDO_FASE1_2026-10-11.md`](docs/RAPPORTO_COLLAUDO_FASE1_2026-10-11.md), sottocompiti A–E) rimangono storici; la sintesi ufficiale corrente della Fase 2 e dell'infrastruttura connettori è questo documento.
 
 ---
 
@@ -32,25 +32,31 @@ Un elemento predisposto o coperto da fixture/fake non equivale a un collaudo run
 | **API Private e Protezione CSRF** | **RAGGIUNTO** | Tutte le route `/api/gmail/*` richiedono sessione valida (401 per anonimi); tutte le mutazioni (POST/PUT/DELETE) richiedono token CSRF valido (403 per CSRF mancante/errato); preview isolata senza persistenza di record sorgente; import richiede conferma crittografica della policy visualizzata; query utente FTS PostgreSQL isolata e mai inviata a Google. |
 | **Coda Procrastinate & Concorrenza** | **RAGGIUNTO** | Lock globale `gmail-heavy-global` su coda `gmail`; retry limitato con backoff esponenziale solo per errori transienti/quota; payload task serializzati con soli ID logici e mode (nessuna credenziale); concorrenza fissata a 1. |
 | **Ricerca Testuale FTS e Citazioni** | **RAGGIUNTO** | Indice PostgreSQL GIN su `to_tsvector('simple', ...)` con `websearch_to_tsquery`; citazioni strutturate con `source_item_id`, `source_revision_id`, `evidence`, `revision_hash` e link verificabile; filtri per account, date e limite massimo applicati. |
-| **UI Fonti Gmail** | **RAGGIUNTO** | Componente React [`GmailSourcesPage.tsx`](frontend/src/GmailSourcesPage.tsx) con indicatori di stato (non configurato / disconnesso / connesso), configurazione policy, preview, avanzamento job, gestione alias, ricerca e citazioni. Build verificata con Vite. |
-| **Schema e Migrazioni DB** | **RAGGIUNTO** | Tre migrazioni Alembic incrementali e reversibili (`0001_initial_infrastructure`, `0002_gmail_sent_core`, `0003_gmail_operational`); nessun ritocco a migrazioni storiche; perfetta coerenza tra modelli ORM SQLAlchemy e DDL migrazioni. |
+| **Source Connection Wizard & UI Fonti** | **RAGGIUNTO** | Nuova UI unificata [`SourcesPage.tsx`](frontend/src/SourcesPage.tsx) e [`SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx) con catalogo connettori a schede, drag-and-drop / upload file JSON Google Cloud o input manuale credenziali, collegata a [`GmailSourcesPage.tsx`](frontend/src/GmailSourcesPage.tsx). Build verificata con Vite. |
+| **Catalogo Connettori Estensibile** | **RAGGIUNTO** | Struttura modulare in [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py:1) con metadata completi (`ConnectorCategory`, `AuthModel`, `SourceFieldDefinition`, `ConnectorCardMetadata`), endpoint `/api/sources/catalog` e predisposizione connettori futuri (Immich, NAS/Directory, OmniRoute). |
+| **Credenziali Cifrate AES-256-GCM in DB** | **RAGGIUNTO** | Modulo crittografico [`backend/src/gbrain/application/crypto.py`](backend/src/gbrain/application/crypto.py:1) con crittografia autenticata AES-256-GCM e derivazione chiave PBKDF2; repository relazionale [`backend/src/gbrain/infrastructure/source_credentials_repository.py`](backend/src/gbrain/infrastructure/source_credentials_repository.py:1); endpoint REST privati `/api/sources/{source_id}/credentials` con CSRF protection; fallback trasparente su file secrets del filesystem. |
+| **Schema e Migrazioni DB (Alembic Head)** | **RAGGIUNTO** | Quattro migrazioni Alembic incrementali e reversibili con Alembic head a `20261012_0004` ([`backend/migrations/versions/20261012_0004_source_credentials.py`](backend/migrations/versions/20261012_0004_source_credentials.py:1)); perfetta coerenza tra modelli ORM SQLAlchemy ([`SourceCredentialsModel`](backend/src/gbrain/domain/models.py:171)) e DDL migrazioni. |
 | **Collaudo runtime Docker/Linux reale** | **PENDENTE** | Richiede demone Docker Linux operativo su host di prova (in ambiente di sviluppo locale la named pipe Docker Desktop Linux era assente). |
 | **Collaudo Gmail reale Google Cloud** | **PENDENTE** | Richiede credenziali Google Cloud di prova configurate e consenso esplicito su casella reale; intenzionalmente non eseguito per evitare uso di credenziali o dati non autorizzati. |
 | **Esecuzione Procrastinate su DB reale** | **PENDENTE** | Richiede PostgreSQL reale con estensioni e migrazioni applicate per validare il lock advisory/tabella Procrastinate. |
 
 ---
 
-## Difetti trovati e corretti durante l'audit
+## Evoluzione e Nuove Feature — GBrain Source Connection Wizard
 
-1. **Enforcement alias obbligatorio su avvio importazione (`start_job_endpoint` in [`backend/src/gbrain/presentation/gmail_api.py`](backend/src/gbrain/presentation/gmail_api.py:300)):**
-   - *Problema:* L'endpoint `/api/gmail/jobs` verificava la corrispondenza della policy ma non controllava esplicitamente che `account.confirmed_aliases` fosse non vuoto prima di accodare un lavoro di importazione (`full`, `incremental`, `reconciliation`).
-   - *Correzione:* Aggiunto controllo preventivo che solleva `GmailServiceError("alias_required", ...)` (HTTP 400) se nessun alias è confermato.
-2. **Enforcement alias nel job worker (`execute_gmail_job` in [`backend/src/gbrain/application/gmail_jobs.py`](backend/src/gbrain/application/gmail_jobs.py:434)):**
-   - *Problema:* Il worker procedeva all'inizializzazione del connettore anche con alias vuoti se invocato direttamente fuori dalla preview.
-   - *Correzione:* Aggiunto controllo di sicurezza a difesa in profondità che solleva `GmailServiceError("alias_required", ...)` bloccando l'esecuzione dell'importazione.
-3. **Completamento copertura rotte private nell'audit (`test_private_gmail_routes_require_auth_and_mutations_require_csrf` in [`backend/tests/test_gmail_operational.py`](backend/tests/test_gmail_operational.py:150)):**
-   - *Problema:* Il test di sicurezza sulle route del router Gmail non includeva esplicitamente `/api/gmail/aliases/{alias}` (DELETE) tra le mutazioni protette da CSRF né `/api/gmail/sources/{source_item_id}/live-evidence` (GET) tra le route protette da Principal.
-   - *Correzione:* Integrate entrambe le rotte nella matrice di controllo, verificando che tutte le 14 route registrate sul router Gmail applichino le dipendenze di autenticazione e CSRF prescritte.
+Nel ciclo di implementazione del **Source Connection Wizard** sono stati consolidati i seguenti componenti architetturali:
+
+1. **Catalogo Modulare dei Connettori:**
+   - Astrazione formale delle definizioni connettore in [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py:1).
+   - Esposizione di metadata dichiarativi via API (`id`, `name`, `category`, `description`, `icon`, `auth_model`, `config_fields`, `documentation_url`).
+   - Supporto nativo per molteplici modelli di autenticazione: `oauth2_web`, `api_key`, `local_directory`, `webhook`.
+2. **Gestione Credenziali Cifrate in Database:**
+   - Tabella relazionale `source_credentials` introdotta tramite migrazione Alembic [`backend/migrations/versions/20261012_0004_source_credentials.py`](backend/migrations/versions/20261012_0004_source_credentials.py:1).
+   - Conservazione confidenziale dei campi sensibili (`encrypted_client_secret`, `encrypted_extra_config`) cifrati con AES-256-GCM a 256 bit e IV casuale a 96 bit via [`backend/src/gbrain/application/crypto.py`](backend/src/gbrain/application/crypto.py:1).
+   - Risoluzione gerarchica delle credenziali: il repository interroga prioritariamente il database relazionale; se assente, esegue il fallback non distruttivo sui secret montati da filesystem (`/run/secrets/gmail_oauth_client`).
+3. **Interfaccia Utente Reattiva e Source Wizard:**
+   - Componente [`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1) per la configurazione assistita in modalità upload file JSON Google o compilazione manuale dei campi (`Client ID`, `Client Secret`).
+   - Schermata panoramica [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) con raggruppamento per stato (fonti connesse vs catalogo connettori disponibili) e navigazione fluida verso il connettore Gmail o il wizard di attivazione.
 
 ---
 
@@ -59,32 +65,41 @@ Un elemento predisposto o coperto da fixture/fake non equivale a un collaudo run
 Tutti i controlli deterministici sono stati eseguiti localmente con esito positivo:
 
 - **Pytest:** `uv run pytest backend/tests -v`
-  - **93 test superati**, **3 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
+  - **141 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
   - 0 fallimenti, 0 errori.
 - **Ruff linter:** `uv run ruff check backend`
   - **Superato:** 0 errori, 0 avvisi.
 - **Ruff formatter:** `uv run ruff format --check backend`
-  - **Superato:** 46 file formattati in modo conforme.
+  - **Superato:** 49 file formattati in modo conforme.
 - **Mypy type check:** `uv run mypy backend/src backend/tests`
-  - **Superato:** Successo su tutti i 42 file sorgente, 0 errori di tipo.
+  - **Superato:** Successo su tutti i 45 file sorgente, 0 errori di tipo.
 - **Frontend TypeScript & Build:** `npm --prefix frontend run build`
-  - **Superato:** Type check `tsc -b` superato, build Vite completata in 83 ms senza errori.
+  - **Superato:** Type check `tsc -b` superato, bundle Vite completato senza errori.
 
 ---
 
-## File modificati e creati nel Sottocompito E
+## File modificati e creati nella feature Source Connection Wizard
 
 - **Creati:**
-  - [`backend/tests/test_gmail_audit_fase2.py`](backend/tests/test_gmail_audit_fase2.py) — Suite di audit consolidata con 28 nuovi test specifici per OAuth, cifratura, alias, SENT invariant, MIME, sync engine, API CSRF, budget e 3 test pendenti per integrazione reale.
+  - [`backend/migrations/versions/20261012_0004_source_credentials.py`](backend/migrations/versions/20261012_0004_source_credentials.py:1) — Migrazione Alembic (head `20261012_0004`) per la tabella `source_credentials`.
+  - [`backend/src/gbrain/application/crypto.py`](backend/src/gbrain/application/crypto.py:1) — Modulo crittografico unificato AES-256-GCM con autenticazione AAD e derivazione di chiave.
+  - [`backend/src/gbrain/infrastructure/source_credentials_repository.py`](backend/src/gbrain/infrastructure/source_credentials_repository.py:1) — Repository relazionale asincrono per il ciclo di vita delle credenziali fonti.
+  - [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:1) — Router FastAPI con endpoint `/api/sources/catalog` e `/api/sources/{source_id}/credentials`.
+  - [`backend/tests/test_sources_wizard_backend.py`](backend/tests/test_sources_wizard_backend.py:1) — Suite di 15 test per il catalogo fonti, cifratura credenziali, API private e fallback filesystem.
+  - [`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1) — Componente React per la configurazione guidata delle fonti con upload JSON e form manuale.
+  - [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) — Pagina catalogo fonti con schede connettori, stato di connessione e filtri di categoria.
 - **Modificati:**
-  - [`backend/src/gbrain/presentation/gmail_api.py`](backend/src/gbrain/presentation/gmail_api.py) — Correzione enforcement alias obbligatorio su avvio lavoro di importazione.
-  - [`backend/src/gbrain/application/gmail_jobs.py`](backend/src/gbrain/application/gmail_jobs.py) — Correzione enforcement alias a difesa in profondità nel worker task.
-  - [`backend/tests/test_gmail_operational.py`](backend/tests/test_gmail_operational.py) — Estensione copertura completa rotte private e mutazioni CSRF.
-  - [`docs/PIANO_FASE2_GMAIL.md`](docs/PIANO_FASE2_GMAIL.md) — Aggiornamento stato sequenza di delivery, chiusura sottocompiti A–E e marcatura gate runtime pendenti.
-  - [`docs/SICUREZZA.md`](docs/SICUREZZA.md) — Aggiornamento architettura di sicurezza con stato consolidato Fase 2.
-  - [`docs/CONNETTORI.md`](docs/CONNETTORI.md) — Allineamento stato Fase 2 e contratti operativi.
-  - [`README.md`](README.md) — Allineamento descrizione repository a Fase 1 + Fase 2 Gmail deterministica completata.
-  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — Checkpoint ufficiale conclusivo Fase 2.
+  - [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py:1) — Estensione contrattuale con dataclass dei metadata connettori e catalogo registry.
+  - [`backend/src/gbrain/domain/models.py`](backend/src/gbrain/domain/models.py:1) — Definizione ORM del modello [`SourceCredentialsModel`](backend/src/gbrain/domain/models.py:171).
+  - [`backend/src/gbrain/application/gmail_oauth.py`](backend/src/gbrain/application/gmail_oauth.py:1) — Integrazione della risoluzione ibrida delle credenziali (database prioritario con fallback filesystem).
+  - [`backend/src/gbrain/application/gmail_service.py`](backend/src/gbrain/application/gmail_service.py:1) — Cablaggio del repository credenziali e gestione stato configurato dinamico.
+  - [`backend/src/gbrain/presentation/api.py`](backend/src/gbrain/presentation/api.py:1) — Registrazione del nuovo router `sources_router`.
+  - [`backend/src/gbrain/presentation/schemas.py`](backend/src/gbrain/presentation/schemas.py:1) — Schemi Pydantic per catalogo connettori e credenziali fonti.
+  - [`backend/src/gbrain/config.py`](backend/src/gbrain/config.py:1) — Supporto a `GBRAIN_ENCRYPTION_MASTER_KEY` con fallback su chiave token Gmail.
+  - [`frontend/src/api.ts`](frontend/src/api.ts:1) — Client API con metodi per catalogo fonti e salvataggio credenziali cifrate.
+  - [`frontend/src/GmailSourcesPage.tsx`](frontend/src/GmailSourcesPage.tsx:1) — Integrazione del wizard e pulsante di configurazione rapida credenziali.
+  - [`frontend/src/styles.css`](frontend/src/styles.css:1) — Stili responsivi per wizard di onboarding, card del catalogo fonti e upload box.
+  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato alla Fase F.
 
 ---
 

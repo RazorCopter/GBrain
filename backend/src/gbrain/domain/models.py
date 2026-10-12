@@ -104,6 +104,9 @@ class OwnerAccount(TimestampMixin, Base):
     connector_accounts: Mapped[list[ConnectorAccount]] = relationship(
         back_populates="owner", cascade="all, delete-orphan"
     )
+    source_client_credentials: Mapped[list[SourceClientCredential]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
+    )
 
 
 class AuthSession(Base):
@@ -453,3 +456,26 @@ class AppConfiguration(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class SourceClientCredential(TimestampMixin, Base):
+    __tablename__ = "source_client_credentials"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "source_kind", name="uq_source_client_owner_kind"),
+        Index("ix_source_client_credentials_owner_id", "owner_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("owner_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    auth_method: Mapped[str] = mapped_column(String(32), nullable=False, default="oauth2")
+    client_type: Mapped[str] = mapped_column(String(32), nullable=False, default="web")
+    client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    encrypted_credentials: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    format_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    configured_redirect_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    owner: Mapped[OwnerAccount] = relationship(back_populates="source_client_credentials")

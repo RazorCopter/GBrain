@@ -51,6 +51,70 @@ class BudgetExhaustedError(ConnectorError):
         self.resource = resource
 
 
+class SourceCategory(StrEnum):
+    EMAIL_COMMUNICATIONS = "email_communications"
+    CLOUD_STORAGE = "cloud_storage"
+    MEDIA_PHOTOS = "media_photos"
+    LOCAL_STORAGE = "local_storage"
+    DEVELOPER_CODE = "developer_code"
+    CONVERSATIONS_AI = "conversations_ai"
+    NETWORKING = "networking"
+
+
+class AuthenticationMethod(StrEnum):
+    OAUTH2_AUTHORIZATION_CODE = "oauth2_authorization_code"
+    API_TOKEN_HEADER = "api_token_header"  # noqa: S105
+    BEARER_TOKEN = "bearer_token"  # noqa: S105
+    FILESYSTEM_PATH = "filesystem_path"
+    ARCHIVE_UPLOAD = "archive_upload"
+    NONE = "none"
+
+
+class ConnectorStatus(StrEnum):
+    FULLY_AVAILABLE = "fully_available"
+    COMING_SOON = "coming_soon"
+    MAINTENANCE = "maintenance"
+    DEPRECATED = "deprecated"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFieldDescriptor:
+    name: str
+    label: str
+    field_type: str
+    required: bool = True
+    placeholder: str = ""
+    description: str = ""
+    help_text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ImportPolicyDescriptor:
+    supports_date_range: bool = True
+    default_window_days: int = 30
+    max_items_limit: int = 5000
+    default_item_limit: int = 500
+    max_request_budget: int = 2000
+    default_request_budget: int = 200
+    label_restriction: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDescriptor:
+    id: str
+    name: str
+    category: SourceCategory
+    description: str
+    icon: str
+    auth_method: AuthenticationMethod
+    status: ConnectorStatus
+    test_available: bool = False
+    sync_capabilities: ConnectorCapabilities | None = None
+    config_fields: tuple[SourceFieldDescriptor, ...] = ()
+    import_policy: ImportPolicyDescriptor | None = None
+    documentation_url: str | None = None
+
+
 class PageState(StrEnum):
     COMPLETE = "complete"
     PARTIAL_BUDGET = "partial_budget"
@@ -183,3 +247,163 @@ class ConnectorContract(
         checkpoint: CheckpointT,
         budget: RequestBudget,
     ) -> ReconcileT_co: ...
+
+
+SOURCE_CATALOG: tuple[SourceDescriptor, ...] = (
+    SourceDescriptor(
+        id="gmail",
+        name="Google Gmail",
+        category=SourceCategory.EMAIL_COMMUNICATIONS,
+        description="Sincronizzazione riservata delle email inviate (SENT) con perimetro read-only.",
+        icon="gmail",
+        auth_method=AuthenticationMethod.OAUTH2_AUTHORIZATION_CODE,
+        status=ConnectorStatus.FULLY_AVAILABLE,
+        test_available=True,
+        sync_capabilities=ConnectorCapabilities(
+            source_kind="gmail",
+            read_only=True,
+            pagination=True,
+            incremental=True,
+            reconciliation=True,
+            max_page_size=100,
+            concurrency=1,
+            operations=(
+                "test_connection",
+                "preview_selection",
+                "enumerate_page",
+                "fetch_raw",
+                "normalize_content",
+                "reconcile",
+            ),
+        ),
+        config_fields=(
+            SourceFieldDescriptor(
+                name="client_id",
+                label="Client ID Google OAuth",
+                field_type="text",
+                required=True,
+                placeholder="xxxx.apps.googleusercontent.com",
+                description="ID client OAuth 2.0 Web Application",
+            ),
+            SourceFieldDescriptor(
+                name="client_secret",
+                label="Client Secret Google",
+                field_type="password",
+                required=True,
+                placeholder="GOCSPX-xxxx",
+                description="Client secret riservato dell'applicazione Google Cloud Console",
+            ),
+            SourceFieldDescriptor(
+                name="redirect_uri_override",
+                label="Redirect URI personalizzata",
+                field_type="url",
+                required=False,
+                placeholder="https://dominio-o-ip/api/sources/gmail/oauth/callback",
+                description="Opzionale; se omessa viene rilevata automaticamente dall'istanza",
+            ),
+        ),
+        import_policy=ImportPolicyDescriptor(
+            supports_date_range=True,
+            default_window_days=30,
+            max_items_limit=5000,
+            default_item_limit=500,
+            max_request_budget=2000,
+            default_request_budget=200,
+            label_restriction="SENT",
+        ),
+        documentation_url="https://console.cloud.google.com/apis/credentials",
+    ),
+    SourceDescriptor(
+        id="google_drive",
+        name="Google Drive",
+        category=SourceCategory.CLOUD_STORAGE,
+        description="Indicizzazione documentale, PDF e fogli di calcolo archiviati su Google Drive.",
+        icon="google_drive",
+        auth_method=AuthenticationMethod.OAUTH2_AUTHORIZATION_CODE,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="google_calendar",
+        name="Google Calendar",
+        category=SourceCategory.EMAIL_COMMUNICATIONS,
+        description="Importazione eventi, riunioni storiche e metadati di calendario.",
+        icon="google_calendar",
+        auth_method=AuthenticationMethod.OAUTH2_AUTHORIZATION_CODE,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="immich",
+        name="Immich Foto & Video",
+        category=SourceCategory.MEDIA_PHOTOS,
+        description="Asset multimediali, timeline ed eventi fotografici self-hosted da istanza Immich.",
+        icon="immich",
+        auth_method=AuthenticationMethod.API_TOKEN_HEADER,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="synology",
+        name="Synology NAS",
+        category=SourceCategory.LOCAL_STORAGE,
+        description="Cartelle condivise, snapshot e file system su dispositivi NAS Synology via API DSM.",
+        icon="synology",
+        auth_method=AuthenticationMethod.BEARER_TOKEN,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="local_documents",
+        name="Documenti Locali",
+        category=SourceCategory.LOCAL_STORAGE,
+        description="Scansione sicura di directory locali del server (PDF, markdown, note di testo).",
+        icon="folder",
+        auth_method=AuthenticationMethod.FILESYSTEM_PATH,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="github",
+        name="GitHub",
+        category=SourceCategory.DEVELOPER_CODE,
+        description="Commit history, pull request, issue e documentazione repository.",
+        icon="github",
+        auth_method=AuthenticationMethod.BEARER_TOKEN,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="chatgpt_export",
+        name="ChatGPT Export",
+        category=SourceCategory.CONVERSATIONS_AI,
+        description="Importazione sicura di archivi zip esportati da ChatGPT contenenti conversazioni storiche.",
+        icon="chatgpt",
+        auth_method=AuthenticationMethod.ARCHIVE_UPLOAD,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+    SourceDescriptor(
+        id="omniroute",
+        name="OmniRoute",
+        category=SourceCategory.NETWORKING,
+        description="Topologia di rete, routing table e diagnostica da apparati OmniRoute.",
+        icon="network",
+        auth_method=AuthenticationMethod.API_TOKEN_HEADER,
+        status=ConnectorStatus.COMING_SOON,
+        test_available=False,
+    ),
+)
+
+
+def get_source_catalog() -> tuple[SourceDescriptor, ...]:
+    """Restituisce l'elenco immutabile di tutti i descrittori di fonte supportati o pianificati."""
+    return SOURCE_CATALOG
+
+
+def get_source_descriptor(source_id: str) -> SourceDescriptor | None:
+    """Recupera il descrittore di fonte specificato o None se inesistente."""
+    for descriptor in SOURCE_CATALOG:
+        if descriptor.id == source_id:
+            return descriptor
+    return None

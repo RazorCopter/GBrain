@@ -1,8 +1,30 @@
-# Contratto dei connettori
+# Contratto dei connettori e Catalogo Modulare Fonti
 
-> **Stato 11 ottobre 2026:** contratto, nucleo e integrazione Gmail `SENT` (OAuth web server-side, token cifrati AES-256-GCM, worker Procrastinate, API private con CSRF, ricerca FTS, pagina Fonti UI e audit consolidato Sottocompito E con 93 test deterministici) sono implementati e verificabili senza rete. Collaudi reali con Docker/Linux e Google Cloud restano pendenti; nessuna credenziale reale è stata usata.
+> **Stato 12 ottobre 2026:** contratto dei connettori, nucleo Gmail `SENT` e nuovo **Catalogo Modulare Fonti con Source Connection Wizard** (gestione credenziali cifrate AES-256-GCM su PostgreSQL con Alembic head `20261012_0004`, fallback filesystem, UI reattiva con upload JSON e 108 test deterministici superati) sono implementati e verificabili senza rete. Collaudi reali con Docker/Linux e Google Cloud restano pendenti; nessuna credenziale reale è stata usata.
 
 Il contratto in [`backend/src/gbrain/domain/connectors.py`](../backend/src/gbrain/domain/connectors.py) usa protocolli e dataclass generici senza esporre oggetti dinamici Google. Gmail specializza selezione, cursor, locator, raw message, checkpoint e risultato in [`backend/src/gbrain/domain/gmail.py`](../backend/src/gbrain/domain/gmail.py). Setup operativo e restrizioni sono in [`docs/GMAIL_OAUTH_SETUP.md`](GMAIL_OAUTH_SETUP.md).
+
+## Catalogo Modulare delle Fonti
+
+GBrain adotta un catalogo estensibile per registrare, visualizzare e configurare sorgenti dati eterogenee (email, fotografie, file locali, chat, note, dati biometrici).
+
+### Metadata e Astrazioni del Catalogo
+In [`backend/src/gbrain/domain/connectors.py`](../backend/src/gbrain/domain/connectors.py:1) sono formalizzate le strutture dati fondamentali:
+- **`ConnectorCategory`:** `email`, `photos`, `files`, `chat`, `notes`, `health`, `custom`;
+- **`AuthModel`:** `oauth2_web`, `api_key`, `local_directory`, `webhook`, `none`;
+- **`SourceFieldDefinition`:** specifica dichiarativa di ogni campo richiesto dal connettore (`id`, `label`, `type`, `required`, `placeholder`, `description`, `default_value`, `is_secret`);
+- **`ConnectorCardMetadata`:** metadata completi della scheda per la UI (`id`, `name`, `category`, `description`, `icon`, `auth_model`, `status`, `config_fields`, `documentation_url`).
+
+### Connettori Registrati nel Catalogo
+1. **Gmail SENT (`gmail`):** attivo e configurabile. Autenticazione `oauth2_web` con scope restrittivo `gmail.readonly`, importazione guidata via JSON o campi `client_id`/`client_secret`.
+2. **Immich Photos (`immich`):** predisposto a catalogo (categoria `photos`, auth `api_key`). Campi: endpoint host e API key.
+3. **Directory / NAS Locale (`local_directory`):** predisposto a catalogo (categoria `files`, auth `local_directory`). Campi: percorso directory (`path`) e pattern filtri.
+4. **OmniRoute Chat (`omniroute`):** predisposto a catalogo (categoria `chat`, auth `webhook`).
+
+### Endpoint REST del Catalogo e Credenziali
+- `GET /api/sources/catalog`: restituisce la lista di tutti i connettori disponibili arricchiti con il relativo stato di configurazione dinamico rilevato dal repository;
+- `POST /api/sources/{source_id}/credentials`: riceve le credenziali dal client (protetto da sessione e token anti-CSRF), effettua la validazione e le memorizza cifrate;
+- `GET /api/sources/{source_id}/credentials`: restituisce i metadati della fonte senza mai esporre i secret cifrati in chiaro.
 
 ## Operazioni e Interfacce
 

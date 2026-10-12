@@ -140,6 +140,150 @@ export interface GmailSources {
     source_limit: string
 }
 
+export interface ConnectorCapabilities {
+    read_only: boolean
+    pagination: boolean
+    incremental: boolean
+    reconciliation: boolean
+    max_page_size: number
+    concurrency: number
+    operations: string[]
+}
+
+export interface SourceFieldDescriptor {
+    name: string
+    label: string
+    field_type: string
+    required: boolean
+    placeholder: string
+    description: string
+    help_text: string
+}
+
+export interface ImportPolicyDescriptor {
+    supports_date_range: boolean
+    default_window_days: number
+    max_items_limit: number
+    default_item_limit: number
+    max_request_budget: number
+    default_request_budget: number
+    label_restriction: string | null
+}
+
+export interface SourceCatalogItem {
+    id: string
+    name: string
+    category: string
+    description: string
+    icon: string
+    auth_method: string
+    status: 'available' | 'coming_soon' | 'deprecated' | string
+    test_available: boolean
+    sync_capabilities: ConnectorCapabilities | null
+    config_fields: SourceFieldDescriptor[]
+    import_policy: ImportPolicyDescriptor | null
+    documentation_url: string | null
+}
+
+export interface SourceCatalogResponse {
+    items: SourceCatalogItem[]
+    total: number
+}
+
+export interface LanWarningResponse {
+    is_private_ip: boolean
+    warning_code: string
+    message: string
+}
+
+export interface SourceStatusResponse {
+    source_id: string
+    configured: boolean
+    auth_source: string | null
+    client_id_preview: string | null
+    account_connected: boolean
+    external_account_id: string | null
+    primary_email: string | null
+    status: string
+    detected_callback_url: string
+    lan_warning: LanWarningResponse | null
+}
+
+export interface SourceCredentialsUploadPayload {
+    raw_json?: Record<string, unknown> | string | null
+    client_id?: string | null
+    client_secret?: string | null
+    redirect_uri_override?: string | null
+}
+
+export interface SourceCredentialsSaveResponse {
+    source_id: string
+    client_id: string | null
+    client_type: string
+    configured_redirect_uri: string | null
+    message: string
+}
+
+export interface SourceTestConnectionResponse {
+    source_id: string
+    connected: boolean
+    latency_ms: number | null
+    primary_identity: string | null
+    aliases: string[]
+    message: string
+}
+
+export interface SourcePreviewSampleItem {
+    id: string
+    date: string | null
+    subject: string | null
+    to: string[]
+    snippet: string | null
+}
+
+export interface SourcePreviewResponse {
+    source_id: string
+    estimated_count: number
+    period_after: string
+    period_before: string
+    sample_items: SourcePreviewSampleItem[]
+    query: string
+    note: string
+}
+
+export interface SourceSyncPayload {
+    period_after?: string | null
+    period_before?: string | null
+    item_limit?: number
+    request_budget?: number
+    batch_size?: number
+    concurrency?: number
+    mode?: 'full' | 'incremental' | 'reconciliation'
+}
+
+export interface SourceSyncResponse {
+    source_id: string
+    job_id: string
+    queue_job_id: number | null
+    status: string
+    mode: string
+    message: string
+}
+
+export interface SourceDisconnectResponse {
+    source_id: string
+    disconnected: boolean
+    remote_revoked: boolean
+    credentials_removed: boolean
+    message: string
+}
+
+export interface GmailOAuthStartResponse {
+    authorization_url: string
+    state: string
+    expires_at: string
+}
+
 interface ApiErrorBody {
     detail?: string
 }
@@ -260,4 +404,41 @@ export const api = {
     gmailSearch: (query: string, limit = 20) => request<GmailSources>(
         `/api/gmail/search${queryString({ query, limit })}`,
     ),
+
+    // Endpoint unificati per Connettori e Source Wizard (Fase C / D)
+    fetchSourceCatalog: () => request<SourceCatalogResponse>('/api/sources/catalog'),
+    fetchSourceStatus: (sourceId: string) =>
+        request<SourceStatusResponse>(`/api/sources/${encodeURIComponent(sourceId)}/status`),
+    saveSourceCredentials: (sourceId: string, payload: SourceCredentialsUploadPayload) =>
+        request<SourceCredentialsSaveResponse>(`/api/sources/${encodeURIComponent(sourceId)}/credentials`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+        }),
+    testSourceConnection: (sourceId: string) =>
+        request<SourceTestConnectionResponse>(`/api/sources/${encodeURIComponent(sourceId)}/test-connection`, {
+            method: 'POST',
+        }),
+    fetchSourcePreview: (
+        sourceId: string,
+        params?: { limit?: number; period_after?: string; period_before?: string },
+    ) =>
+        request<SourcePreviewResponse>(
+            `/api/sources/${encodeURIComponent(sourceId)}/preview${queryString(params ?? {})}`,
+        ),
+    triggerSourceSync: (sourceId: string, payload?: SourceSyncPayload) =>
+        request<SourceSyncResponse>(`/api/sources/${encodeURIComponent(sourceId)}/sync`, {
+            method: 'POST',
+            body: JSON.stringify(payload ?? {}),
+        }),
+    deleteSource: (sourceId: string, removeCredentials = false) =>
+        request<SourceDisconnectResponse>(
+            `/api/sources/${encodeURIComponent(sourceId)}${queryString({
+                remove_credentials: removeCredentials ? 'true' : undefined,
+            })}`,
+            { method: 'DELETE' },
+        ),
+    startSourceOAuth: (sourceId: string) =>
+        request<GmailOAuthStartResponse>(`/api/sources/${encodeURIComponent(sourceId)}/oauth/authorize`, {
+            method: 'POST',
+        }),
 }

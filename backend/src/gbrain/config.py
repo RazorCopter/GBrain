@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     # setup Gmail può restare assente senza impedire l'avvio dell'applicazione.
     gmail_oauth_client_secret_file: OptionalPath = None
     gmail_token_encryption_key_file: OptionalPath = None
+    source_credentials_encryption_key_file: OptionalPath = None
     gmail_oauth_redirect_uri: str | None = None
     gmail_oauth_state_ttl_seconds: int = Field(default=600, ge=300, le=900)
     gmail_oauth_timeout_seconds: float = Field(default=20.0, ge=1.0, le=60.0)
@@ -140,6 +141,7 @@ class Settings(BaseSettings):
         for path, label in (
             (self.gmail_oauth_client_secret_file, "client OAuth Gmail"),
             (self.gmail_token_encryption_key_file, "cifratura token Gmail"),
+            (self.source_credentials_encryption_key_file, "cifratura credenziali fonti"),
         ):
             if path is not None:
                 self._read_secret_file(path, label)
@@ -176,6 +178,28 @@ class Settings(BaseSettings):
         if len(decoded) != 32:
             raise ConfigurationError("La chiave di cifratura token Gmail deve contenere 32 byte")
         return decoded
+
+    @property
+    def source_credentials_encryption_key(self) -> bytes:
+        from gbrain.application.crypto import derive_credentials_key
+
+        if self.source_credentials_encryption_key_file is not None:
+            raw = self._read_secret_file(
+                self.source_credentials_encryption_key_file,
+                "cifratura credenziali fonti",
+            ).get_secret_value()
+            try:
+                decoded = bytes.fromhex(raw)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "La chiave di cifratura credenziali fonti deve essere esadecimale"
+                ) from exc
+            if len(decoded) != 32:
+                raise ConfigurationError(
+                    "La chiave di cifratura credenziali fonti deve contenere 32 byte"
+                )
+            return decoded
+        return derive_credentials_key(self.auth_signing_secret)
 
     @property
     def database_url(self) -> str:

@@ -1,56 +1,110 @@
 # Setup OAuth Gmail read-only
 
-## Stato e confine
+## Stato, confini e requisiti di sicurezza
 
-L'integrazione usa unicamente il client ufficiale Google e lo scope esatto:
+L'integrazione utilizza unicamente il client ufficiale Google API e richiede lo scope esatto e minimale:
 
 `https://www.googleapis.com/auth/gmail.readonly`
 
-Lo scope autorizza tecnicamente la lettura dell'intera casella. Il wrapper applicativo non accetta query inserite dall'utente ed esegue soltanto operazioni di lettura su messaggi con etichetta `SENT`; ogni fetch diretto riverifica `SENT`. Non esistono operazioni send, modify o drafts. Nessuna password Google viene richiesta o conservata.
+Lo scope autorizza tecnicamente la lettura della casella postale dell'utente in modalità sola lettura. L'applicazione impone le seguenti invarianti a garanzia della massima privacy:
+- Il wrapper applicativo non accetta query arbitrarie inserite dall'utente ed esegue **esclusivamente** operazioni di lettura su messaggi recanti l'etichetta di sistema `SENT` (messaggi inviati dall'utente);
+- Ogni fetch diretto ricontrolla la presenza del label `SENT`;
+- Non esistono operazioni di invio (`send`), modifica (`modify`), bozze (`drafts`) o cancellazione;
+- Nessuna password Google dell'utente viene mai richiesta o memorizzata;
+- In assenza di configurazione, la pagina Fonti riporta fedelmente lo stato **non configurato**.
 
-Il repository e i test non collegano un account reale. In assenza dei secret la pagina Fonti mostra correttamente **non configurato**.
+---
 
-## Azione singola richiesta in Google Cloud
+## 1. Procedura Principale (Consigliata) — Source Connection Wizard via Web UI
 
-Creare/scaricare un client OAuth 2.0 di tipo **Applicazione web**, registrando esattamente la callback:
+A partire da questa versione, l'attivazione della fonte Gmail **non richiede la modifica manuale di file Compose o il montaggio di file sul filesystem dell'host**. L'intera configurazione si effettua direttamente dall'interfaccia utente di GBrain.
 
-- sviluppo: `http://localhost:8000/api/gmail/oauth/callback`;
-- produzione: `${GBRAIN_PUBLIC_URL}/api/gmail/oauth/callback`, obbligatoriamente HTTPS.
+### Passo 1.1: Creazione delle credenziali in Google Cloud Console
+1. Accedere alla [Google Cloud Console](https://console.cloud.google.com/);
+2. Selezionare o creare un progetto (es. `GBrain Private`);
+3. In **API e servizi > Libreria**, cercare e abilitare la **Gmail API**;
+4. In **Schermata consenso OAuth**:
+   - Tipo utente: **Esterno**;
+   - Stato pubblicazione: **In prova (Testing)**;
+   - Aggiungere il proprio indirizzo email personale alla lista **Utenti di test**;
+   - Aggiungere lo scope `https://www.googleapis.com/auth/gmail.readonly`;
+5. In **API e servizi > Credenziali**:
+   - Cliccare su **+ Crea credenziali > ID client OAuth**;
+   - Tipo di applicazione: **Applicazione web**;
+   - Nome: `GBrain Client`;
+   - In **URI di reindirizzamento autorizzati**, inserire l'URI esatto di callback:
+     - Per installazioni con dominio HTTPS: `https://<IL_TUO_DOMINIO>/api/gmail/oauth/callback` (es. `https://gbrain.lan.home/api/gmail/oauth/callback`);
+     - Per sviluppo locale o tunnel loopback: `http://localhost:8000/api/gmail/oauth/callback`;
+6. Scaricare il file JSON delle credenziali appena create (pulsante **Scarica JSON**).
 
-Salvare il JSON scaricato come `secrets/gmail-oauth-client.json`. Il file è ignorato da Git e viene montato read-only come `/run/secrets/gmail_oauth_client`.
+### Passo 1.2: Configurazione guidata tramite il Wizard
+1. Aprire la dashboard di GBrain e recarsi nella pagina [`Fonti`](frontend/src/SourcesPage.tsx:1) (`/sources`);
+2. Nel catalogo connettori, individuare la scheda **Gmail SENT** e cliccare su **Configura**;
+3. Nel **Source Connection Wizard** ([`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1)) sono disponibili due modalità:
+   - **Upload File JSON (Scelta consigliata):** trascinare o selezionare il file JSON scaricato da Google Cloud. Il sistema parserizza istantaneamente il documento ed estrae `client_id` e `client_secret`;
+   - **Inserimento Manuale:** incollare o digitare `Client ID` e `Client Secret` nei rispettivi campi form;
+4. Cliccare su **Salva e attiva fonte**:
+   - Il backend valida i formati dei parametri;
+   - I secret vengono crittografati con cifratura autenticata **AES-256-GCM** e persistiti nella tabella `source_credentials` su PostgreSQL tramite [`backend/src/gbrain/infrastructure/source_credentials_repository.py`](backend/src/gbrain/infrastructure/source_credentials_repository.py:1);
+   - Lo stato del connettore passa immediatamente a **Disconnesso (Pronto per autorizzazione)**.
 
-Non ampliare gli scope nel client o nella consent screen. Il server rifiuta token con scope diverso dall'unico scope readonly.
+---
 
-## Chiave dei token
+## 2. Vincolo Google OAuth sulle LAN HTTP e Modalità Operative Consigliate
 
-Generare 32 byte casuali e salvarli in forma esadecimale (64 caratteri) in un secret file, ad esempio `secrets/gmail-token-key.txt`. Configurare `GBRAIN_GMAIL_TOKEN_ENCRYPTION_KEY_FILE` con lo stesso percorso/mount sia per app sia per worker. È una chiave distinta dal secret di sessione.
+### 2.1 Il vincolo tecnico di Google Cloud
+Per stringenti policy di sicurezza, **Google OAuth 2.0 rifiuta categoricamente gli indirizzi IP privati su protocollo HTTP non cifrato** (come ad esempio `http://192.168.1.150:8000/api/gmail/oauth/callback`). Inserendo un IP LAN HTTP, la console Google Cloud restituirà un errore di tipo:
+> *Invalid Redirect: redirect_uri must use HTTPS or be a localhost address.*
 
-I token sono scambiati server-side, cifrati con AES-256-GCM autenticato e formato versionato prima del database. Token, client secret, verifier PKCE e state non vengono inviati al frontend, salvati in localStorage o inseriti nei payload Procrastinate. Il browser riceve soltanto l'URL Google di autorizzazione.
+### 2.2 Modalità Operative Supportate
 
-## Variabili
+| Scenario Operativo | Configurazione URI di Callback | Note e Requisiti |
+|---|---|---|
+| **Home Lab / NAS con Reverse Proxy (Consigliato)** | `https://gbrain.tuodominio.it/api/gmail/oauth/callback` | Richiede un certificato SSL (Let's Encrypt o locale con CA fidata). Impostare `GBRAIN_PUBLIC_URL=https://gbrain.tuodominio.it` e `GBRAIN_SESSION_SECURE_COOKIE=true`. |
+| **Sviluppo Locale su PC** | `http://localhost:8000/api/gmail/oauth/callback` | Consentito nativamente da Google su HTTP standard senza HTTPS. |
+| **Server Headless / NAS senza Dominio Pubblico (Tunnel SSH)** | `http://localhost:8000/api/gmail/oauth/callback` | Creare un port forwarding SSH dal PC client verso il server: `ssh -L 8000:localhost:8000 utente@ip-del-nas`. Aprire il browser su `http://localhost:8000` per completare il flusso di autenticazione. |
+| **Rete VPN con MagicDNS (es. Tailscale)** | `https://gbrain.tailnet-name.ts.net/api/gmail/oauth/callback` | Abilitare i certificati HTTPS automatici Tailscale per ottenere un FQDN HTTPS valido e privato. |
 
-- `GBRAIN_GMAIL_OAUTH_CLIENT_SECRET_FILE=/run/secrets/gmail_oauth_client`
-- `GBRAIN_GMAIL_TOKEN_ENCRYPTION_KEY_FILE=/run/secrets/gmail_token_key`
-- `GBRAIN_GMAIL_OAUTH_REDIRECT_URI=<PUBLIC_URL>/api/gmail/oauth/callback`
+---
 
-Il profilo Compose di base non monta questi secret opzionali, così il setup può restare pendente senza impedire l'avvio. Per attivarlo, aggiungere ai servizi `app` e `worker` gli stessi due mount/secrets e le tre variabili sopra (oppure un file override Compose locale non versionato). `GBRAIN_PUBLIC_URL` e redirect devono coincidere. In produzione entrambi usano HTTPS e i cookie di sessione devono essere secure.
+## 3. Procedura Avanzata / Legacy — Montaggio File Secret su Filesystem
 
-## Flusso e protezioni
+Per ambienti completamente headless, container orchestrati via CI/CD o scenari GitOps in cui si preferisce gestire i segreti tramite file read-only montati dall'infrastruttura, il supporto filesystem è pienamente attivo come fallback non distruttivo.
 
-1. l'owner autenticato avvia OAuth con POST protetta CSRF;
-2. il server genera state ad alta entropia monouso, lega owner e sessione, imposta scadenza 5–15 minuti e cifra il verifier PKCE;
-3. la callback richiede la stessa sessione, valida binding/scadenza/replay e consuma lo state prima dello scambio;
-4. lo scambio, la verifica dello scope e `users.getProfile` avvengono server-side;
-5. l'indirizzo del profilo è proposto come alias, ma non vale finché l'owner non lo conferma esplicitamente;
-6. almeno un alias confermato è richiesto per preview/import;
-7. refresh e gateway ricontrollano lo scope esatto.
+1. Salvare il file JSON scaricato da Google nella cartella dei segreti: `secrets/gmail-oauth-client.json` (il file è escluso da Git tramite `.gitignore`);
+2. Montare il file nei servizi `app` e `worker` del file Compose:
+   ```yaml
+   secrets:
+     gmail_oauth_client:
+       file: ./secrets/gmail-oauth-client.json
+   ```
+3. Configurare la variabile d'ambiente:
+   `GBRAIN_GMAIL_OAUTH_CLIENT_SECRET_FILE=/run/secrets/gmail_oauth_client`
+4. **Gerarchia di Risoluzione:** All'avvio dell'autorizzazione, [`backend/src/gbrain/application/gmail_oauth.py`](backend/src/gbrain/application/gmail_oauth.py:1) verifica prima la presenza di credenziali configurate nel database; se non presenti, effettua il caricamento trasparente dal secret file del filesystem.
 
-## Revoca e rinnovo
+---
 
-**Revoca e disconnetti** tenta la revoca remota Google quando la rete è disponibile e rimuove sempre localmente ciphertext, scope e alias. L'esito distingue revoca remota confermata, fallita o non tentata; non viene mai mostrato un falso successo remoto.
+## 4. Chiavi di Cifratura e Gestione dei Token
 
-Un errore auth/refresh marca il lavoro come fallito e richiede una nuova autorizzazione. Errori transitori/quota sono gli unici ritentati nel budget; history scaduta richiede esplicitamente riconciliazione.
+### 4.1 Chiave Master di Cifratura
+Tutti i token Google scambiati e i secret memorizzati nel database relazionale vengono cifrati tramite crittografia simmetrica **AES-256-GCM** autenticata.
+- La chiave crittografica è a 256 bit (32 byte esadecimali / 64 caratteri HEX);
+- Può essere definita tramite la variabile d'ambiente unificata `GBRAIN_ENCRYPTION_MASTER_KEY` oppure tramite il file di chiave storico puntato da `GBRAIN_GMAIL_TOKEN_ENCRYPTION_KEY_FILE=/run/secrets/gmail_token_key`;
+- Per generare una chiave sicura:
+  ```bash
+  openssl rand -hex 32
+  ```
 
-## Coda e policy
+### 4.2 Riservatezza dei Token e Formato Crittografico
+I token OAuth (access token e refresh token) sono scambiati unicamente server-side, cifrati prima della memorizzazione in PostgreSQL e non vengono mai esposti al browser, memorizzati in `localStorage` o trasmessi nelle code dei task Procrastinate. Il frontend riceve unicamente l'URL di consenso Google e lo stato operativo.
 
-Preview, full import, incrementale e riconciliazione usano il perimetro server-side SENT. La preview non persiste messaggi completi e non avanza checkpoint. L'import richiede una seconda conferma e il server confronta la snapshot esatta della policy mostrata. I task Procrastinate sono persistenti e serializzati con lock globale iniziale; esiste inoltre un solo job pending/running per account.
+---
+
+## 5. Flusso di Autorizzazione e Invarianti di Sicurezza
+
+1. **Inizializzazione:** L'owner autenticato avvia la procedura OAuth tramite una chiamata POST protetta da cookie di sessione e token anti-CSRF;
+2. **State e PKCE:** Il server genera uno `state` monouso ad alta entropia calcolato con HMAC-SHA256 legato all'owner e alla sessione attiva, con scadenza tassativa di 10 minuti, e cifra il code verifier PKCE con AES-256-GCM;
+3. **Validazione Callback:** La callback Google esige la medesima sessione HTTP, convalida lo stato, previene qualsiasi tentativo di replay e invalida lo state prima dello scambio dei token;
+4. **Scambio Server-Side:** Lo scambio del code per i token di accesso e la chiamata a `users.getProfile` avvengono esclusivamente backend-to-backend;
+5. **Verifica Alias:** L'indirizzo email estratto dal profilo viene proposto all'utente come alias; nessun import o preview può essere avviato finché l'owner non conferma esplicitamente almeno un alias (`alias_required`);
+6. **Revoca e Disconnessione:** Il comando "Revoca e disconnetti" cancella permanentemente le credenziali e i token locali dal database PostgreSQL e tenta contestualmente la revoca remota presso gli endpoint Google.

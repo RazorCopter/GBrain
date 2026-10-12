@@ -34,9 +34,11 @@ from gbrain.presentation.schemas import (
     SessionResponse,
     StatusResponse,
 )
+from gbrain.presentation.sources_api import sources_router
 
 logger = logging.getLogger(__name__)
 api_router = APIRouter(prefix="/api")
+api_router.include_router(sources_router)
 
 
 def _set_session_cookies(

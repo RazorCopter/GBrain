@@ -11,7 +11,7 @@ from sqlalchemy import desc, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gbrain.application.gmail_oauth import decrypt_credentials
+from gbrain.application.gmail_oauth import decrypt_credentials, is_gmail_configured
 from gbrain.application.gmail_sync import GmailSentConnector
 from gbrain.config import Settings
 from gbrain.domain.connectors import RequestBudget
@@ -153,8 +153,9 @@ async def gmail_status(
     )
     operations = GmailSentConnector.inspect_capabilities  # mantiene il contratto discoverable
     del operations
+    configured, _, _ = await is_gmail_configured(session, settings, owner_id)
     return GmailStatus(
-        configured=settings.gmail_oauth_configured,
+        configured=configured,
         connected=connected,
         account=account,
         aliases_ready=bool(account and account.confirmed_aliases),

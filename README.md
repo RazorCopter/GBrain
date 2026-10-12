@@ -1,6 +1,6 @@
-# GBrain — Fondazione Fase 1 e Integrazione Gmail Fase 2
+# GBrain — Fondazione Fase 1, Integrazione Gmail Fase 2 e Source Wizard
 
-GBrain è un second brain autobiografico self-hosted. Questo repository contiene la **fondazione Fase 1** consolidata e l'integrazione connettore **Fase 2 Gmail `SENT`** (nucleo sync/MIME, OAuth web server-side, cifratura AES-256-GCM, worker Procrastinate, ricerca testuale PostgreSQL FTS e pagina Fonti). Immich, NAS, OmniRoute, Graphiti (Fase 3), MCP e funzioni autobiografiche/LLM non sono ancora implementati. Il codice ha superato tutti i controlli deterministici e di audit (Ruff, Mypy, build React e 93 test unitari/funzionali superati), mentre il collaudo su demone Docker/Linux reale e l'accesso con credenziali Google Cloud reali rimangono intenzionalmente pendenti: lo stato ufficiale è in [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+GBrain è un second brain autobiografico self-hosted. Questo repository contiene la **fondazione Fase 1** consolidata, l'integrazione connettore **Fase 2 Gmail `SENT`** (nucleo sync/MIME, OAuth web server-side, cifratura AES-256-GCM, worker Procrastinate, ricerca testuale PostgreSQL FTS e pagina Fonti) e il nuovo **GBrain Source Connection Wizard** con catalogo modulare delle fonti e gestione credenziali cifrate su PostgreSQL (Alembic head `20261012_0004`). Immich, NAS, OmniRoute, Graphiti (Fase 3), MCP e funzioni autobiografiche/LLM non sono ancora implementati. Il codice ha superato tutti i controlli deterministici e di audit (Ruff, Mypy, build React e 141 test unitari/funzionali superati), mentre il collaudo su demone Docker/Linux reale e l'accesso con credenziali Google Cloud reali rimangono intenzionalmente pendenti: lo stato ufficiale è in [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
 
 ## Prerequisiti
 
@@ -97,6 +97,22 @@ docker compose --profile compact exec app python -m gbrain.cli demo-fixtures --r
 ```
 
 Il secondo comando resetta solo il namespace demo riconosciuto. La demo non crea account, non aggira autenticazione/CSRF e non contatta servizi reali. Dettagli in [`docs/FIXTURE_SINTETICHE.md`](docs/FIXTURE_SINTETICHE.md).
+
+## Gestione Fonti e Source Connection Wizard
+
+GBrain include un'architettura modulare per la connessione delle fonti autobiografiche, accessibile dalla scheda **Fonti** (`/sources`) dell'interfaccia web.
+
+### Configurazione guidata tramite UI (Senza modifiche manuali a Compose)
+A partire dalla versione corrente, l'attivazione del client Google OAuth **non richiede più la modifica manuale dei file `compose.yaml` né il montaggio obbligatorio di file su filesystem**:
+1. Accedere a GBrain e navigare nella pagina **Fonti**;
+2. Nel catalogo connettori, individuare la scheda **Gmail SENT** e cliccare su **Configura**;
+3. Nel **Source Connection Wizard** ([`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1)):
+   - **Upload JSON Google Cloud:** trascinare o selezionare direttamente il file `.json` del client OAuth scaricato dalla Google Cloud Console (oppure incollare il contenuto grezzo); il wizard estrae automaticamente `client_id` e `client_secret`;
+   - **Inserimento Manuale:** in alternativa, digitare manualmente Client ID e Client Secret;
+4. Cliccare su **Salva e attiva fonte**: il backend valida la configurazione e memorizza i secret in formato cifrato **AES-256-GCM** nella tabella `source_credentials` su PostgreSQL (gestita via [`backend/src/gbrain/infrastructure/source_credentials_repository.py`](backend/src/gbrain/infrastructure/source_credentials_repository.py:1)).
+
+### Compatibilità e Fallback Filesystem
+I deployment storici o automatizzati che montano il secret su filesystem (`/run/secrets/gmail_oauth_client` o la variabile `GBRAIN_GMAIL_OAUTH_CLIENT_SECRET_FILE`) rimangono pienamente supportati come opzione di fallback trasparente: il connettore verifica prioritariamente le credenziali salvate nel database cifrato e, se assenti, ricorre al file montato. La guida completa sul flusso OAuth e i requisiti Google è consultabile in [`docs/GMAIL_OAUTH_SETUP.md`](docs/GMAIL_OAUTH_SETUP.md).
 
 ## Arresto, aggiornamento e rollback
 

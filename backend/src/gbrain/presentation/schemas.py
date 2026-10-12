@@ -194,3 +194,142 @@ class DemoFixtureStatusResponse(BaseModel):
     cases: list[str]
     security_controls_unchanged: bool = True
     real_integrations: list[str] = Field(default_factory=list)
+
+
+class ConnectorCapabilitiesResponse(BaseModel):
+    source_kind: str
+    read_only: bool
+    pagination: bool
+    incremental: bool
+    reconciliation: bool
+    max_page_size: int
+    concurrency: int
+    operations: list[str] = Field(default_factory=list)
+
+
+class SourceFieldDescriptorResponse(BaseModel):
+    name: str
+    label: str
+    field_type: str
+    required: bool
+    placeholder: str = ""
+    description: str = ""
+    help_text: str = ""
+
+
+class ImportPolicyDescriptorResponse(BaseModel):
+    supports_date_range: bool
+    default_window_days: int
+    max_items_limit: int
+    default_item_limit: int
+    max_request_budget: int
+    default_request_budget: int
+    label_restriction: str | None = None
+
+
+class SourceCatalogItemResponse(BaseModel):
+    id: str
+    name: str
+    category: str
+    description: str
+    icon: str
+    auth_method: str
+    status: str
+    test_available: bool
+    sync_capabilities: ConnectorCapabilitiesResponse | None = None
+    config_fields: list[SourceFieldDescriptorResponse] = Field(default_factory=list)
+    import_policy: ImportPolicyDescriptorResponse | None = None
+    documentation_url: str | None = None
+
+
+class SourceCatalogResponse(BaseModel):
+    items: list[SourceCatalogItemResponse]
+    total: int
+
+
+class LanWarningResponse(BaseModel):
+    is_private_ip: bool
+    warning_code: str
+    message: str
+
+
+class SourceStatusResponse(BaseModel):
+    source_id: str
+    configured: bool
+    auth_source: str | None = None
+    client_id_preview: str | None = None
+    account_connected: bool = False
+    external_account_id: str | None = None
+    primary_email: str | None = None
+    status: str
+    detected_callback_url: str
+    lan_warning: LanWarningResponse | None = None
+
+
+class SourceCredentialsUploadRequest(BaseModel):
+    raw_json: dict[str, Any] | str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    redirect_uri_override: str | None = None
+
+
+class SourceCredentialsSaveResponse(BaseModel):
+    source_id: str
+    client_id: str | None
+    client_type: str
+    configured_redirect_uri: str | None
+    message: str
+
+
+class SourceTestConnectionResponse(BaseModel):
+    source_id: str
+    connected: bool
+    latency_ms: float | None = None
+    primary_identity: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    message: str
+
+
+class SourcePreviewSampleItem(BaseModel):
+    id: str
+    date: datetime | None = None
+    subject: str | None = None
+    to: list[str] = Field(default_factory=list)
+    snippet: str | None = None
+
+
+class SourcePreviewResponse(BaseModel):
+    source_id: str
+    estimated_count: int
+    period_after: datetime
+    period_before: datetime
+    sample_items: list[SourcePreviewSampleItem] = Field(default_factory=list)
+    query: str
+    note: str = "Anteprima di sola lettura per posta inviata (SENT)"
+
+
+class SourceSyncRequest(BaseModel):
+    period_after: datetime | None = None
+    period_before: datetime | None = None
+    item_limit: int = Field(default=500, ge=1, le=5000)
+    request_budget: int = Field(default=200, ge=1, le=2000)
+    batch_size: int = Field(default=25, ge=1, le=500)
+    concurrency: int = Field(default=1, ge=1, le=1)
+    mode: Literal["full", "incremental", "reconciliation"] = "full"
+
+
+class SourceSyncResponse(BaseModel):
+    source_id: str
+    job_id: UUID
+    queue_job_id: int | None
+    status: str
+    mode: str
+    message: str
+
+
+class SourceDisconnectResponse(BaseModel):
+    source_id: str
+    disconnected: bool
+    remote_revoked: bool
+    credentials_removed: bool
+    message: str

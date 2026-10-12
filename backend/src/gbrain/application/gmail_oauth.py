@@ -7,10 +7,11 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -58,6 +59,7 @@ class GmailOAuthStateError(GmailOAuthError):
 @dataclass(frozen=True, slots=True)
 class OAuthStart:
     authorization_url: str
+    state: str
     expires_at: datetime
 
 
@@ -188,10 +190,16 @@ def credentials_from_stored(stored: StoredToken) -> Credentials:
     )
 
 
+def _get_token_encryption_key(settings: Settings) -> bytes:
+    if settings.gmail_token_encryption_key_file is not None:
+        return settings.gmail_token_encryption_key
+    return settings.source_credentials_encryption_key
+
+
 def encrypt_credentials(credentials: Credentials, settings: Settings) -> bytes:
     return encrypt_secret(
         serialize_credentials(credentials),
-        settings.gmail_token_encryption_key,
+        _get_token_encryption_key(settings),
         context=_TOKEN_ASSOCIATED_DATA,
     )
 
@@ -202,13 +210,20 @@ def decrypt_credentials(account: ConnectorAccount, settings: Settings) -> Creden
         or account.oauth_token_format_version != _TOKEN_FORMAT_VERSION
     ):
         raise GmailOAuthError("credentials_missing", "Credenziali Gmail non disponibili")
-    stored = deserialize_credentials(
-        decrypt_secret(
+    try:
+        raw_token = decrypt_secret(
             account.oauth_token_ciphertext,
-            settings.gmail_token_encryption_key,
+            _get_token_encryption_key(settings),
             context=_TOKEN_ASSOCIATED_DATA,
         )
-    )
+    except GmailOAuthError:
+        # Fallback alla chiave secondaria derivata se fallisce con la chiave montata
+        raw_token = decrypt_secret(
+            account.oauth_token_ciphertext,
+            settings.source_credentials_encryption_key,
+            context=_TOKEN_ASSOCIATED_DATA,
+        )
+    stored = deserialize_credentials(raw_token)
     return credentials_from_stored(stored)
 
 
@@ -226,6 +241,146 @@ def refresh_credentials(credentials: Credentials, settings: Settings) -> Credent
     if refreshed_scopes != frozenset({GMAIL_READONLY_SCOPE}):
         raise GmailOAuthError("scope_mismatch", "Refresh Gmail ha restituito scope non valido")
     return credentials
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedOAuthClient:
+    client_config: dict[str, Any]
+    redirect_uri: str
+    auth_source: str  # "db" o "file"
+    client_id: str
+
+
+def normalize_google_client_config(
+    raw_config: dict[str, Any], redirect_uri: str | None = None
+) -> dict[str, Any]:
+    if "web" in raw_config and isinstance(raw_config["web"], dict):
+        cfg = dict(raw_config["web"])
+        client_type = "web"
+    elif "installed" in raw_config and isinstance(raw_config["installed"], dict):
+        cfg = dict(raw_config["installed"])
+        client_type = "installed"
+    elif "client_id" in raw_config and "client_secret" in raw_config:
+        cfg = dict(raw_config)
+        client_type = "web"
+    else:
+        raise GmailOAuthError(
+            "invalid_credentials_structure", "Struttura delle credenziali Google non valida"
+        )
+
+    client_id = str(cfg.get("client_id") or "").strip()
+    client_secret = str(cfg.get("client_secret") or "").strip()
+    if not client_id or not client_secret:
+        raise GmailOAuthError("missing_client_keys", "Client ID o Client Secret mancanti")
+
+    auth_uri = str(cfg.get("auth_uri") or "https://accounts.google.com/o/oauth2/auth")
+    token_uri = str(cfg.get("token_uri") or "https://oauth2.googleapis.com/token")
+    redirect_uris = list(cfg.get("redirect_uris") or [])
+    if redirect_uri and redirect_uri not in redirect_uris:
+        redirect_uris.insert(0, redirect_uri)
+
+    normalized_entry = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "auth_uri": auth_uri,
+        "token_uri": token_uri,
+        "redirect_uris": redirect_uris,
+    }
+    return {client_type: normalized_entry}
+
+
+async def resolve_gmail_oauth_client(
+    session: AsyncSession,
+    settings: Settings,
+    owner_id: uuid.UUID,
+    *,
+    redirect_uri_override: str | None = None,
+) -> ResolvedOAuthClient:
+    from gbrain.infrastructure.source_credentials_repository import SourceCredentialsRepository
+
+    # 1. Priorità: database per tenant/owner
+    record = await SourceCredentialsRepository.get_credentials(session, owner_id, "gmail")
+    if record is not None and record.is_active:
+        from gbrain.application.crypto import decrypt_json
+
+        decrypted = decrypt_json(
+            record.encrypted_credentials, settings.source_credentials_encryption_key
+        )
+        redirect_uri = (
+            redirect_uri_override
+            or record.configured_redirect_uri
+            or settings.gmail_oauth_redirect_uri
+            or f"{settings.public_url.rstrip('/')}/api/sources/gmail/oauth/callback"
+        )
+        normalized = normalize_google_client_config(decrypted, redirect_uri=redirect_uri)
+        client_type = next(iter(normalized))
+        client_id = record.client_id or str(normalized[client_type]["client_id"])
+        return ResolvedOAuthClient(
+            client_config=normalized,
+            redirect_uri=redirect_uri,
+            auth_source="db",
+            client_id=client_id,
+        )
+
+    # 2. Fallback: secret file montato su filesystem
+    if (
+        settings.gmail_oauth_client_secret_file is not None
+        and settings.gmail_oauth_client_secret_file.exists()
+    ):
+        raw_text = settings.gmail_oauth_client_secret_file.read_text(encoding="utf-8")
+        parsed = json.loads(raw_text)
+        redirect_uri = (
+            redirect_uri_override
+            or settings.gmail_oauth_redirect_uri
+            or f"{settings.public_url.rstrip('/')}/api/gmail/oauth/callback"
+        )
+        normalized = normalize_google_client_config(parsed, redirect_uri=redirect_uri)
+        client_type = next(iter(normalized))
+        client_id = str(normalized[client_type]["client_id"])
+        return ResolvedOAuthClient(
+            client_config=normalized,
+            redirect_uri=redirect_uri,
+            auth_source="file",
+            client_id=client_id,
+        )
+
+    raise GmailOAuthNotConfiguredError
+
+
+async def is_gmail_configured(
+    session: AsyncSession,
+    settings: Settings,
+    owner_id: uuid.UUID,
+) -> tuple[bool, str | None, str | None]:
+    from gbrain.infrastructure.source_credentials_repository import SourceCredentialsRepository
+
+    record = await SourceCredentialsRepository.get_credentials(session, owner_id, "gmail")
+    if record is not None and record.is_active:
+        preview = record.client_id
+        if preview and len(preview) > 16:
+            preview = f"{preview[:12]}...{preview[-8:]}"
+        return True, "db", preview
+
+    if settings.gmail_oauth_configured:
+        preview = None
+        if (
+            settings.gmail_oauth_client_secret_file is not None
+            and settings.gmail_oauth_client_secret_file.exists()
+        ):
+            try:
+                parsed = json.loads(
+                    settings.gmail_oauth_client_secret_file.read_text(encoding="utf-8")
+                )
+                for key in ("web", "installed"):
+                    if key in parsed and "client_id" in parsed[key]:
+                        cid = str(parsed[key]["client_id"])
+                        preview = f"{cid[:12]}...{cid[-8:]}" if len(cid) > 16 else cid
+                        break
+            except Exception:
+                preview = None
+        return True, "file", preview
+
+    return False, None, None
 
 
 def _default_flow_factory(settings: Settings, code_verifier: str) -> OAuthFlowLike:
@@ -268,17 +423,31 @@ async def begin_oauth(
     owner: OwnerAccount,
     auth_session: AuthSession,
     *,
+    redirect_uri_override: str | None = None,
     now: datetime | None = None,
     flow_factory: FlowFactory | None = None,
 ) -> OAuthStart:
-    if not settings.gmail_oauth_configured:
-        raise GmailOAuthNotConfiguredError
     current = now or datetime.now(UTC)
     raw_state = secrets.token_urlsafe(48)
     code_verifier = secrets.token_urlsafe(64)
-    flow = (flow_factory or (lambda verifier: _default_flow_factory(settings, verifier)))(
-        code_verifier
-    )
+
+    if flow_factory is not None:
+        flow = flow_factory(code_verifier)
+    else:
+        resolved = await resolve_gmail_oauth_client(
+            session, settings, owner.id, redirect_uri_override=redirect_uri_override
+        )
+        flow = cast(
+            OAuthFlowLike,
+            Flow.from_client_config(
+                resolved.client_config,
+                scopes=[GMAIL_READONLY_SCOPE],
+                redirect_uri=resolved.redirect_uri,
+                autogenerate_code_verifier=False,
+                code_verifier=code_verifier,
+            ),
+        )
+
     authorization_url, returned_state = flow.authorization_url(
         state=raw_state,
         access_type="offline",
@@ -295,14 +464,14 @@ async def begin_oauth(
             state_hash=_urlsafe_digest(raw_state, settings.auth_signing_secret),
             code_verifier_ciphertext=encrypt_secret(
                 code_verifier.encode("ascii"),
-                settings.gmail_token_encryption_key,
+                _get_token_encryption_key(settings),
                 context=_STATE_ASSOCIATED_DATA,
             ),
             expires_at=expires_at,
         )
     )
     await session.commit()
-    return OAuthStart(authorization_url=authorization_url, expires_at=expires_at)
+    return OAuthStart(authorization_url=authorization_url, state=raw_state, expires_at=expires_at)
 
 
 async def complete_oauth(
@@ -338,12 +507,34 @@ async def complete_oauth(
     # Consumo prima dello scambio: anche un callback fallito non può essere riprodotto.
     state_row.consumed_at = current
     await session.commit()
-    verifier = decrypt_secret(
-        state_row.code_verifier_ciphertext,
-        settings.gmail_token_encryption_key,
-        context=_STATE_ASSOCIATED_DATA,
-    ).decode("ascii")
-    flow = (flow_factory or (lambda value: _default_flow_factory(settings, value)))(verifier)
+    try:
+        raw_verifier = decrypt_secret(
+            state_row.code_verifier_ciphertext,
+            _get_token_encryption_key(settings),
+            context=_STATE_ASSOCIATED_DATA,
+        )
+    except GmailOAuthError:
+        raw_verifier = decrypt_secret(
+            state_row.code_verifier_ciphertext,
+            settings.source_credentials_encryption_key,
+            context=_STATE_ASSOCIATED_DATA,
+        )
+    verifier = raw_verifier.decode("ascii")
+
+    if flow_factory is not None:
+        flow = flow_factory(verifier)
+    else:
+        resolved = await resolve_gmail_oauth_client(session, settings, owner.id)
+        flow = cast(
+            OAuthFlowLike,
+            Flow.from_client_config(
+                resolved.client_config,
+                scopes=[GMAIL_READONLY_SCOPE],
+                redirect_uri=resolved.redirect_uri,
+                autogenerate_code_verifier=False,
+                code_verifier=verifier,
+            ),
+        )
     try:
         await asyncio.to_thread(flow.fetch_token, code=code)
     except Exception as exc:
