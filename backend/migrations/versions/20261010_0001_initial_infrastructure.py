@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from importlib.resources import files
 
 import sqlalchemy as sa
-from alembic import context, op
+from alembic import context, op  # noqa: F401
 from sqlalchemy.dialects import postgresql
 
 revision: str = "20261010_0001"
@@ -20,10 +20,21 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 import_job_status = postgresql.ENUM(
-    "pending", "running", "completed", "failed", "cancelled", name="import_job_status"
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    name="import_job_status",
+    create_type=False,
 )
 outbox_status = postgresql.ENUM(
-    "pending", "processing", "completed", "failed", name="outbox_status"
+    "pending",
+    "processing",
+    "completed",
+    "failed",
+    name="outbox_status",
+    create_type=False,
 )
 
 
@@ -275,14 +286,62 @@ def upgrade() -> None:
     procrastinate_schema = (
         files("procrastinate").joinpath("sql/schema.sql").read_text(encoding="utf-8")
     )
-    if context.is_offline_mode():
-        op.execute(procrastinate_schema)
-    else:
-        bind.exec_driver_sql(procrastinate_schema)
+    op.execute(sa.text(procrastinate_schema))
 
 
 def downgrade() -> None:
-    raise RuntimeError(
-        "Il downgrade iniziale non è automatico: contiene lo schema condiviso Procrastinate. "
-        "Ripristinare un backup PostgreSQL o ricreare il database esplicitamente."
+    procrastinate_teardown = (
+        "-- Trigger Procrastinate su tabella procrastinate_jobs\n"
+        "DROP TRIGGER IF EXISTS procrastinate_jobs_notify_queue_job_inserted_v1 ON procrastinate_jobs;\n"
+        "DROP TRIGGER IF EXISTS procrastinate_jobs_notify_queue_job_aborted_v1 ON procrastinate_jobs;\n"
+        "DROP TRIGGER IF EXISTS procrastinate_trigger_status_events_update_v1 ON procrastinate_jobs;\n"
+        "DROP TRIGGER IF EXISTS procrastinate_trigger_status_events_insert_v1 ON procrastinate_jobs;\n"
+        "DROP TRIGGER IF EXISTS procrastinate_trigger_scheduled_events_v1 ON procrastinate_jobs;\n"
+        "DROP TRIGGER IF EXISTS procrastinate_trigger_abort_requested_events_v1 ON procrastinate_jobs;\n"
+        "DROP TRIGGER IF EXISTS procrastinate_trigger_delete_jobs_v1 ON procrastinate_jobs;\n"
+        "-- Funzioni Procrastinate (trigger functions e procedure)\n"
+        "DROP FUNCTION IF EXISTS procrastinate_defer_jobs_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_defer_periodic_job_v2;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_fetch_job_v2;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_finish_job_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_cancel_job_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_retry_job_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_retry_job_v2;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_notify_queue_job_inserted_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_notify_queue_abort_job_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_trigger_function_status_events_insert_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_trigger_function_status_events_update_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_trigger_function_scheduled_events_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_trigger_abort_requested_events_procedure_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_unlink_periodic_defers_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_register_worker_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_unregister_worker_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_update_heartbeat_v1;\n"
+        "DROP FUNCTION IF EXISTS procrastinate_prune_stalled_workers_v1;\n"
+        "-- Tabelle Procrastinate in ordine inverso di dipendenza FK\n"
+        "DROP TABLE IF EXISTS procrastinate_events;\n"
+        "DROP TABLE IF EXISTS procrastinate_periodic_defers;\n"
+        "DROP TABLE IF EXISTS procrastinate_jobs;\n"
+        "DROP TABLE IF EXISTS procrastinate_workers;\n"
+        "-- Tipi Procrastinate (compositi ed ENUM)\n"
+        "DROP TYPE IF EXISTS procrastinate_job_to_defer_v1;\n"
+        "DROP TYPE IF EXISTS procrastinate_job_event_type;\n"
+        "DROP TYPE IF EXISTS procrastinate_job_status;"
     )
+    op.execute(sa.text(procrastinate_teardown))
+
+    op.drop_table("app_configurations")
+    op.drop_table("deletion_records")
+    op.drop_table("exclusions")
+    op.drop_index("ix_outbox_claim", table_name="outbox_events")
+    op.drop_table("outbox_events")
+    op.drop_table("source_revisions")
+    op.drop_table("import_jobs")
+    op.drop_table("source_items")
+    op.drop_table("auth_sessions")
+    op.drop_table("system_state")
+    op.drop_table("owner_accounts")
+
+    bind = op.get_bind()
+    outbox_status.drop(bind, checkfirst=True)
+    import_job_status.drop(bind, checkfirst=True)

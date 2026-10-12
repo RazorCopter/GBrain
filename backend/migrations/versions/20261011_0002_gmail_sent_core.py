@@ -25,9 +25,15 @@ connector_account_status = postgresql.ENUM(
     "revoked",
     "disabled",
     name="connector_account_status",
+    create_type=False,
 )
 source_policy_status = postgresql.ENUM(
-    "draft", "active", "paused", "disabled", name="source_policy_status"
+    "draft",
+    "active",
+    "paused",
+    "disabled",
+    name="source_policy_status",
+    create_type=False,
 )
 gmail_reconciliation_state = postgresql.ENUM(
     "not_required",
@@ -35,9 +41,15 @@ gmail_reconciliation_state = postgresql.ENUM(
     "running",
     "complete",
     name="gmail_reconciliation_state",
+    create_type=False,
 )
 source_item_state = postgresql.ENUM(
-    "active", "removed", "out_of_scope", "excluded", name="source_item_state"
+    "active",
+    "removed",
+    "out_of_scope",
+    "excluded",
+    name="source_item_state",
+    create_type=False,
 )
 
 
