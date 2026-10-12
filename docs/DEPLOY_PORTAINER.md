@@ -12,18 +12,18 @@ Quando si distribuisce uno stack su Portainer (tramite il pulsante **+ Add stack
 
 - **Perché con Immich si può usare direttamente il "Web editor"?**  
   Progetti come Immich pubblicano su registry pubblici (es. GitHub Container Registry `ghcr.io/immich-app/immich-server:release`) immagini Docker già compilate e pronte all'uso. Incollando il `docker-compose.yml` nel Web Editor di Portainer, il demone Docker deve unicamente effettuare il *pull* delle immagini.
-- **Perché GBrain con `build: .` richiede il "Repository" (oppure un pre-build)?**  
-  Il codice sorgente di GBrain risiede nel repository Git `https://github.com/RazorCopter/GBrain`. Nel file [`compose.yaml`](compose.yaml:52), i servizi `app` e `worker` specificano una direttiva di compilazione (`build: context: .`).  
-  Se si incolla tale configurazione direttamente nel **Web editor**, Portainer non dispone dei file sorgente (frontend React, backend FastAPI, `Dockerfile`, file lock uv) e fallirà con un errore di tipo `build context does not exist or is not accessible`.
+- **Perché GBrain con `build: .` richiede il "Repository" (oppure un pre-build)?**
+  Il codice sorgente di GBrain risiede nel repository Git `https://github.com/RazorCopter/GBrain`. Nel file [`compose.yaml`](compose.yaml:52), il servizio `app` specifica la direttiva di compilazione ([`build: context: .`](compose.yaml:53)) e [`pull_policy: build`](compose.yaml:52), mentre il servizio `worker` riutilizza la stessa immagine locale tramite [`pull_policy: never`](compose.yaml:88).
+  Se si incolla tale configurazione direttamente nel **Web editor** senza aver prima compilato l'immagine, Portainer non dispone dei file sorgente (frontend React, backend FastAPI, [`Dockerfile`](Dockerfile:1), file lock uv) e fallirà con un errore di tipo `build context does not exist or is not accessible`.
 
-### 1.2 I Due Metodi di Deploy Disponibili in Portainer
+### 1.2 I Percorsi di Deploy Senza Registry Disponibili
 
-| Caratteristica | Metodo A: Scheda "Repository" (Consigliato) | Metodo B: Scheda "Web Editor" (Stile Immich) |
-| :--- | :--- | :--- |
-| **Comandi shell manuali** | **Zero** sull'host/LXC | Richiede `docker build` manuale da shell una tantum |
-| **Come si attiva in Portainer** | Scheda **Repository** con URL Git | Scheda **Web editor** incollando lo YAML pronto |
-| **Compilazione** | Automatica eseguita da Portainer ad ogni deploy | Pre-compilata manualmente prima del deploy |
-| **Aggiornamenti futuri** | Pulsante *Pull and redeploy* / Webhook automatico | Rilanciare build manuale e premere *Redeploy* |
+| Caratteristica | Metodo A: Scheda "Repository" (GUI Portainer) | Alternativa Shell: Clone Git Diretto (Server) | Metodo B: Scheda "Web Editor" (Pre-Build Locale) |
+| :--- | :--- | :--- | :--- |
+| **Comandi shell manuali** | **Zero** sull'host/LXC | Minimi (`clone` e `compose up -d --build`) | `docker build` manuale prima del deploy |
+| **Come si attiva** | Scheda **Repository** in Portainer con URL Git | Esecuzione da shell server; visualizzato in Portainer | Scheda **Web editor** incollando lo YAML pronto |
+| **Compilazione** | Automatica su server gestita da Portainer | Automatica su server eseguita da Docker Compose | Pre-compilata manualmente prima del deploy |
+| **Aggiornamenti futuri** | Pulsante *Pull and redeploy* in Portainer | `git pull && docker compose up -d --build` | Rilanciare build e premere *Redeploy* |
 
 ---
 
@@ -120,9 +120,25 @@ openssl rand -hex 24
 
 ## 3. Metodo A (Consigliato) — Deploy tramite Scheda "Repository"
 
-Questo è il metodo ufficiale più semplice su Portainer: non richiede di compilare manualmente le immagini né di usare la shell Docker.
+Questo è il metodo ufficiale per distribuire lo stack compilando l'immagine sul server direttamente dal repository Git, senza dover gestire o configurare alcun registry di immagini Docker privato o pubblico.
 
-### 3.1 Creazione dello Stack
+### 3.1 Come Funziona il Meccanismo Build/Riuso e Prevenzione Errori di Pull
+
+Nel file [`compose.yaml`](compose.yaml:48):
+1. **Compilazione su server (`app`)**: il servizio `app` definisce la sezione [`build: context: .`](compose.yaml:53) con [`dockerfile: Dockerfile`](compose.yaml:55) e [`pull_policy: build`](compose.yaml:52). La direttiva [`pull_policy: build`](compose.yaml:52) istruisce il motore Docker Compose a compilare sempre l'immagine locale dal repository clonato e impedisce qualsiasi richiesta di pull verso registry esterni per l'immagine applicativa.
+2. **Riuso immagine locale (`worker`)**: il servizio `worker` condivide lo stesso tag [`image: gbrain:${GBRAIN_IMAGE_TAG:-0.1.0}`](compose.yaml:87) e imposta tassativamente [`pull_policy: never`](compose.yaml:88). Questo impedisce a Compose di cercare `gbrain` su Docker Hub, riutilizzando l'immagine compilata dal servizio `app`. La dipendenza [`depends_on: app: condition: service_healthy`](compose.yaml:98) garantisce inoltre che il container `worker` venga avviato solo dopo che `app` è stato compilato, avviato e ha superato l'healthcheck.
+3. **Immagini database esterne (`postgres`, `neo4j`)**: mantengono la configurazione standard senza policy restrittive, permettendo a Docker Compose di effettuare regolarmente il pull delle immagini ufficiali pubbliche da Docker Hub.
+
+#### Risoluzione dell'Errore Portainer `pull access denied for gbrain`
+Se uno stack con servizi multi-container referenzia un'immagine locale non presente su un registry pubblico (es. `gbrain:0.1.0`), Portainer esegue di default un'operazione preventiva di `compose pull`. Senza le direttive [`pull_policy: build`](compose.yaml:52) su `app` e [`pull_policy: never`](compose.yaml:88) su `worker`, Compose interpreta il worker come un'immagine remota da scaricare da `docker.io/library/gbrain:0.1.0`, provocando l'errore bloccante:
+`failed to pull images of the stack: compose pull operation failed: pull access denied for gbrain`.
+L'accoppiamento di [`pull_policy: build`](compose.yaml:52) su `app` e [`pull_policy: never`](compose.yaml:88) su `worker` neutralizza questo comportamento, escludendo l'immagine applicativa dalla fase di pull.
+
+#### Requisiti e Compatibilità Versioni
+- **Docker Compose v2.2.0+**: il supporto completo e stabile della semantica `pull_policy` (valori `build` e `never`) richiede Docker Compose Specification v2 (v2.2.0 o superiore), integrato nelle versioni moderne di Docker Engine e Portainer CE/EE 2.x.
+- **Ambiente Docker Standalone**: la compilazione tramite Stack Repository richiede un ambiente Portainer collegato a un Docker Engine standalone (socket locale `/var/run/docker.sock` o Portainer Agent su host singolo). Non è supportata su cluster Docker Swarm nativi poiché Swarm non consente la compilazione locale da stack file.
+
+### 3.2 Creazione dello Stack
 1. Accedere a Portainer -> selezionare l'ambiente target (es. **local**).
 2. Selezionare **Stacks** -> **+ Add stack**.
 3. Nella riga **Build method**, cliccare sulla scheda **Repository**.
@@ -133,7 +149,7 @@ Questo è il metodo ufficiale più semplice su Portainer: non richiede di compil
    - **Compose path**: `compose.yaml` (⚠️ verificare di non lasciare il valore di default `docker-compose.yml`)
    - **Automatic updates** (opzionale): abilitare per aggiornare automaticamente lo stack ad ogni nuovo commit.
 
-### 3.2 Variabili d'Ambiente per il Metodo A
+### 3.3 Variabili d'Ambiente per il Metodo A
 Nella stessa pagina, scorrere alla sezione **Environment variables**, selezionare **Advanced mode** e incollare il blocco seguente (sostituendo le voci `CAMBIA_CON_...` e l'IP):
 
 ```bash
@@ -166,15 +182,80 @@ GBRAIN_AUTH_SECRET=CAMBIA_CON_SECRET_MIN_32_CARATTERI_GENERATO
 GBRAIN_NEO4J_PASSWORD=CAMBIA_CON_PASSWORD_NEO4J_GENERATA
 ```
 
-5. Cliccare su **Deploy the stack**. Portainer clonerà il repo, compilerà l'immagine tramite [`Dockerfile`](Dockerfile:1) e avvierà tutti i 4 servizi.
+5. Cliccare su **Deploy the stack**. Portainer clonerà il repo, compilerà l'immagine tramite [`Dockerfile`](Dockerfile:1) senza tentare il pull remoto di `gbrain`, e avvierà tutti i 4 servizi.
 
 ---
 
-## 4. Metodo B — Deploy tramite Scheda "Web Editor" (Stile Immich)
+## 4. Alternativa Minima Concreta Senza Registry (Clone Git + Docker Compose da Shell)
+
+Qualora l'ambiente Portainer utilizzato presenti vincoli che impediscono la compilazione da Stack Repository (ad esempio: Portainer Agent remoto privo di accesso al filesystem del demone Docker, cluster Swarm, o versioni di Portainer che impongono un pre-pull rigido a monte ignorando le direttive Compose), è disponibile una procedura alternativa minima e robusta **senza alcun registry di immagini**.
+
+In questa alternativa, la compilazione avviene direttamente sul server host (o container LXC) tramite Git e Docker Compose CLI, e lo stack risultante viene comunque integrato e gestito visivamente all'interno di Portainer.
+
+### 4.1 Procedura di Installazione da Shell sul Server
+
+1. **Clonare il repository sul server**:
+   Connettersi via SSH al server Docker host o alla shell del container LXC ed eseguire:
+   ```bash
+   sudo git clone https://github.com/RazorCopter/GBrain.git /opt/gbrain
+   cd /opt/gbrain
+   ```
+
+2. **Configurare il file di ambiente `.env`**:
+   Creare il file `.env` copiando il modello di esempio e valorizzando le password e i percorsi:
+   ```bash
+   cp example.env .env
+   ```
+   Modificare `.env` con un editor di testo (`nano .env`) impostando:
+   - `COMPOSE_PROFILES=compact`
+   - `GBRAIN_HOST_STORAGE_PATH=/mnt/synology_docker/GBrain`
+   - `GBRAIN_PUBLIC_URL=http://<IP_DEL_SERVER>:8000`
+   - Le password sicure per `GBRAIN_POSTGRES_PASSWORD`, `GBRAIN_AUTH_SECRET` (minimo 32 caratteri) e `GBRAIN_NEO4J_PASSWORD`.
+
+3. **Compilazione dell'immagine e avvio dei container**:
+   Eseguire il comando Compose con il flag `--build`:
+   ```bash
+   docker compose --profile compact up -d --build
+   ```
+   In alternativa, se si preferisce separare la fase di build dalla fase di avvio:
+   ```bash
+   # Compila l'immagine gbrain:0.1.0 sul server
+   docker compose build app
+   # Avvia tutti i container dello stack
+   docker compose --profile compact up -d
+   ```
+   Docker Compose:
+   - Compila l'immagine `gbrain:0.1.0` localmente usando [`Dockerfile`](Dockerfile:1) e il codice in `/opt/gbrain`.
+   - Scarica le immagini pubbliche certificate di PostgreSQL e Neo4j.
+   - Avvia `postgres` e `neo4j`.
+   - Avvia `app` usando l'immagine locale appena compilata.
+   - Avvia `worker` riutilizzando la stessa immagine locale senza alcun download esterno.
+
+### 4.2 Visibilità e Gestione dello Stack in Portainer
+- Una volta avviato da terminale, Portainer rileva automaticamente i 4 container e il progetto compose `gbrain`.
+- Nella sezione **Stacks** di Portainer, lo stack comparirà come stack esterno (etichettato come *Limited* o *External*).
+- Dalla Web UI di Portainer è possibile:
+  - Ispezionare i log in tempo reale di `app`, `worker`, `postgres` e `neo4j`.
+  - Verificare lo stato di salute degli healthcheck.
+  - Monitorare l'utilizzo di CPU e RAM.
+  - Avviare, arrestare o riavviare i container.
+
+### 4.3 Aggiornamenti Futuri tramite l'Alternativa Shell
+Per aggiornare il codice e applicare nuove modifiche senza registry:
+```bash
+cd /opt/gbrain
+git pull
+docker compose --profile compact up -d --build
+```
+Docker Compose ricompilerà solo i layer modificati e ricreerà i container preservando tutti i volumi persistenti.
+
+---
+
+## 5. Metodo B — Deploy tramite Scheda "Web Editor" (Stile Immich)
 
 Se si desidera incollare direttamente lo YAML nel **Web editor** di Portainer, esattamente come si fa con Immich, è sufficiente pre-compilare l'immagine sull'host una tantum oppure usare un compose che referenzia l'immagine compilata locale.
 
-### 4.1 Passo Preliminare Shell (Build una tantum)
+### 5.1 Passo Preliminare Shell (Build una tantum)
 Sul container LXC o host Docker eseguire:
 
 ```bash
@@ -186,9 +267,9 @@ sudo docker build -t gbrain:0.1.0 .
 
 Una volta eseguito questo comando, l'immagine `gbrain:0.1.0` sarà memorizzata nella cache locale di Docker del server.
 
-### 4.2 Compose YAML Completo "Chiavi in Mano" per Web Editor
+### 5.2 Compose YAML Completo "Chiavi in Mano" per Web Editor
 
-In Portainer -> **Stacks** -> **+ Add stack** -> selezionare la scheda **Web editor**, assegnare il nome `gbrain` e incollare il seguente Compose YAML auto-consistente.  
+In Portainer -> **Stacks** -> **+ Add stack** -> selezionare la scheda **Web editor**, assegnare il nome `gbrain` e incollare il seguente Compose YAML auto-consistente. Entrambi i servizi `app` e `worker` specificano [`pull_policy: never`](compose.yaml:88) per impedire a Portainer qualsiasi tentativo di interrogare Docker Hub per l'immagine applicativa compilata localmente.
 Tutti i volumi sono già puntati direttamente a `/mnt/synology_docker/GBrain/...`:
 
 ```yaml
@@ -242,6 +323,7 @@ x-app-volumes: &app-volumes
 services:
   app:
     image: gbrain:0.1.0
+    pull_policy: never
     command: [ "web" ]
     environment: *app-environment
     secrets:
@@ -273,6 +355,7 @@ services:
 
   worker:
     image: gbrain:0.1.0
+    pull_policy: never
     command: [ "worker" ]
     environment: *app-environment
     secrets:
@@ -364,7 +447,7 @@ networks:
     internal: true
 ```
 
-### 4.3 Variabili d'Ambiente per il Metodo B (Web Editor)
+### 5.3 Variabili d'Ambiente per il Metodo B (Web Editor)
 Sotto l'editor YAML, nella sezione **Environment variables**, selezionare **Advanced mode** e inserire i soli valori applicativi e segreti:
 
 ```bash
@@ -377,11 +460,11 @@ GBRAIN_AUTH_SECRET=CAMBIA_CON_SECRET_MIN_32_CARATTERI_GENERATO
 GBRAIN_NEO4J_PASSWORD=CAMBIA_CON_PASSWORD_NEO4J_GENERATA
 ```
 
-Cliccare su **Deploy the stack**. L'avvio sarà istantaneo poiché l'immagine è già presente sul sistema.
+Cliccare su **Deploy the stack**. L'avvio sarà istantaneo poiché l'immagine è già presente sul sistema e le policy `never` impediscono richieste remote.
 
 ---
 
-## 5. Passo 3 — Bootstrap Iniziale dell'Account Owner
+## 6. Passo 3 — Bootstrap Iniziale dell'Account Owner
 
 GBrain non include utenti predefiniti o password di fabbrica memorizzate nel codice. Il primo avvio attiva un flusso di registrazione esclusivo denominato **Bootstrap Owner**.
 
@@ -399,19 +482,20 @@ GBrain non include utenti predefiniti o password di fabbrica memorizzate nel cod
 
 ---
 
-## 6. Verifica dello Stack e Manutenzione
+## 7. Verifica dello Stack e Manutenzione
 
-### 6.1 Verifica dello Stato dei Container
+### 7.1 Verifica dello Stato dei Container
 In Portainer -> **Stacks** -> `gbrain`:
 - Tutti i 4 container (`app`, `worker`, `postgres`, `neo4j`) devono essere nello stato **running**.
 - I servizi `app` e `postgres` devono mostrare lo stato **healthy**.
 
-### 6.2 Verifica della Pagina Fonti
+### 7.2 Verifica della Pagina Fonti
 Nella dashboard principale, cliccare sulla scheda **Fonti**. Se non sono state inserite credenziali Gmail in `secrets`, la scheda mostrerà l'integrazione Gmail nello stato **Non configurato**, confermando che lo stack è pienamente integro e operativo.
 
-### 6.3 Aggiornamenti Futuri dello Stack
-- **Se si è usato il Metodo A (Repository)**: in Portainer -> Stack `gbrain` -> premere **Pull and redeploy** attivando la spunta *Re-pull image and redeploy*. Portainer scaricherà i nuovi commit e ricompilerà automaticamente.
+### 7.3 Aggiornamenti Futuri dello Stack
+- **Se si è usato il Metodo A (Repository)**: in Portainer -> Stack `gbrain` -> premere **Pull and redeploy**. Portainer scaricherà i nuovi commit dal repository Git e ricompilerà automaticamente l'immagine sul server, mantenendo intatte le policy senza interrogare registri esterni.
+- **Se si è usata l'Alternativa Shell diretta**: eseguire da terminale sul server `cd /opt/gbrain && git pull && docker compose --profile compact up -d --build`.
 - **Se si è usato il Metodo B (Web editor)**: eseguire da shell `git pull && docker build -t gbrain:0.1.0 .` nella cartella di build e in Portainer premere **Redeploy**.
 
-### 6.4 Backup e Ripristino dei Dati
+### 7.4 Backup e Ripristino dei Dati
 I comandi e le procedure formali di backup dei volumi e dei dump database sono documentati in [`docs/BACKUP_RIPRISTINO.md`](docs/BACKUP_RIPRISTINO.md:1) ed eseguibili mediante [`scripts/backup.sh`](scripts/backup.sh:1) e [`scripts/restore.sh`](scripts/restore.sh:1).

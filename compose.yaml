@@ -7,7 +7,7 @@ x-logging: &default-logging
     max-file: "3"
 
 x-app-environment: &app-environment
-  GBRAIN_ENVIRONMENT: ${GBRAIN_ENVIRONMENT:-development}
+  GBRAIN_ENVIRONMENT: ${GBRAIN_ENVIRONMENT:-${GBRAIN_ENV:-development}}
   GBRAIN_LOG_LEVEL: ${GBRAIN_LOG_LEVEL:-INFO}
   GBRAIN_PUBLIC_URL: ${GBRAIN_PUBLIC_URL:-http://localhost:8000}
   GBRAIN_DEMO_MODE: ${GBRAIN_DEMO_MODE:-false}
@@ -18,8 +18,8 @@ x-app-environment: &app-environment
   GBRAIN_FRONTEND_DIR: /app/frontend/dist
   GBRAIN_POSTGRES_HOST: postgres
   GBRAIN_POSTGRES_PORT: "5432"
-  GBRAIN_POSTGRES_DB: ${POSTGRES_DB:-gbrain}
-  GBRAIN_POSTGRES_USER: ${POSTGRES_USER:-gbrain}
+  GBRAIN_POSTGRES_DB: ${POSTGRES_DB:-${GBRAIN_POSTGRES_DB:-gbrain}}
+  GBRAIN_POSTGRES_USER: ${POSTGRES_USER:-${GBRAIN_POSTGRES_USER:-gbrain}}
   GBRAIN_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
   GBRAIN_AUTH_SECRET_FILE: /run/secrets/auth_secret
   GBRAIN_SESSION_TTL_SECONDS: ${GBRAIN_SESSION_TTL_SECONDS:-43200}
@@ -49,6 +49,7 @@ services:
   app:
     profiles: [ "compact" ]
     image: gbrain:${GBRAIN_IMAGE_TAG:-0.1.0}
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
@@ -60,7 +61,7 @@ services:
       - neo4j_password
     volumes: *app-volumes
     ports:
-      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8000}:8000"
+      - "${WEB_BIND_ADDRESS:-${GBRAIN_WEB_BIND_HOST:-127.0.0.1}}:${WEB_PORT:-${GBRAIN_WEB_PORT:-8000}}:8000"
     networks:
       - edge
       - backend
@@ -84,6 +85,7 @@ services:
   worker:
     profiles: [ "compact" ]
     image: gbrain:${GBRAIN_IMAGE_TAG:-0.1.0}
+    pull_policy: never
     command: [ "worker" ]
     environment: *app-environment
     secrets:
@@ -112,8 +114,8 @@ services:
     profiles: [ "compact" ]
     image: postgres:16.10-bookworm@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-gbrain}
-      POSTGRES_USER: ${POSTGRES_USER:-gbrain}
+      POSTGRES_DB: ${POSTGRES_DB:-${GBRAIN_POSTGRES_DB:-gbrain}}
+      POSTGRES_USER: ${POSTGRES_USER:-${GBRAIN_POSTGRES_USER:-gbrain}}
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets:
       - postgres_password
@@ -141,9 +143,9 @@ services:
       - -ec
       - export NEO4J_AUTH="neo4j/$$(cat /run/secrets/neo4j_password)"; exec /startup/docker-entrypoint.sh neo4j
     environment:
-      NEO4J_server_memory_heap_initial__size: 256m
-      NEO4J_server_memory_heap_max__size: 512m
-      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INIT:-256m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-512m}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
       NEO4J_server_default__listen__address: 0.0.0.0
     secrets:
       - neo4j_password
