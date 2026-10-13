@@ -59,6 +59,8 @@ from gbrain.presentation.schemas import (
     ConnectorCapabilitiesResponse,
     GmailBackfillStateResponse,
     GmailCoverageResponse,
+    GmailItemGapListResponse,
+    GmailItemGapResponse,
     GmailOAuthStartResponse,
     GmailPreviewResponse,
     HistoryImportRequest,
@@ -296,6 +298,9 @@ async def get_source_status(
                     query_fingerprint=cov.query_fingerprint,
                     config_revision=cov.config_revision,
                     is_legacy=cov.is_legacy,
+                    has_gaps=cov.has_gaps,
+                    missing_count=cov.missing_count,
+                    status=cov.status,
                     last_completed_at=cov.last_completed_at,
                 )
                 if cov.query_fingerprint != cfg.query_fingerprint or cov.is_legacy:
@@ -313,6 +318,7 @@ async def get_source_status(
                     page_token=bf.page_token,
                     status=bf.status,
                     items_imported=bf.items_imported,
+                    items_not_imported=bf.items_not_imported,
                     last_run_at=bf.last_run_at,
                     last_error_code=bf.last_error_code,
                 )
@@ -341,6 +347,8 @@ async def get_source_status(
             sync_config=sync_config_resp,
             coverage=coverage_resp,
             backfill_state=backfill_resp,
+            has_gaps=coverage_resp.has_gaps if coverage_resp else False,
+            missing_count=coverage_resp.missing_count if coverage_resp else 0,
             requires_import=requires_import,
             last_sync_at=last_sync_at,
         )
@@ -945,6 +953,62 @@ async def import_history_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=exc.safe_message
         ) from exc
+
+
+@sources_router.get("/{source_id}/diagnostics", response_model=GmailItemGapListResponse)
+async def get_source_diagnostics(
+    source_id: str,
+    session: DbSession,
+    principal: PrincipalDep,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+) -> GmailItemGapListResponse:
+    """Restituisce le lacune diagnostiche consultabili e bounded per la fonte specificata."""
+    if source_id != "gmail":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fonte non supportata")
+
+    account = await get_gmail_account(session, principal.owner.id, required=False)
+    if account is None:
+        return GmailItemGapListResponse(
+            items=[],
+            total=0,
+            page=page,
+            page_size=page_size,
+            has_gaps=False,
+            open_count=0,
+            resolved_count=0,
+        )
+
+    repo = AsyncPostgresGmailRepository(session)
+    items, total = await repo.list_gaps(
+        account.id, status=status_filter, page=page, page_size=page_size
+    )
+    open_count, resolved_count = await repo.count_gaps(account.id)
+    return GmailItemGapListResponse(
+        items=[
+            GmailItemGapResponse(
+                id=item.id,
+                gmail_message_id=item.gmail_message_id,
+                gmail_thread_id=item.gmail_thread_id,
+                config_revision=item.config_revision,
+                query_fingerprint=item.query_fingerprint,
+                phase=item.phase,
+                reason_code=item.reason_code,
+                status=item.status,
+                occurred_at=item.occurred_at,
+                resolved_at=item.resolved_at,
+                details=item.details,
+            )
+            for item in items
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+        has_gaps=open_count > 0,
+        open_count=open_count,
+        resolved_count=resolved_count,
+    )
 
 
 @sources_router.delete("/{source_id}", response_model=SourceDisconnectResponse)

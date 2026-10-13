@@ -416,6 +416,17 @@ class GmailSyncConfigData:
 
 
 @dataclass(frozen=True, slots=True)
+class GmailItemGapData:
+    gmail_message_id: str
+    phase: str
+    reason_code: str
+    details: dict[str, Any]
+    occurred_at: datetime
+    gmail_thread_id: str | None = None
+    status: str = "open"
+
+
+@dataclass(frozen=True, slots=True)
 class GmailBackfillStateData:
     config_revision: int
     query_fingerprint: str
@@ -424,6 +435,7 @@ class GmailBackfillStateData:
     page_token: str | None = None
     status: str = "idle"
     items_imported: int = 0
+    items_not_imported: int = 0
     last_run_at: datetime | None = None
     last_error_code: str | None = None
 
@@ -436,6 +448,9 @@ class GmailCoverageData:
     config_revision: int | None = None
     is_legacy: bool = False
     last_completed_at: datetime | None = None
+    has_gaps: bool = False
+    missing_count: int = 0
+    status: str = "completed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +473,8 @@ class GmailSyncResult:
     pages: int
     state: PageState
     checkpoint: GmailCheckpointState
+    not_imported_items: int = 0
+    gaps: tuple[GmailItemGapData, ...] = field(default_factory=tuple)
     detail_codes: tuple[str, ...] = field(default_factory=tuple)
 
 

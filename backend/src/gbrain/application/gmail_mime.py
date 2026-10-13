@@ -14,7 +14,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, cast
 
-from gbrain.domain.connectors import ConnectorError, ConnectorErrorCategory
+from gbrain.domain.connectors import GmailMimeError
 from gbrain.domain.gmail import (
     PIPELINE_VERSION,
     AttachmentReference,
@@ -31,10 +31,19 @@ from gbrain.domain.gmail import (
     stable_revision_hash,
 )
 
-_MAX_MESSAGE_BYTES = 25 * 1024 * 1024
+# ``sizeEstimate`` include anche gli allegati esterni e non e' un limite di parsing.
+# I limiti seguenti si applicano invece ai dati effettivamente materializzati dal parser.
 _MAX_BODY_BYTES = 5 * 1024 * 1024
+_MAX_PART_BODY_BYTES = 5 * 1024 * 1024
 _MAX_PARTS = 100
 _MAX_DEPTH = 10
+_MAX_ATTACHMENTS = 100
+_MAX_ATTACHMENT_NAME_LEN = 255
+_MAX_HEADERS_PER_PART = 100
+_MAX_HEADER_NAME_LEN = 128
+_MAX_HEADER_VALUE_LEN = 16 * 1024
+_MAX_METADATA_CHARS = 256 * 1024
+_MAX_IDENTIFIER_LEN = 512
 _PARSE_TIMEOUT_SECONDS = 30.0
 _USEFUL_HEADERS = frozenset(
     {"message-id", "date", "from", "to", "cc", "subject", "reply-to", "in-reply-to", "references"}
@@ -50,12 +59,29 @@ _QUOTE_HEADER_RE = re.compile(
 )
 
 
+def sanitize_attachment_filename(filename: str, max_len: int = _MAX_ATTACHMENT_NAME_LEN) -> str:
+    # Non conservare path forniti dal mittente; oltre a non essere utili, possono
+    # risultare ingannevoli nella UI o nei futuri export.
+    leaf = re.split(r"[/\\]+", filename)[-1]
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", leaf).strip().strip(".")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned or "unnamed_attachment"
+
+
 @dataclass(frozen=True, slots=True)
 class MimeLimits:
-    max_message_bytes: int = _MAX_MESSAGE_BYTES
     max_body_bytes: int = _MAX_BODY_BYTES
+    max_part_body_bytes: int = _MAX_PART_BODY_BYTES
     max_parts: int = _MAX_PARTS
     max_depth: int = _MAX_DEPTH
+    max_attachments: int = _MAX_ATTACHMENTS
+    max_attachment_name_len: int = _MAX_ATTACHMENT_NAME_LEN
+    max_headers_per_part: int = _MAX_HEADERS_PER_PART
+    max_header_name_len: int = _MAX_HEADER_NAME_LEN
+    max_header_value_len: int = _MAX_HEADER_VALUE_LEN
+    max_metadata_chars: int = _MAX_METADATA_CHARS
+    max_identifier_len: int = _MAX_IDENTIFIER_LEN
     timeout_seconds: float = _PARSE_TIMEOUT_SECONDS
 
 
@@ -64,6 +90,7 @@ class _WalkState:
     started_at: float
     parts_seen: int = 0
     bytes_seen: int = 0
+    metadata_chars_seen: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +187,6 @@ def normalize_gmail_message(
     monotonic: Any = time.monotonic,
 ) -> NormalizedGmailMessage:
     effective_limits = limits or MimeLimits()
-    if raw.size_estimate is not None and raw.size_estimate > effective_limits.max_message_bytes:
-        raise _parse_error("MESSAGE_TOO_LARGE")
     parsed = _parse_payload(raw.payload, effective_limits, monotonic)
     header_map = {header.name.casefold(): header.value for header in parsed.headers}
     from_addresses = address_header_values(header_map.get("from"))
@@ -300,6 +325,8 @@ def html_to_safe_text(value: str) -> str:
 
 
 def _parse_payload(payload: Mapping[str, Any], limits: MimeLimits, monotonic: Any) -> _ParsedMime:
+    if not isinstance(payload, Mapping):
+        raise _parse_error("MIME_MALFORMED")
     state = _WalkState(started_at=float(monotonic()))
     plain_parts: list[_TextPart] = []
     html_parts: list[_TextPart] = []
@@ -310,52 +337,93 @@ def _parse_payload(payload: Mapping[str, Any], limits: MimeLimits, monotonic: An
         nonlocal headers
         _check_limits(state, limits, monotonic, depth)
         state.parts_seen += 1
-        part_id = str(part.get("partId") or fallback_id)
-        mime_type = str(part.get("mimeType") or "application/octet-stream").casefold()
-        if depth == 0:
-            headers = _decode_headers(part.get("headers"))
+        part_id = _bounded_metadata(part.get("partId") or fallback_id, limits, state)
+        mime_type = _bounded_metadata(
+            part.get("mimeType") or "application/octet-stream", limits, state
+        ).casefold()
         body = part.get("body", {})
         body_mapping = cast(Mapping[str, Any], body) if isinstance(body, Mapping) else {}
-        filename = _decode_header_value(str(part.get("filename") or ""))
-        attachment_id = _optional(body_mapping.get("attachmentId"))
-        size = int(body_mapping.get("size") or 0)
-        part_headers = _decode_headers(part.get("headers"))
+        raw_filename = _bounded_metadata(part.get("filename") or "", limits, state)
+        filename = _decode_header_value(raw_filename)
+        attachment_id = _optional_bounded(
+            body_mapping.get("attachmentId"), limits.max_identifier_len
+        )
+        size = _safe_nonnegative_size(body_mapping.get("size"))
+        part_headers = _decode_headers(part.get("headers"), limits, state)
+        if depth == 0:
+            headers = part_headers
         part_header_map = {item.name.casefold(): item.value for item in part_headers}
         content_id = part_header_map.get("content-id")
         disposition = part_header_map.get("content-disposition", "").casefold()
-        if filename or attachment_id:
-            if size > limits.max_message_bytes:
-                raise _parse_error("ATTACHMENT_METADATA_SIZE_LIMIT")
+
+        is_attachment = bool(
+            filename
+            or attachment_id
+            or "attachment" in disposition
+            or (
+                mime_type
+                not in {
+                    "text/plain",
+                    "text/html",
+                    "multipart/alternative",
+                    "multipart/mixed",
+                    "multipart/related",
+                    "multipart/digest",
+                }
+                and not part.get("parts")
+            )
+        )
+
+        if is_attachment:
+            if len(attachments) >= limits.max_attachments:
+                raise _parse_error("ATTACHMENT_COUNT_LIMIT")
+            sanitized_name = sanitize_attachment_filename(filename, limits.max_attachment_name_len)
             attachments.append(
                 AttachmentReference(
                     part_id=part_id,
-                    filename=filename,
+                    filename=sanitized_name,
                     mime_type=mime_type,
-                    size=size,
+                    size=max(0, size),
                     attachment_id=attachment_id,
-                    inline="inline" in disposition,
+                    inline="inline" in disposition or bool(content_id),
                     content_id=content_id,
                 )
             )
         elif mime_type in {"text/plain", "text/html"}:
             data = body_mapping.get("data")
             if data is not None:
-                decoded = _decode_base64url(str(data))
+                if not isinstance(data, str):
+                    raise _parse_error("BASE64URL_DECODE_ERROR")
+                raw_str = data.strip()
+                # Controllo sulla rappresentazione encoded prima del decode: evita
+                # sia l'allocazione del blob sia copie non necessarie di input enormi.
+                max_encoded_chars = 4 * ((limits.max_part_body_bytes + 2) // 3)
+                if len(raw_str) > max_encoded_chars:
+                    raise _parse_error("BODY_TOO_LARGE")
+                estimated_bytes = (len(raw_str) * 3) // 4
+                if estimated_bytes > limits.max_part_body_bytes:
+                    raise _parse_error("BODY_TOO_LARGE")
+                if state.bytes_seen + estimated_bytes > limits.max_body_bytes:
+                    raise _parse_error("BODY_TOO_LARGE")
+                decoded = _decode_base64url(raw_str)
+                if len(decoded) > limits.max_part_body_bytes:
+                    raise _parse_error("BODY_TOO_LARGE")
+                if state.bytes_seen + len(decoded) > limits.max_body_bytes:
+                    raise _parse_error("BODY_TOO_LARGE")
                 state.bytes_seen += len(decoded)
-                if state.bytes_seen > limits.max_body_bytes:
-                    raise _parse_error("BODY_SIZE_LIMIT")
                 text = _decode_text(decoded, part_header_map.get("content-type") or mime_type)
                 if mime_type == "text/html":
                     html_parts.append(_TextPart(part_id, mime_type, html_to_safe_text(text)))
                 else:
                     plain_parts.append(_TextPart(part_id, mime_type, text.strip()))
+
         child_parts = part.get("parts", ())
         if child_parts:
             if not isinstance(child_parts, list):
-                raise _parse_error("MIME_PARTS_SCHEMA_INVALID")
+                raise _parse_error("MIME_MALFORMED")
             for index, child in enumerate(child_parts):
                 if not isinstance(child, Mapping):
-                    raise _parse_error("MIME_PART_SCHEMA_INVALID")
+                    raise _parse_error("MIME_MALFORMED")
                 walk(cast(Mapping[str, Any], child), depth + 1, f"{part_id}.{index}")
 
     walk(payload, 0, "0")
@@ -366,22 +434,37 @@ def _check_limits(state: _WalkState, limits: MimeLimits, monotonic: Any, depth: 
     if depth > limits.max_depth:
         raise _parse_error("MIME_DEPTH_LIMIT")
     if state.parts_seen >= limits.max_parts:
-        raise _parse_error("MIME_PART_COUNT_LIMIT")
+        raise _parse_error("MIME_PARTS_LIMIT")
     if float(monotonic()) - state.started_at > limits.timeout_seconds:
-        raise _parse_error("MIME_PARSE_TIMEOUT")
+        raise _parse_error("MIME_TIMEOUT")
 
 
-def _decode_headers(value: object) -> tuple[GmailHeader, ...]:
+def _decode_headers(
+    value: object, limits: MimeLimits, state: _WalkState
+) -> tuple[GmailHeader, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
         raise _parse_error("MIME_HEADERS_SCHEMA_INVALID")
+    if len(value) > limits.max_headers_per_part:
+        raise _parse_error("HEADER_COUNT_LIMIT")
     result: list[GmailHeader] = []
     for raw_header in value:
         if not isinstance(raw_header, Mapping):
             raise _parse_error("MIME_HEADER_SCHEMA_INVALID")
-        name = str(raw_header.get("name") or "").strip()
-        raw_value = str(raw_header.get("value") or "")
+        raw_name = raw_header.get("name") or ""
+        raw_value = raw_header.get("value") or ""
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            raise _parse_error("MIME_HEADER_SCHEMA_INVALID")
+        if (
+            len(raw_name) > limits.max_header_name_len
+            or len(raw_value) > limits.max_header_value_len
+        ):
+            raise _parse_error("METADATA_TOO_LARGE")
+        state.metadata_chars_seen += len(raw_name) + len(raw_value)
+        if state.metadata_chars_seen > limits.max_metadata_chars:
+            raise _parse_error("METADATA_TOO_LARGE")
+        name = raw_name.strip()
         if name and "\n" not in name and "\r" not in name:
             result.append(GmailHeader(name, _decode_header_value(raw_value)))
     return tuple(result)
@@ -446,12 +529,37 @@ def _join_parts(parts: Sequence[_TextPart]) -> str | None:
     return "\n\n".join(values) if values else None
 
 
-def _parse_error(code: str) -> ConnectorError:
-    return ConnectorError(ConnectorErrorCategory.PARSE, f"Parsing MIME fallito: {code}")
+def _parse_error(code: str) -> GmailMimeError:
+    return GmailMimeError(code, f"Parsing MIME fallito: {code}")
 
 
-def _optional(value: object) -> str | None:
+def _optional_bounded(value: object, max_len: int) -> str | None:
     if value is None:
         return None
-    result = str(value)
+    if not isinstance(value, str) or len(value) > max_len:
+        raise _parse_error("METADATA_TOO_LARGE")
+    result = value.strip()
     return result or None
+
+
+def _bounded_metadata(value: object, limits: MimeLimits, state: _WalkState) -> str:
+    if not isinstance(value, str):
+        raise _parse_error("MIME_MALFORMED")
+    if len(value) > limits.max_identifier_len:
+        raise _parse_error("METADATA_TOO_LARGE")
+    state.metadata_chars_seen += len(value)
+    if state.metadata_chars_seen > limits.max_metadata_chars:
+        raise _parse_error("METADATA_TOO_LARGE")
+    return value
+
+
+def _safe_nonnegative_size(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise _parse_error("MIME_MALFORMED")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _parse_error("MIME_MALFORMED") from exc
+    return max(0, parsed)

@@ -42,6 +42,9 @@ export interface ImportJob {
     mode: string | null
     status: string
     processed_items: number
+    imported_items?: number
+    not_imported_items?: number
+    duplicate_items?: number
     total_items: number | null
     checkpoint: Record<string, unknown>
     policy_snapshot: Record<string, string | number>
@@ -227,6 +230,8 @@ export interface SourceStatusResponse {
     sync_config?: SourceSyncConfig | null
     coverage?: GmailCoverage | null
     backfill_state?: GmailBackfillState | null
+    has_gaps?: boolean
+    missing_count?: number
     requires_import?: boolean
     last_sync_at?: string | null
 }
@@ -253,6 +258,9 @@ export interface GmailCoverage {
     query_fingerprint: string | null
     config_revision: number | null
     is_legacy: boolean
+    has_gaps?: boolean
+    missing_count?: number
+    status?: string
     last_completed_at: string | null
 }
 
@@ -264,8 +272,33 @@ export interface GmailBackfillState {
     page_token: string | null
     status: 'idle' | 'running' | 'partial' | 'completed' | 'failed' | string
     items_imported: number
+    items_not_imported?: number
     last_run_at: string | null
     last_error_code: string | null
+}
+
+export interface GmailItemGap {
+    id: string
+    gmail_message_id: string
+    gmail_thread_id?: string | null
+    config_revision?: number | null
+    query_fingerprint?: string | null
+    phase: string
+    reason_code: string
+    status: string
+    occurred_at: string
+    resolved_at?: string | null
+    details: Record<string, unknown>
+}
+
+export interface GmailItemGapListResponse {
+    items: GmailItemGap[]
+    total: number
+    page: number
+    page_size: number
+    has_gaps: boolean
+    open_count: number
+    resolved_count: number
 }
 
 export interface SourceCredentialsUploadPayload {
@@ -529,4 +562,11 @@ export const api = {
             method: 'POST',
             body: JSON.stringify({ mode: 'incremental' }),
         }),
+    fetchSourceDiagnostics: (sourceId: string, page = 1, pageSize = 20, status?: string) => {
+        const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+        if (status) params.append('status', status)
+        return request<GmailItemGapListResponse>(
+            `/api/sources/${encodeURIComponent(sourceId)}/diagnostics?${params.toString()}`,
+        )
+    },
 }

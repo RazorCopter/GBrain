@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -29,6 +29,7 @@ from gbrain.domain.gmail import (
     GmailCheckpointState,
     GmailCursor,
     GmailHistoryCursor,
+    GmailItemGapData,
     GmailReconciliationState,
     GmailSelection,
     GmailSyncMode,
@@ -53,6 +54,10 @@ class GmailJobTransientError(RuntimeError):
 
 
 class GmailJobPermanentError(RuntimeError):
+    pass
+
+
+class GmailJobFatalError(RuntimeError):
     pass
 
 
@@ -170,12 +175,21 @@ async def _update_progress(
     *,
     phase: str,
     total: int | None = None,
+    imported: int | None = None,
+    duplicate: int | None = None,
+    not_imported: int | None = None,
 ) -> None:
     async with database.session_factory() as session:
         job = await session.get(ImportJob, job_id)
         if job is None:
             return
         job.processed_items = processed
+        if imported is not None:
+            job.imported_items = imported
+        if duplicate is not None:
+            job.duplicate_items = duplicate
+        if not_imported is not None:
+            job.not_imported_items = not_imported
         job.total_items = total
         job.checkpoint = _checkpoint_payload(checkpoint, phase=phase)
         await session.commit()
@@ -188,18 +202,31 @@ async def _finish(
     status: ImportJobStatus,
     checkpoint: GmailCheckpointState | None = None,
     processed: int | None = None,
+    imported: int | None = None,
+    duplicate: int | None = None,
+    not_imported: int | None = None,
     error_code: str | None = None,
     error_detail: str | None = None,
     is_partial: bool = False,
-) -> None:
+) -> ImportJob:
     async with database.session_factory() as session:
         job = await session.get(ImportJob, job_id)
         if job is None:
-            return
-        job.status = status
-        job.finished_at = datetime.now(UTC)
+            raise GmailJobPermanentError("Job non trovato per completamento")
+        if imported is not None:
+            job.imported_items = imported
+        if duplicate is not None:
+            job.duplicate_items = duplicate
+        if not_imported is not None:
+            job.not_imported_items = not_imported
         if processed is not None:
             job.processed_items = processed
+
+        if status == ImportJobStatus.COMPLETED and (job.not_imported_items or 0) > 0:
+            status = ImportJobStatus.COMPLETED_WITH_WARNINGS
+
+        job.status = status
+        job.finished_at = datetime.now(UTC)
         phase = "partial" if is_partial else status.value
         if checkpoint is not None:
             is_initial_complete = not is_partial and checkpoint.is_initial_complete
@@ -215,6 +242,7 @@ async def _finish(
         job.error_code = error_code
         job.error_detail = error_detail
         await session.commit()
+        return job
 
 
 async def _persist_page(
@@ -226,7 +254,10 @@ async def _persist_page(
     *,
     removed_ids: frozenset[str] = frozenset(),
     out_of_scope_ids: frozenset[str] = frozenset(),
-) -> int:
+    gaps: Sequence[GmailItemGapData] = (),
+    job_id: uuid.UUID | None = None,
+    examined_count: int | None = None,
+) -> tuple[int, int, int]:
     from gbrain.domain.gmail import NormalizedGmailMessage
 
     typed_messages = cast(list[NormalizedGmailMessage], messages)
@@ -238,8 +269,16 @@ async def _persist_page(
             checkpoint,
             removed_external_ids=removed_ids,
             out_of_scope_external_ids=out_of_scope_ids,
+            gaps=gaps,
+            job_id=job_id,
+            examined_count=examined_count,
         )
-        return len(outcomes)
+        inserted = sum(1 for o in outcomes if o.inserted)
+        # Una revisione crea una nuova SourceRevision ma non una nuova riga SourceItem:
+        # ai fini di saved/duplicate e' quindi un elemento gia' esistente.
+        duplicate = sum(1 for o in outcomes if o.unchanged or o.revised)
+        not_imported = len(gaps)
+        return inserted, duplicate, not_imported
 
 
 async def _run_full(
@@ -267,6 +306,7 @@ async def _run_full(
             raise asyncio.CancelledError
         page = await asyncio.to_thread(connector.enumerate_page, selection, cursor, budget)
         messages: list[object] = []
+        page_gaps: list[GmailItemGapData] = []
         out_of_scope: set[str] = set()
         for locator in page.items:
             try:
@@ -275,6 +315,17 @@ async def _run_full(
             except ConnectorError as exc:
                 if exc.category == ConnectorErrorCategory.PERIMETER:
                     out_of_scope.add(locator.message_id)
+                    continue
+                if exc.category == ConnectorErrorCategory.PARSE:
+                    reason = getattr(exc, "reason_code", None) or "MIME_PARSE_ERROR"
+                    gap = GmailItemGapData(
+                        gmail_message_id=locator.message_id,
+                        phase="mime_parse",
+                        reason_code=reason,
+                        details={"error_code": reason, "safe_message": exc.safe_message},
+                        occurred_at=datetime.now(UTC),
+                    )
+                    page_gaps.append(gap)
                     continue
                 raise
         now = datetime.now(UTC)
@@ -295,15 +346,24 @@ async def _run_full(
             config_revision=job.config_revision,
             query_fingerprint=job.query_fingerprint,
         )
-        processed += await _persist_page(
+        imp_delta, dup_delta, not_imp_delta = await _persist_page(
             database,
             account.id,
             job.source_policy_id,
             messages,
             current,
             out_of_scope_ids=frozenset(out_of_scope),
+            gaps=page_gaps,
+            job_id=job.id,
+            examined_count=len(page.items),
         )
-        await _update_progress(database, job.id, current, processed, phase="page_committed")
+        # Il repository ha aggiornato atomicamente job, messaggi, gap e checkpoint.
+        # Manteniamo soltanto lo snapshot locale per il completamento finale.
+        job.imported_items = (job.imported_items or 0) + imp_delta
+        job.duplicate_items = (job.duplicate_items or 0) + dup_delta
+        job.not_imported_items = (job.not_imported_items or 0) + not_imp_delta
+        processed += len(page.items)
+        job.processed_items = processed
         cursor = page.next_cursor
         if cursor is None or page.state != PageState.COMPLETE:
             # Se la scansione completa ha terminato tutte le pagine ma history_id è ancora None
@@ -370,6 +430,7 @@ async def _run_incremental(
             raise asyncio.CancelledError
         page = await asyncio.to_thread(connector._gateway.list_history_page, cursor, budget)
         messages: list[object] = []
+        page_gaps: list[GmailItemGapData] = []
         out_of_scope: set[str] = set()
         for locator in page.locators:
             try:
@@ -380,6 +441,17 @@ async def _run_incremental(
                     out_of_scope.add(locator.message_id)
                     continue
                 if exc.category == ConnectorErrorCategory.PERMANENT and exc.status_code == 404:
+                    continue
+                if exc.category == ConnectorErrorCategory.PARSE:
+                    reason = getattr(exc, "reason_code", None) or "MIME_PARSE_ERROR"
+                    gap = GmailItemGapData(
+                        gmail_message_id=locator.message_id,
+                        phase="mime_parse",
+                        reason_code=reason,
+                        details={"error_code": reason, "safe_message": exc.safe_message},
+                        occurred_at=datetime.now(UTC),
+                    )
+                    page_gaps.append(gap)
                     continue
                 raise
         current = GmailCheckpointState(
@@ -395,7 +467,7 @@ async def _run_incremental(
             config_revision=job.config_revision,
             query_fingerprint=job.query_fingerprint,
         )
-        processed += await _persist_page(
+        imp_delta, dup_delta, not_imp_delta = await _persist_page(
             database,
             account.id,
             job.source_policy_id,
@@ -403,8 +475,24 @@ async def _run_incremental(
             current,
             removed_ids=frozenset(page.deleted_message_ids),
             out_of_scope_ids=frozenset(out_of_scope),
+            gaps=page_gaps,
+            job_id=job.id,
         )
-        await _update_progress(database, job.id, current, processed, phase="history_committed")
+        job.imported_items = (job.imported_items or 0) + imp_delta
+        job.duplicate_items = (job.duplicate_items or 0) + dup_delta
+        job.not_imported_items = (job.not_imported_items or 0) + not_imp_delta
+        processed += imp_delta + dup_delta + not_imp_delta
+        job.processed_items = processed
+        await _update_progress(
+            database,
+            job.id,
+            current,
+            processed,
+            phase="history_committed",
+            imported=job.imported_items,
+            duplicate=job.duplicate_items,
+            not_imported=job.not_imported_items,
+        )
         async with database.session_factory() as session:
             repo = AsyncPostgresGmailRepository(session)
             await repo.update_coverage(
@@ -591,7 +679,7 @@ async def execute_gmail_job(
         else:
             raise GmailJobPermanentError("Modalità lavoro Gmail non valida")
 
-        await _finish(
+        final_job = await _finish(
             database,
             job.id,
             status=ImportJobStatus.COMPLETED,
@@ -599,6 +687,12 @@ async def execute_gmail_job(
             processed=processed,
             is_partial=is_partial,
         )
+        if final_job.status == ImportJobStatus.COMPLETED_WITH_WARNINGS:
+            logger.warning(
+                "Job Gmail %s completato con %d lacune permanenti non importate",
+                job.id,
+                final_job.not_imported_items,
+            )
     except asyncio.CancelledError:
         return
     except ConnectorError as exc:

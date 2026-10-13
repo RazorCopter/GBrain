@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from gbrain.application.gmail_mime import normalize_gmail_message
+from gbrain.application.gmail_mime import MimeLimits, normalize_gmail_message
 from gbrain.domain.connectors import (
     BudgetExhaustedError,
     ConnectionStatus,
@@ -26,6 +26,7 @@ from gbrain.domain.gmail import (
     GmailCursor,
     GmailHistoryCursor,
     GmailHistoryPage,
+    GmailItemGapData,
     GmailLocator,
     GmailPersistOutcome,
     GmailRawMessage,
@@ -84,6 +85,7 @@ class GmailUnitOfWork(Protocol):
         *,
         removed_external_ids: frozenset[str] = frozenset(),
         out_of_scope_external_ids: frozenset[str] = frozenset(),
+        gaps: Sequence[GmailItemGapData] = (),
     ) -> tuple[GmailPersistOutcome, ...]:
         """Persiste batch, stati sorgente e checkpoint nella stessa transazione durevole."""
 
@@ -111,12 +113,14 @@ class GmailSentConnector:
         owner_aliases: Sequence[str],
         *,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        limits: MimeLimits | None = None,
     ) -> None:
         if gateway.scope != GMAIL_READONLY_SCOPE:
             raise ValueError("Il gateway Gmail deve usare lo scope readonly esatto")
         self._gateway = gateway
         self._owner_aliases = tuple(owner_aliases)
         self._now = now
+        self._limits = limits
 
     def test_connection(self, budget: RequestBudget) -> ConnectionStatus:
         profile = self._gateway.get_profile(budget)
@@ -192,6 +196,7 @@ class GmailSentConnector:
             raw_data,
             self._owner_aliases,
             acquired_at=self._now(),
+            limits=self._limits,
         )
 
     def checkpoint(self, state: GmailCheckpointState) -> GmailCheckpointState:
@@ -258,6 +263,7 @@ class GmailSyncEngine:
                 state = page.state
                 page_messages: list[NormalizedGmailMessage] = []
                 out_of_scope_ids: set[str] = set()
+                page_gaps: list[GmailItemGapData] = []
                 for locator in page.items:
                     try:
                         page_messages.append(
@@ -270,6 +276,19 @@ class GmailSyncEngine:
                             counters.rejected += 1
                             out_of_scope_ids.add(locator.message_id)
                             continue
+                        if exc.category == ConnectorErrorCategory.PARSE:
+                            counters.not_imported += 1
+                            reason = getattr(exc, "reason_code", None) or "MIME_PARSE_ERROR"
+                            gap = GmailItemGapData(
+                                gmail_message_id=locator.message_id,
+                                phase="mime_parse",
+                                reason_code=reason,
+                                details={"error_code": reason, "safe_message": exc.safe_message},
+                                occurred_at=self._connector._now(),
+                            )
+                            page_gaps.append(gap)
+                            counters.gaps.append(gap)
+                            continue
                         raise
                 current_checkpoint = _checkpoint_after_page(
                     current_checkpoint,
@@ -278,13 +297,14 @@ class GmailSyncEngine:
                     page_messages,
                     self._connector._now(),
                 )
-                # Anche una pagina contenente soli rifiuti deve avanzare solo in
+                # Anche una pagina contenente soli rifiuti o gap deve avanzare solo in
                 # una transazione checkpoint esplicita.
                 self._commit_batch(
                     page_messages,
                     current_checkpoint,
                     counters,
                     out_of_scope_external_ids=frozenset(out_of_scope_ids),
+                    gaps=tuple(page_gaps),
                 )
                 cursor = page.next_cursor
                 if cursor is None:
@@ -562,6 +582,7 @@ class GmailSyncEngine:
         *,
         removed_external_ids: frozenset[str] = frozenset(),
         out_of_scope_external_ids: frozenset[str] = frozenset(),
+        gaps: Sequence[GmailItemGapData] = (),
     ) -> None:
         outcomes = self._uow.persist_batch(
             checkpoint.account_id,
@@ -569,6 +590,7 @@ class GmailSyncEngine:
             checkpoint,
             removed_external_ids=removed_external_ids,
             out_of_scope_external_ids=out_of_scope_external_ids,
+            gaps=gaps,
         )
         for outcome in outcomes:
             counters.persisted += int(outcome.inserted)
@@ -588,6 +610,8 @@ class _Counters:
     removed: int = 0
     excluded_preserved: int = 0
     pages: int = 0
+    not_imported: int = 0
+    gaps: list[GmailItemGapData] = field(default_factory=list)
 
     def result(
         self,
@@ -607,6 +631,8 @@ class _Counters:
             pages=self.pages,
             state=state,
             checkpoint=checkpoint,
+            not_imported_items=self.not_imported,
+            gaps=tuple(self.gaps),
             detail_codes=detail_codes,
         )
 
@@ -642,6 +668,7 @@ class InMemoryGmailUnitOfWork:
         self.states: dict[tuple[str, str], str] = {}
         self.excluded: set[tuple[str, str]] = set()
         self.checkpoints: dict[str, GmailCheckpointState] = {}
+        self.gaps: dict[tuple[str, str], GmailItemGapData] = {}
         self.commit_count = 0
 
     def persist_batch(
@@ -652,6 +679,7 @@ class InMemoryGmailUnitOfWork:
         *,
         removed_external_ids: frozenset[str] = frozenset(),
         out_of_scope_external_ids: frozenset[str] = frozenset(),
+        gaps: Sequence[GmailItemGapData] = (),
     ) -> tuple[GmailPersistOutcome, ...]:
         staged_messages = dict(self.messages)
         staged_revisions = dict(self.revisions)
@@ -690,6 +718,21 @@ class InMemoryGmailUnitOfWork:
         for external_id in out_of_scope_external_ids:
             identity = (account_id, external_id)
             staged_states[identity] = "excluded" if identity in self.excluded else "out_of_scope"
+        for gap in gaps:
+            self.gaps[(account_id, gap.gmail_message_id)] = gap
+        for message in messages:
+            gap_key = (account_id, message.external_id)
+            if gap_key in self.gaps:
+                existing_gap = self.gaps[gap_key]
+                self.gaps[gap_key] = GmailItemGapData(
+                    gmail_message_id=existing_gap.gmail_message_id,
+                    phase=existing_gap.phase,
+                    reason_code=existing_gap.reason_code,
+                    details=existing_gap.details,
+                    occurred_at=existing_gap.occurred_at,
+                    gmail_thread_id=existing_gap.gmail_thread_id,
+                    status="resolved",
+                )
         self.messages = staged_messages
         self.revisions = staged_revisions
         self.states = staged_states

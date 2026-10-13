@@ -4,13 +4,14 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gbrain.domain.gmail import (
     GMAIL_SOURCE_KIND,
     GmailBackfillStateData,
     GmailCheckpointState,
+    GmailItemGapData,
     GmailPersistOutcome,
     GmailReconciliationState,
     GmailSyncConfigData,
@@ -20,6 +21,8 @@ from gbrain.domain.models import (
     GmailBackfillState,
     GmailCheckpoint,
     GmailCoverage,
+    GmailItemGap,
+    ImportJob,
     ReconciliationState,
     SourceItem,
     SourceItemState,
@@ -43,6 +46,9 @@ class AsyncPostgresGmailRepository:
         *,
         removed_external_ids: frozenset[str] = frozenset(),
         out_of_scope_external_ids: frozenset[str] = frozenset(),
+        gaps: Sequence[GmailItemGapData] = (),
+        job_id: uuid.UUID | None = None,
+        examined_count: int | None = None,
     ) -> tuple[GmailPersistOutcome, ...]:
         outcomes: list[GmailPersistOutcome] = []
         now = datetime.now(UTC)
@@ -146,6 +152,88 @@ class AsyncPostgresGmailRepository:
                         revision_id=str(revision.id),
                     )
                 )
+
+                # Se questo messaggio aveva in precedenza un gap aperto, lo marchiamo risolto
+                await self._session.execute(
+                    update(GmailItemGap)
+                    .where(
+                        GmailItemGap.connector_account_id == account_id,
+                        GmailItemGap.gmail_message_id == message.external_id,
+                        GmailItemGap.status == "open",
+                    )
+                    .values(status="resolved", resolved_at=now, updated_at=now)
+                )
+
+            # Persistenza transazionale e idempotente dei gap per-item
+            for gap in gaps:
+                existing_gap = await self._session.scalar(
+                    select(GmailItemGap)
+                    .where(
+                        GmailItemGap.connector_account_id == account_id,
+                        GmailItemGap.gmail_message_id == gap.gmail_message_id,
+                        GmailItemGap.config_revision == (checkpoint.config_revision or 0),
+                    )
+                    .with_for_update()
+                )
+                if existing_gap is None:
+                    new_gap = GmailItemGap(
+                        connector_account_id=account_id,
+                        source_policy_id=policy_id,
+                        import_job_id=job_id,
+                        gmail_message_id=gap.gmail_message_id,
+                        gmail_thread_id=gap.gmail_thread_id,
+                        config_revision=checkpoint.config_revision or 0,
+                        query_fingerprint=checkpoint.query_fingerprint,
+                        phase=gap.phase,
+                        reason_code=gap.reason_code,
+                        status="open",
+                        occurred_at=gap.occurred_at,
+                        details=gap.details,
+                    )
+                    self._session.add(new_gap)
+                else:
+                    existing_gap.phase = gap.phase
+                    existing_gap.reason_code = gap.reason_code
+                    existing_gap.status = "open"
+                    existing_gap.resolved_at = None
+                    existing_gap.occurred_at = gap.occurred_at
+                    existing_gap.details = gap.details
+                    if job_id is not None:
+                        existing_gap.import_job_id = job_id
+                    existing_gap.updated_at = now
+
+            # Messaggi/gap/checkpoint e contatori del job devono essere una singola
+            # unita' atomica. In questo modo un crash subito dopo il commit non perde
+            # i progressi e la ripresa dal page token non sottostima i contatori.
+            inserted_count = sum(1 for outcome in outcomes if outcome.inserted)
+            existing_count = sum(1 for outcome in outcomes if outcome.unchanged or outcome.revised)
+            not_imported_count = len(gaps)
+            if job_id is not None:
+                # Il task Gmail e' gia' serializzato dal lock di coda; ``get`` mantiene
+                # inoltre compatibilita' con la UoW in-memory usata nei test contrattuali.
+                job = await self._session.get(ImportJob, job_id)
+                if job is None:
+                    raise RuntimeError("gmail_import_job_missing")
+                job.imported_items = (job.imported_items or 0) + inserted_count
+                job.duplicate_items = (job.duplicate_items or 0) + existing_count
+                job.not_imported_items = (job.not_imported_items or 0) + not_imported_count
+                job.processed_items = (job.processed_items or 0) + (
+                    examined_count
+                    if examined_count is not None
+                    else len(messages) + not_imported_count
+                )
+
+            # Se esiste un record di backfill per questa revisione, aggiorna contatori
+            if checkpoint.config_revision is not None:
+                backfill_row = await self._session.scalar(
+                    select(GmailBackfillState)
+                    .where(GmailBackfillState.connector_account_id == account_id)
+                    .with_for_update()
+                )
+                if backfill_row is not None:
+                    backfill_row.items_imported += inserted_count
+                    backfill_row.items_not_imported += not_imported_count
+
             await self._mark_source_states(
                 account_id,
                 removed_external_ids=removed_external_ids,
@@ -460,7 +548,70 @@ class AsyncPostgresGmailRepository:
         coverage.config_revision = config_revision
         coverage.is_legacy = is_legacy
         coverage.last_completed_at = now
+
+        if is_legacy:
+            coverage.status = "legacy"
+            coverage.has_gaps = False
+            coverage.missing_count = 0
+        else:
+            open_gaps_count = (
+                await self._session.scalar(
+                    select(func.count(GmailItemGap.id)).where(
+                        GmailItemGap.connector_account_id == account_id,
+                        GmailItemGap.status == "open",
+                    )
+                )
+                or 0
+            )
+            coverage.missing_count = int(open_gaps_count)
+            coverage.has_gaps = open_gaps_count > 0
+            coverage.status = "complete_with_gaps" if open_gaps_count > 0 else "completed"
+
         return coverage
+
+    async def list_gaps(
+        self,
+        account_id: uuid.UUID,
+        *,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[Sequence[GmailItemGap], int]:
+        query = select(GmailItemGap).where(GmailItemGap.connector_account_id == account_id)
+        if status:
+            query = query.where(GmailItemGap.status == status)
+        count_query = select(func.count(GmailItemGap.id)).where(
+            GmailItemGap.connector_account_id == account_id
+        )
+        if status:
+            count_query = count_query.where(GmailItemGap.status == status)
+
+        total = await self._session.scalar(count_query) or 0
+        query = query.order_by(GmailItemGap.occurred_at.desc(), GmailItemGap.created_at.desc())
+        query = query.offset((page - 1) * page_size).limit(page_size)
+        items = (await self._session.scalars(query)).all()
+        return tuple(items), int(total)
+
+    async def count_gaps(self, account_id: uuid.UUID) -> tuple[int, int]:
+        open_count = (
+            await self._session.scalar(
+                select(func.count(GmailItemGap.id)).where(
+                    GmailItemGap.connector_account_id == account_id,
+                    GmailItemGap.status == "open",
+                )
+            )
+            or 0
+        )
+        resolved_count = (
+            await self._session.scalar(
+                select(func.count(GmailItemGap.id)).where(
+                    GmailItemGap.connector_account_id == account_id,
+                    GmailItemGap.status == "resolved",
+                )
+            )
+            or 0
+        )
+        return int(open_count), int(resolved_count)
 
 
 def checkpoint_from_model(model: GmailCheckpoint) -> GmailCheckpointState:

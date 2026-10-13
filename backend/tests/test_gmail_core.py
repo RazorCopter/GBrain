@@ -176,7 +176,8 @@ def test_mime_charset_multipart_attachment_and_unknown_alias() -> None:
 
 def test_mime_visible_size_and_schema_failures() -> None:
     raw = _raw("sent-plain-1")
-    oversized = GmailRawMessage(
+    # sizeEstimate non fa più da veto globale se il testo è entro i limiti
+    large_size_estimate = GmailRawMessage(
         raw.message_id,
         raw.thread_id,
         raw.history_id,
@@ -184,15 +185,23 @@ def test_mime_visible_size_and_schema_failures() -> None:
         raw.internal_date_ms,
         raw.snippet,
         raw.payload,
-        1000,
+        30 * 1024 * 1024,
     )
-    with pytest.raises(ConnectorError, match="MESSAGE_TOO_LARGE") as captured:
+    normalized = normalize_gmail_message(
+        large_size_estimate,
+        ("owner@example.test",),
+    )
+    assert normalized.body_new is not None
+
+    # Se invece il corpo effettivo supera il limite, viene sollevato BODY_TOO_LARGE
+    with pytest.raises(ConnectorError, match="BODY_TOO_LARGE") as captured:
         normalize_gmail_message(
-            oversized,
+            raw,
             ("owner@example.test",),
-            limits=MimeLimits(max_message_bytes=100),
+            limits=MimeLimits(max_body_bytes=5),
         )
     assert captured.value.category == ConnectorErrorCategory.PARSE
+    assert getattr(captured.value, "reason_code", None) == "BODY_TOO_LARGE"
 
 
 def test_distinct_gmail_ids_remain_distinct_despite_identical_body() -> None:

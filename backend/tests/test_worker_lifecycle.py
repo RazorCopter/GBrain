@@ -11,8 +11,9 @@ import procrastinate
 import procrastinate.exceptions
 import pytest
 
-from gbrain.application.gmail_jobs import GmailJobTransientError
+from gbrain.application.gmail_jobs import GmailJobFatalError, GmailJobTransientError
 from gbrain.config import get_settings
+from gbrain.domain.models import ImportJobStatus
 from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME, create_procrastinate_app
 
 
@@ -368,6 +369,52 @@ async def test_worker_gmail_sync_task_executes_job_successfully() -> None:
             mode=test_mode,
         )
         mock_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "raises_fatal"),
+    [
+        (ImportJobStatus.FAILED, True),
+        (ImportJobStatus.COMPLETED_WITH_WARNINGS, False),
+    ],
+)
+async def test_worker_propagates_application_failure_but_not_warnings(
+    status: ImportJobStatus, raises_fatal: bool
+) -> None:
+    from contextlib import asynccontextmanager
+    from uuid import uuid4
+
+    from gbrain.worker import gmail_sync
+
+    final_job = MagicMock(
+        status=status,
+        error_code="fatal_application_error" if raises_fatal else None,
+        error_detail="safe detail" if raises_fatal else None,
+        not_imported_items=1,
+    )
+
+    @asynccontextmanager
+    async def session_factory() -> Any:
+        session = MagicMock()
+        session.get = AsyncMock(return_value=final_job)
+        yield session
+
+    mock_db = MagicMock()
+    mock_db.session_factory = session_factory
+    mock_db.close = AsyncMock()
+    invocation = gmail_sync.func(job_id=str(uuid4()), account_id=str(uuid4()), mode="full")
+    with (
+        patch("gbrain.worker.Database", return_value=mock_db),
+        patch("gbrain.worker.execute_gmail_job", new_callable=AsyncMock),
+    ):
+        if raises_fatal:
+            with pytest.raises(GmailJobFatalError):
+                await invocation
+        else:
+            await invocation
+
+    mock_db.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

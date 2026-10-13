@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class BootstrapRequest(BaseModel):
@@ -147,8 +147,23 @@ class ImportJobResponse(BaseModel):
     queue_job_id: int | None
     mode: str | None
     status: str
-    processed_items: int
-    total_items: int | None
+    processed_items: int = 0
+    imported_items: int = 0
+    not_imported_items: int = 0
+    duplicate_items: int = 0
+    total_items: int | None = None
+
+    @field_validator(
+        "imported_items",
+        "not_imported_items",
+        "duplicate_items",
+        "processed_items",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_int_or_zero(cls, value: Any) -> int:
+        return 0 if value is None else int(value)
+
     checkpoint: dict[str, Any]
     policy_snapshot: dict[str, Any]
     error_code: str | None
@@ -296,6 +311,9 @@ class GmailCoverageResponse(BaseModel):
     query_fingerprint: str | None = None
     config_revision: int | None = None
     is_legacy: bool = False
+    has_gaps: bool = False
+    missing_count: int = 0
+    status: str = "completed"
     last_completed_at: datetime | None = None
 
 
@@ -307,8 +325,33 @@ class GmailBackfillStateResponse(BaseModel):
     page_token: str | None = None
     status: str
     items_imported: int = 0
+    items_not_imported: int = 0
     last_run_at: datetime | None = None
     last_error_code: str | None = None
+
+
+class GmailItemGapResponse(BaseModel):
+    id: UUID
+    gmail_message_id: str
+    gmail_thread_id: str | None = None
+    config_revision: int | None = None
+    query_fingerprint: str | None = None
+    phase: str
+    reason_code: str
+    status: str
+    occurred_at: datetime
+    resolved_at: datetime | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class GmailItemGapListResponse(BaseModel):
+    items: list[GmailItemGapResponse]
+    total: int
+    page: int
+    page_size: int
+    has_gaps: bool
+    open_count: int
+    resolved_count: int
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -345,6 +388,8 @@ class SourceStatusResponse(BaseModel):
     sync_config: SourceSyncConfigResponse | None = None
     coverage: GmailCoverageResponse | None = None
     backfill_state: GmailBackfillStateResponse | None = None
+    has_gaps: bool = False
+    missing_count: int = 0
     requires_import: bool = False
     last_sync_at: datetime | None = None
 

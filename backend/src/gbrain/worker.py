@@ -9,7 +9,11 @@ import procrastinate
 from sqlalchemy import select
 
 from gbrain.application.auth import purge_expired_sessions
-from gbrain.application.gmail_jobs import GmailJobTransientError, execute_gmail_job
+from gbrain.application.gmail_jobs import (
+    GmailJobFatalError,
+    GmailJobTransientError,
+    execute_gmail_job,
+)
 from gbrain.config import get_settings
 from gbrain.domain.models import ImportJob, ImportJobStatus, OutboxEvent, OutboxStatus
 from gbrain.infrastructure.database import Database
@@ -81,6 +85,25 @@ async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
                 account_id=account_id,
                 mode=mode,
             )
+            async with database.session_factory() as session:
+                final_job = await session.get(ImportJob, uuid.UUID(job_id))
+                if final_job is not None:
+                    if final_job.status == ImportJobStatus.FAILED:
+                        logger.error(
+                            "Job applicativo Gmail %s fallito: %s - %s",
+                            job_id,
+                            final_job.error_code,
+                            final_job.error_detail,
+                        )
+                        raise GmailJobFatalError(
+                            f"Job applicativo Gmail {job_id} fallito: {final_job.error_code} - {final_job.error_detail}"
+                        )
+                    if final_job.status == ImportJobStatus.COMPLETED_WITH_WARNINGS:
+                        logger.warning(
+                            "Job applicativo Gmail %s completato con lacune permanenti: non_importati=%d",
+                            job_id,
+                            final_job.not_imported_items,
+                        )
         except GmailJobTransientError:
             async with database.session_factory() as session:
                 job = await session.get(ImportJob, uuid.UUID(job_id))
@@ -93,6 +116,9 @@ async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
                         job.finished_at = None
                         job.checkpoint = {**job.checkpoint, "phase": "retry_scheduled"}
                     await session.commit()
+            raise
+        except GmailJobFatalError as exc:
+            logger.error("Job applicativo Gmail fallito in modo fatale: %s", exc)
             raise
     finally:
         await database.close()

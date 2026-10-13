@@ -1,9 +1,9 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
-**Data checkpoint:** 13 ottobre 2026
-**Checkpoint:** Fase I — Gestione persistente della fonte Gmail oltre il wizard, separazione configurazione/backfill/copertura/checkpoint e aggiornamento continuo open-ended
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata; Fase 2 Gmail `SENT` implementata end-to-end oltre il wizard con persistenza dedicata della configurazione sorgente (`SourceSyncConfig`), stato/cursore del backfill separato (`GmailBackfillState`), copertura completata (`GmailCoverage`) e fencing di checkpoint/cambi tramite revisione e query fingerprint; aggiornamento continuo "Aggiorna ora" backend-authoritative con upper bound dinamico a runtime nel worker (`datetime.now(UTC)`) senza `before` storico statico; filtro Gmail validato, incluso nello snapshot immutabile e nel payload `messages.list`; migrazione Alembic additiva singola head lineare (`20261013_0005`) provata su PostgreSQL 16 effimero nel ciclo `0004→0005→0004→0005`; collaudo locale API/persistenza/worker eseguito con successo su PostgreSQL 16 effimero; dashboard persistente React in [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) con sezioni distinte, anteprima senza mutazioni e avviso esplicito che il cambio filtro non rimuove/reindicizza automaticamente dati già importati; suite test: **185 superati, 5 skipped su 190 raccolti**.
-**Giudizio di prontezza:** controlli automatici locali superati (pytest, Ruff check/format, Mypy, build Vite) e migrazione PostgreSQL effimera verificata. Il working tree è tecnicamente pronto per revisione/commit, ma non consente ancora di dichiarare collaudata l'integrazione Google reale: OAuth, Gmail History API e semantica temporale devono essere validati con un account test Google Cloud senza dati personali. La semantica del cambio filtro resta intenzionalmente additiva e dichiarata in UI.
+**Data checkpoint:** 14 ottobre 2026
+**Checkpoint:** Fase II — Gestione robusta messaggi Gmail grandi, allegati metadata-only, diagnostica per-item e tracciamento lacune di copertura
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata; Fase 2 Gmail `SENT` implementata end-to-end con supporto robusto a messaggi Gmail grandi (rimosso il veto globale preventivo `sizeEstimate > 25 MiB`), allegati gestiti come metadata-only senza chiamate o download di blob remoti (`attachments.get` assente nel gateway); limiti bounded su corpo testuale cumulativo e singola parte (5 MiB), rappresentazione base64 controllata prima del decode, profondità MIME (10), numero parti/header/allegati e metadati/filename; isolamento per-elemento nei batch/pagine con avanzamento atomico di messaggi validi, record diagnostici (`gmail_item_gaps`), contatori job e checkpoint/page token; contatori semantici separati (`imported_items`, `duplicate_items`, `not_imported_items`, `processed_items`); copertura con tracking esplicito delle lacune (`has_gaps`, `missing_count`, stato `complete_with_gaps` vs `completed`); risoluzione automatica delle lacune al reprocessamento; stato job `completed_with_warnings` per lacune permanenti gestite e propagazione `GmailJobFatalError` nel worker per job `failed` senza retry spuri; API consultabile, paginata e non sensibile `GET /api/sources/gmail/diagnostics` (zero PII/body/headers/token); interfaccia React in [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx) arricchita con contatori ed esploratore diagnostico lacune; migrazione additiva lineare `20261014_0006` con ciclo `0005→0006→0005→0006` collaudato con successo su PostgreSQL 16 effimero senza volumi; suite test: **202 superati, 5 skipped su 207 raccolti**.
+**Giudizio di prontezza:** controlli automatici locali superati (pytest, Ruff check/format, Mypy, build Vite) e migrazione PostgreSQL effimera verificata. Il working tree è tecnicamente pronto per revisione indipendente senza commit né push: i limiti runtime e l'integrazione con account Google reali restano vincolati all'autorizzazione con credenziali OAuth effettive (vedere Gate Gmail Reale).
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
 ## Regola di lettura dello stato
@@ -98,6 +98,26 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
 
 ---
 
+## File modificati e creati nella feature Gestione Robusta Messaggi Grandi e Diagnostica Per-Item
+
+- **Creati:**
+  - [`backend/migrations/versions/20261014_0006_gmail_item_diagnostics.py`](backend/migrations/versions/20261014_0006_gmail_item_diagnostics.py:1) — Migrazione Alembic (head lineare `20261014_0006`) per la tabella `gmail_item_gaps`, colonne contatori su `import_jobs`, stato e gap su `gmail_coverages` e `gmail_backfill_states`, e valore enum `completed_with_warnings`.
+  - [`backend/tests/test_gmail_large_messages_and_diagnostics.py`](backend/tests/test_gmail_large_messages_and_diagnostics.py:1) — Suite end-to-end con 12 test dedicati che verificano analiticamente gli scenari da A a H (mail grandi, allegati metadata-only, body over limit, batch misto, ripresa, risoluzione gap, vincoli MIME estremi, worker status e assenza PII nelle API).
+- **Modificati:**
+  - [`backend/src/gbrain/application/gmail_mime.py`](backend/src/gbrain/application/gmail_mime.py:1) — Rimozione veto preventivo `sizeEstimate > 25 MiB`, parser bounded con calcolo preventivo prima di base64 decode, gestione allegati metadata-only senza download blob, sanitizzazione nomi file e sollevamento `GmailMimeError` con codici stabili (`BODY_TOO_LARGE`, `MIME_PARTS_LIMIT`, `MIME_DEPTH_LIMIT`, `ATTACHMENT_COUNT_LIMIT`, `MIME_TIMEOUT`).
+  - [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py:1) — Aggiunta classe `GmailMimeError` e attributo `reason_code` su `ConnectorError`.
+  - [`backend/src/gbrain/domain/gmail.py`](backend/src/gbrain/domain/gmail.py:1) — Dataclass `GmailItemGapData`, estensione `GmailCoverageData`, `GmailBackfillStateData` e `GmailSyncResult` con contatori non importati e lacune.
+  - [`backend/src/gbrain/domain/models.py`](backend/src/gbrain/domain/models.py:1) — Modello ORM `GmailItemGap` con unique constraint e indici, colonne contatori `imported_items`, `not_imported_items`, `duplicate_items` su `ImportJob`, `has_gaps`, `missing_count`, `status` su `GmailCoverage`, `items_not_imported` su `GmailBackfillState`, e valore `COMPLETED_WITH_WARNINGS` su `ImportJobStatus`.
+  - [`backend/src/gbrain/application/gmail_sync.py`](backend/src/gbrain/application/gmail_sync.py:1) — Isolamento per elemento nei batch: errori permanenti di parsing diventano gap invece di abbattere la pagina, avanzamento atomico del checkpoint, salvataggio e risoluzione gap in `InMemoryGmailUnitOfWork`.
+  - [`backend/src/gbrain/infrastructure/gmail_repository.py`](backend/src/gbrain/infrastructure/gmail_repository.py:1) — Persistenza transazionale atomica dei messaggi, risoluzione dei gap risolti, upsert idempotente dei gap aperti, calcolo automatico di `has_gaps` e `missing_count` nella copertura, e metodi `list_gaps`/`count_gaps`.
+  - [`backend/src/gbrain/application/gmail_jobs.py`](backend/src/gbrain/application/gmail_jobs.py:1) — Gestione per-item nei runner di job (`_run_full`, `_run_incremental`, `_run_reconciliation`), commutazione a `COMPLETED_WITH_WARNINGS` in presenza di lacune permanenti, aggiornamento contatori nel job e rilancio controllato di errori fatali.
+  - [`backend/src/gbrain/worker.py`](backend/src/gbrain/worker.py:1) — Verifica post-esecuzione del job applicativo nel wrapper Procrastinate: emissione warning per `COMPLETED_WITH_WARNINGS`, propagazione `GmailJobFatalError` per job `FAILED` senza doppi retry spuri.
+  - [`backend/src/gbrain/presentation/schemas.py`](backend/src/gbrain/presentation/schemas.py:1) — Schemi Pydantic `GmailItemGapResponse`, `GmailItemGapListResponse`, arricchimento contatori su `ImportJobResponse`, `GmailCoverageResponse`, `GmailBackfillStateResponse` e `SourceStatusResponse` con coercizione sicura.
+  - [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:1) — Endpoint protetto `GET /api/sources/{source_id}/diagnostics` per consultare lacune paginate senza PII ed esposizione dei flag di lacune in `get_source_status`.
+  - [`frontend/src/api.ts`](frontend/src/api.ts:1) — Contratti TypeScript aggiornati e metodo `fetchSourceDiagnostics`.
+  - [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) — Integrazione interfaccia: visualizzazione contatori semantici distinti, badge di copertura con lacune, banner job arricchito ed esploratore diagnostico paginato con dettagli sanitizzati.
+  - [`backend/tests/test_gmail_core.py`](backend/tests/test_gmail_core.py:1) — Aggiornamento test per verificare che `sizeEstimate` grande non blocchi il parsing quando il corpo è entro i limiti e che corpi oltre limite sollevino `BODY_TOO_LARGE`.
+
 ## File modificati e creati nella feature Source Connection Wizard
 
 - **Creati:**
@@ -145,6 +165,18 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - [`backend/tests/test_worker_network_and_transport.py`](backend/tests/test_worker_network_and_transport.py:1) — Suite (9 test) per invarianti di rete Compose, catena causale DNS (`NameResolutionError`), retry limitato, permanenza `invalid_grant` e sanitizzazione segreti.
   - [`scripts/verify_worker_connectivity.py`](scripts/verify_worker_connectivity.py:1) — Script probe innocuo (DNS + TLS 443 + HTTP HEAD senza credenziali) per validazione live dal container worker.
   - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con connettività worker, classificazione errori trasporto e suite a 172 test superati.
+
+---
+
+## Verifiche runtime Gmail reali pendenti
+
+Le seguenti verifiche richiedono un account Google Cloud / mailbox Gmail live e deployment sul nodo host, pertanto rimangono esplicitamente **pendenti** e non eseguite in locale:
+
+1. **Mail reale con allegato >25 MiB:** Importazione di un messaggio reale con allegato esterno di grandi dimensioni, verificando che solo i metadati vengano salvati e nessun blob venga scaricato.
+2. **Corpo reale oltre limite:** Ricezione e parsing di un'email reale con corpo eccedente la soglia bounded (`BODY_TOO_LARGE`), verificando la registrazione del gap e la continuazione del batch.
+3. **Mixed page reale Gmail / History:** Paginazione mista su endpoint Gmail reali con mix di elementi validi e malformati/non importabili.
+4. **Reprocess di gap dopo cambio policy:** Risoluzione automatica delle lacune diagnostiche (`status='resolved'`) in seguito a riconfigurazione o nuovo sync con account Google reale.
+5. **Verifica UI Portainer post-deploy:** Accesso alla UI e monitoraggio dei container dopo il rilascio sul nodo LXC/Linux di produzione.
 
 ---
 

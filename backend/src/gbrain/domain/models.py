@@ -47,6 +47,7 @@ class ImportJobStatus(enum.StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    COMPLETED_WITH_WARNINGS = "completed_with_warnings"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -163,6 +164,15 @@ class ImportJob(TimestampMixin, Base):
     checkpoint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     processed_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    imported_items: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+    not_imported_items: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+    duplicate_items: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
     total_items: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(80))
     error_detail: Mapped[str | None] = mapped_column(String(500))
@@ -390,6 +400,9 @@ class ConnectorAccount(TimestampMixin, Base):
     coverage: Mapped[GmailCoverage | None] = relationship(
         back_populates="connector_account", uselist=False, cascade="all, delete-orphan"
     )
+    gaps: Mapped[list[GmailItemGap]] = relationship(
+        back_populates="connector_account", cascade="all, delete-orphan"
+    )
 
 
 class SourcePolicy(TimestampMixin, Base):
@@ -522,6 +535,9 @@ class GmailBackfillState(TimestampMixin, Base):
     page_token: Mapped[str | None] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle")
     items_imported: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_not_imported: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error_code: Mapped[str | None] = mapped_column(String(80))
 
@@ -545,9 +561,66 @@ class GmailCoverage(TimestampMixin, Base):
     query_fingerprint: Mapped[str | None] = mapped_column(String(64))
     config_revision: Mapped[int | None] = mapped_column(Integer)
     is_legacy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_gaps: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    missing_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="completed", server_default="completed"
+    )
     last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     connector_account: Mapped[ConnectorAccount] = relationship(back_populates="coverage")
+
+
+class GmailItemGap(TimestampMixin, Base):
+    __tablename__ = "gmail_item_gaps"
+    __table_args__ = (
+        UniqueConstraint(
+            "connector_account_id",
+            "gmail_message_id",
+            "config_revision",
+            name="uq_gmail_item_gaps_account_msg_rev",
+        ),
+        CheckConstraint(
+            "config_revision >= 0", name="ck_gmail_item_gaps_config_revision_nonnegative"
+        ),
+        CheckConstraint("status IN ('open', 'resolved')", name="ck_gmail_item_gaps_status"),
+        Index("ix_gmail_item_gaps_account_status", "connector_account_id", "status"),
+        Index("ix_gmail_item_gaps_account_occurred", "connector_account_id", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("source_policies.id", ondelete="SET NULL"),
+    )
+    import_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("import_jobs.id", ondelete="SET NULL"),
+    )
+    gmail_message_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(128))
+    config_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    query_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    phase: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    connector_account: Mapped[ConnectorAccount] = relationship(back_populates="gaps")
 
 
 class AppConfiguration(Base):

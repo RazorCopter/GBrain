@@ -34,12 +34,23 @@ class ConnectorError(RuntimeError):
         *,
         retryable: bool = False,
         status_code: int | None = None,
+        reason_code: str | None = None,
     ) -> None:
         super().__init__(safe_message)
         self.category = category
         self.safe_message = safe_message
         self.retryable = retryable
         self.status_code = status_code
+        self.reason_code = reason_code
+
+
+class GmailMimeError(ConnectorError):
+    def __init__(self, reason_code: str, safe_message: str | None = None) -> None:
+        super().__init__(
+            ConnectorErrorCategory.PARSE,
+            safe_message or f"Parsing MIME fallito: {reason_code}",
+            reason_code=reason_code,
+        )
 
 
 class BudgetExhaustedError(ConnectorError):

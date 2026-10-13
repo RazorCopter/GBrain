@@ -19,9 +19,16 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.engine import URL, make_url
 
-HEAD_REVISION = "20261013_0005"
+HEAD_REVISION = "20261014_0006"
 EXPECTED_ENUMS = {
-    "import_job_status": ("pending", "running", "completed", "failed", "cancelled"),
+    "import_job_status": (
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "completed_with_warnings",
+    ),
     "outbox_status": ("pending", "processing", "completed", "failed"),
     "connector_account_status": (
         "pending_authorization",
@@ -118,7 +125,7 @@ def run_recovery_test(database_url: str) -> None:
             temp_env.write_text(
                 temp_env.read_text(encoding="utf-8").replace(
                     'config.set_main_option("sqlalchemy.url", get_settings().database_url)',
-                    "# URL già impostata dal solo harness isolato; non caricare credenziali deployment",
+                    "pass  # URL già impostata dal solo harness isolato; non caricare credenziali deployment",
                 ),
                 encoding="utf-8",
             )

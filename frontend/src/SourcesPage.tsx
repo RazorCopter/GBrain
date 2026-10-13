@@ -3,6 +3,8 @@ import {
     ApiError,
     GmailAccount,
     GmailCitation,
+    GmailItemGap,
+    GmailItemGapListResponse,
     GmailPreview,
     GmailSources,
     ImportJob,
@@ -57,6 +59,22 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
     const [historyPreview, setHistoryPreview] = useState<GmailPreview | null>(null)
     const [previewLoading, setPreviewLoading] = useState(false)
     const [historyImportLoading, setHistoryImportLoading] = useState(false)
+    const [diagnosticsData, setDiagnosticsData] = useState<GmailItemGapListResponse | null>(null)
+    const [diagPage, setDiagPage] = useState(1)
+    const [loadingDiag, setLoadingDiag] = useState(false)
+
+    const loadDiagnostics = async (page = 1) => {
+        setLoadingDiag(true)
+        try {
+            const diag = await api.fetchSourceDiagnostics('gmail', page, 10)
+            setDiagnosticsData(diag)
+            setDiagPage(page)
+        } catch {
+            // diagnostica opzionale
+        } finally {
+            setLoadingDiag(false)
+        }
+    }
 
     async function loadAllData() {
         try {
@@ -71,6 +89,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
             if (statusRes) setGmailStatus(statusRes)
             if (sourcesRes) setSourcesData(sourcesRes)
             if (gmailOldStatus?.account) setGmailAccount(gmailOldStatus.account)
+            await loadDiagnostics(1)
         } catch (err) {
             setGlobalError(err instanceof ApiError ? err.message : 'Errore nel caricamento delle fonti.')
         }
@@ -529,22 +548,28 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                                     <span className="text-warning">Incompleta / Da importare</span>
                                                 )}
                                             </span>
-                                            {gmailStatus?.coverage?.is_legacy && (
+                                            {gmailStatus?.coverage?.status === 'complete_with_gaps' || gmailStatus?.coverage?.has_gaps ? (
+                                                <span className="badge-warning">
+                                                    ⚠️ Completa con Lacune ({gmailStatus?.coverage?.missing_count ?? 0} non importati)
+                                                </span>
+                                            ) : gmailStatus?.coverage?.is_legacy ? (
                                                 <span className="badge-warning">Legacy / Non verificata</span>
+                                            ) : gmailStatus?.coverage?.status === 'completed' && (
+                                                <span className="badge-success">✅ Integrità Completa</span>
                                             )}
                                         </div>
 
                                         <div className="status-cell">
-                                            <span className="cell-label">Stato Backfill</span>
+                                            <span className="cell-label">Stato Backfill & Contatori</span>
                                             <span className="cell-value">
                                                 <span className={`status-tag status-${gmailStatus?.backfill_state?.status ?? 'idle'}`}>
                                                     {(gmailStatus?.backfill_state?.status ?? 'IDLE').toUpperCase()}
                                                 </span>
                                             </span>
                                             <span className="cell-sub text-muted">
-                                                {gmailStatus?.backfill_state?.status === 'partial'
-                                                    ? `Ripresa token attiva (${gmailStatus?.backfill_state?.items_imported} items)`
-                                                    : `${gmailStatus?.backfill_state?.items_imported ?? 0} importati`}
+                                                Importati: <strong>{gmailStatus?.backfill_state?.items_imported ?? 0}</strong>
+                                                {' · '}
+                                                Non Importati (Lacune): <strong className={gmailStatus?.backfill_state?.items_not_imported ? 'text-warning' : ''}>{gmailStatus?.backfill_state?.items_not_imported ?? diagnosticsData?.open_count ?? 0}</strong>
                                             </span>
                                         </div>
                                     </div>
@@ -769,6 +794,12 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                     <p className="job-banner-desc">
                         Modalità: <strong>{activeJob.mode ?? 'full'}</strong> · Messaggi elaborati: <strong>{activeJob.processed_items}</strong>
                         {activeJob.total_items ? ` su ${activeJob.total_items}` : ''}
+                        {' · '}
+                        Importati: <strong>{activeJob.imported_items ?? 0}</strong>
+                        {' · '}
+                        Duplicati: <strong>{activeJob.duplicate_items ?? 0}</strong>
+                        {' · '}
+                        Non importati: <strong className={activeJob.not_imported_items ? 'text-warning' : ''}>{activeJob.not_imported_items ?? 0}</strong>
                     </p>
                     {['pending', 'running'].includes(activeJob.status) && (
                         <div className="progress-bar-container">
@@ -880,6 +911,99 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                     </div>
                 )}
             </div>
+
+            {/* Sezione Diagnostica Lacune Gmail Per-Item */}
+            {isConnected && (
+                <div className="hub-catalog-section" style={{ marginTop: '2rem' }}>
+                    <div className="section-header-row">
+                        <div>
+                            <h3 className="section-title">🔍 Diagnostica Lacune Gmail (Per-Item)</h3>
+                            <p className="section-subtitle">
+                                Registro consultabile, sanitizzato e bounded degli elementi non importabili (es. corpi oltre limite, MIME non conformi).
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            className="secondary compact"
+                            onClick={() => loadDiagnostics(diagPage)}
+                            disabled={loadingDiag}
+                        >
+                            {loadingDiag ? 'Aggiornamento…' : 'Aggiorna Diagnostica'}
+                        </button>
+                    </div>
+
+                    {diagnosticsData && diagnosticsData.total > 0 ? (
+                        <div style={{ marginTop: '1rem' }}>
+                            <div style={{ marginBottom: '0.75rem', fontSize: '0.9rem' }}>
+                                Lacune Totali: <strong>{diagnosticsData.total}</strong> · Aperti: <strong className="text-warning">{diagnosticsData.open_count}</strong> · Risolti: <strong>{diagnosticsData.resolved_count}</strong>
+                            </div>
+                            <div className="table-responsive">
+                                <table className="data-table" style={{ width: '100%', fontSize: '0.85rem' }}>
+                                    <thead>
+                                        <tr>
+                                            <th>Message ID</th>
+                                            <th>Ragione Scarto</th>
+                                            <th>Fase</th>
+                                            <th>Rilevato il</th>
+                                            <th>Stato</th>
+                                            <th>Dettagli Sanitizzati</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {diagnosticsData.items.map((item: GmailItemGap) => (
+                                            <tr key={item.id}>
+                                                <td><code>{item.gmail_message_id}</code></td>
+                                                <td>
+                                                    <span className="badge-warning" style={{ fontSize: '0.75rem' }}>
+                                                        {item.reason_code}
+                                                    </span>
+                                                </td>
+                                                <td>{item.phase}</td>
+                                                <td>{new Date(item.occurred_at).toLocaleString('it-IT')}</td>
+                                                <td>
+                                                    <span className={`status-pill ${item.status === 'open' ? 'status-pending' : 'status-completed'}`}>
+                                                        {item.status.toUpperCase()}
+                                                    </span>
+                                                </td>
+                                                <td>
+                                                    <code style={{ fontSize: '0.75rem' }}>
+                                                        {JSON.stringify(item.details)}
+                                                    </code>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '1rem' }}>
+                                <button
+                                    type="button"
+                                    className="secondary compact"
+                                    onClick={() => loadDiagnostics(diagPage - 1)}
+                                    disabled={diagPage <= 1 || loadingDiag}
+                                >
+                                    ← Precedente
+                                </button>
+                                <span style={{ fontSize: '0.85rem' }}>
+                                    Pagina {diagnosticsData.page} di {Math.max(1, Math.ceil(diagnosticsData.total / diagnosticsData.page_size))}
+                                </span>
+                                <button
+                                    type="button"
+                                    className="secondary compact"
+                                    onClick={() => loadDiagnostics(diagPage + 1)}
+                                    disabled={diagPage * diagnosticsData.page_size >= diagnosticsData.total || loadingDiag}
+                                >
+                                    Successiva →
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="empty-state-box" style={{ padding: '1.5rem', marginTop: '1rem', textAlign: 'center' }}>
+                            <p className="text-muted">Nessuna lacuna riscontrata. Tutti i messaggi analizzati sono stati importati o esclusi regolarmente.</p>
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* Modale Disconnessione */}
             {disconnectModalOpen && (
