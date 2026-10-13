@@ -20,6 +20,8 @@ settings = get_settings()
 procrastinate_app = create_procrastinate_app(settings)
 logger = logging.getLogger(__name__)
 
+WORKER_QUEUES: tuple[str, ...] = ("maintenance", "outbox", "gmail")
+
 
 @procrastinate_app.task(name="gbrain.heartbeat", queue="maintenance")
 async def heartbeat() -> None:
@@ -110,7 +112,7 @@ async def run_worker() -> None:
     async with procrastinate_app.open_async():
         await procrastinate_app.run_worker_async(
             concurrency=settings.worker_concurrency,
-            queues=["maintenance", "outbox"],
+            queues=list(WORKER_QUEUES),
             wait=True,
             listen_notify=True,
             name="gbrain-worker",

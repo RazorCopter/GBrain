@@ -2,7 +2,7 @@
 
 **Data checkpoint:** 13 ottobre 2026
 **Checkpoint:** Fase F — Source Connection Wizard, conferma esplicita alias, connettori estensibili, credenziali cifrate e compatibilità Google OAuth
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il nuovo **Source Connection Wizard** comprensivo di conferma esplicita obbligatoria degli alias Gmail prima della sincronizzazione, catalogo modulare dei connettori, gestione credenziali cifrate AES-256-GCM su PostgreSQL (Alembic head `20261012_0004`), fallback trasparente su filesystem, compatibilità robusta per datetime offset-naive delle credenziali Google e suite test deterministica estesa a 152 test (157 totali).
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il nuovo **Source Connection Wizard** comprensivo di conferma esplicita obbligatoria degli alias Gmail prima della sincronizzazione, catalogo modulare dei connettori, gestione credenziali cifrate AES-256-GCM su PostgreSQL (Alembic head `20261012_0004`), fallback trasparente su filesystem, compatibilità robusta per datetime offset-naive delle credenziali Google, ascolto worker esteso alla coda `gmail` e suite test deterministica estesa a 154 test (159 totali).
 **Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo e UI; pronto per il collaudo infrastrutturale Docker/Linux e configurazione con account reali; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
@@ -11,7 +11,7 @@
 Questo checkpoint distingue rigorosamente:
 
 - **codice predisposto:** file, schemi, API e UI esistono, sono stati revisionati trasversalmente e allineati;
-- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (152 test backend superati + typecheck/build frontend);
+- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (154 test backend superati + typecheck/build frontend);
 - **test integrazione pendente:** test marcati esplicitamente con `@pytest.mark.skip` (3 test) che richiedono demone Docker Linux, PostgreSQL reale con estensioni o credenziali Google Cloud autorizzate;
 - **integrazione reale non eseguita:** non eseguito collaudo runtime con account Google reale o container Docker su Linux host.
 
@@ -112,7 +112,9 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - [`frontend/src/styles.css`](frontend/src/styles.css:1) — Stili responsivi per wizard di onboarding, card del catalogo fonti, upload box e interfaccia di selezione/conferma alias.
   - [`backend/src/gbrain/presentation/gmail_api.py`](backend/src/gbrain/presentation/gmail_api.py:1) — Endpoint dedicato `GET /api/gmail/account` per recupero account e supporto validazione flessibile alias.
   - [`backend/src/gbrain/presentation/schemas.py`](backend/src/gbrain/presentation/schemas.py:1) — Estensione schema `GmailAliasesRequest` per supportare `confirmed_addresses` e arricchimento `SourceStatusResponse` con `aliases_ready` e `confirmed_aliases`.
-  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con flusso di conferma esplicita degli alias Gmail nel Source Connection Wizard prima del sync.
+  - [`backend/src/gbrain/worker.py`](backend/src/gbrain/worker.py:1) — Inclusione della coda `gmail` nelle code di ascolto del worker Procrastinate (`WORKER_QUEUES`).
+  - [`backend/tests/test_worker_lifecycle.py`](backend/tests/test_worker_lifecycle.py:1) — Verifica parametri di avvio e registrazione code ascoltate dal worker Procrastinate.
+  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con configurazione code di ascolto worker e flusso di conferma esplicita degli alias Gmail nel Source Connection Wizard.
 
 ---
 

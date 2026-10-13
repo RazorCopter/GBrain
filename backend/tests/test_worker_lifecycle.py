@@ -153,7 +153,7 @@ async def test_run_worker_closes_and_propagates_cancelled_error() -> None:
 @pytest.mark.asyncio
 async def test_run_worker_forwards_expected_parameters() -> None:
     """Verifica che i parametri attesi del worker vengano inoltrati esattamente a run_worker_async()."""
-    from gbrain.worker import procrastinate_app, run_worker, settings
+    from gbrain.worker import WORKER_QUEUES, procrastinate_app, run_worker, settings
 
     captured_kwargs: dict[str, Any] = {}
     recorder: list[str] = []
@@ -170,16 +170,18 @@ async def test_run_worker_forwards_expected_parameters() -> None:
 
     assert captured_kwargs == {
         "concurrency": settings.worker_concurrency,
-        "queues": ["maintenance", "outbox"],
+        "queues": ["maintenance", "outbox", "gmail"],
         "wait": True,
         "listen_notify": True,
         "name": "gbrain-worker",
     }
+    assert captured_kwargs["queues"] == list(WORKER_QUEUES)
+    assert "gmail" in captured_kwargs["queues"]
 
 
 def test_gmail_job_and_worker_tasks_registered_on_procrastinate_app() -> None:
     """Dimostra che i task attesi (incluso il job Gmail) sono registrati sull'istanza worker."""
-    from gbrain.worker import procrastinate_app, settings
+    from gbrain.worker import WORKER_QUEUES, procrastinate_app, settings
 
     tasks = procrastinate_app.tasks
     assert GMAIL_TASK_NAME in tasks, (
@@ -188,6 +190,7 @@ def test_gmail_job_and_worker_tasks_registered_on_procrastinate_app() -> None:
 
     gmail_task = tasks[GMAIL_TASK_NAME]
     assert gmail_task.queue == "gmail"
+    assert gmail_task.queue in WORKER_QUEUES
     assert gmail_task.lock == "gmail-heavy-global"
     assert isinstance(gmail_task.retry_strategy, procrastinate.RetryStrategy)
 
@@ -296,13 +299,14 @@ async def test_procrastinate_awaitable_context_lifecycle_semantics() -> None:
 
 
 def test_api_enqueue_and_worker_task_registration_contract() -> None:
-    """Verifica la coerenza tra il task accodato dall'API e quello registrato dal worker."""
-    from gbrain.presentation import gmail_api
+    """Verifica la coerenza tra il task accodato dalle API (gmail_api e sources_api) e quello registrato dal worker."""
+    from gbrain.presentation import gmail_api, sources_api
     from gbrain.worker import procrastinate_app, settings
 
     api_task_name = getattr(gmail_api, "GMAIL_TASK_NAME", None)
     assert api_task_name == GMAIL_TASK_NAME == "gbrain.gmail_sync"
     assert GMAIL_TASK_NAME in procrastinate_app.tasks
+    assert hasattr(sources_api, "trigger_source_sync")
 
     worker_task = procrastinate_app.tasks[GMAIL_TASK_NAME]
     assert worker_task.queue == "gmail"
@@ -321,3 +325,89 @@ def test_api_enqueue_and_worker_task_registration_contract() -> None:
     assert api_app.connector._pool_args.get(
         "conninfo"
     ) == procrastinate_app.connector._pool_args.get("conninfo")
+
+
+@pytest.mark.asyncio
+async def test_worker_gmail_sync_task_executes_job_successfully() -> None:
+    """Verifica che il task registrato sulla coda 'gmail' invochi execute_gmail_job con i parametri attesi."""
+    import uuid
+    from unittest.mock import MagicMock
+
+    from gbrain.worker import gmail_sync, settings
+
+    test_job_id = str(uuid.uuid4())
+    test_account_id = str(uuid.uuid4())
+    test_mode = "incremental"
+
+    mock_db = MagicMock()
+    mock_db.close = AsyncMock()
+
+    with (
+        patch("gbrain.worker.Database", return_value=mock_db),
+        patch("gbrain.worker.execute_gmail_job", new_callable=AsyncMock) as mock_execute,
+    ):
+        await gmail_sync.func(job_id=test_job_id, account_id=test_account_id, mode=test_mode)
+
+        mock_execute.assert_awaited_once_with(
+            mock_db,
+            settings,
+            job_id=test_job_id,
+            account_id=test_account_id,
+            mode=test_mode,
+        )
+        mock_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_gmail_sync_task_handles_transient_error_retry() -> None:
+    """Verifica che un errore transitorio incrementi il contatore di retry e lasci il job rieseguibile."""
+    import uuid
+    from unittest.mock import MagicMock
+
+    from gbrain.application.gmail_jobs import GmailJobTransientError
+    from gbrain.domain.models import ImportJob, ImportJobStatus
+    from gbrain.worker import gmail_sync
+
+    test_job_id = uuid.uuid4()
+    test_account_id = uuid.uuid4()
+
+    mock_job = MagicMock()
+    mock_job.retry_count = 0
+    mock_job.checkpoint = {"phase": "running"}
+    mock_job.status = ImportJobStatus.RUNNING
+
+    mock_session = MagicMock()
+    mock_session.get = AsyncMock(return_value=mock_job)
+    mock_session.commit = AsyncMock()
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> MagicMock:
+            return mock_session
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    mock_db = MagicMock()
+    mock_db.session_factory.return_value = FakeSessionContext()
+    mock_db.close = AsyncMock()
+
+    with (
+        patch("gbrain.worker.Database", return_value=mock_db),
+        patch(
+            "gbrain.worker.execute_gmail_job",
+            side_effect=GmailJobTransientError("transient network timeout"),
+        ),
+    ):
+        with pytest.raises(GmailJobTransientError, match="transient network timeout"):
+            await gmail_sync.func(
+                job_id=str(test_job_id),
+                account_id=str(test_account_id),
+                mode="full",
+            )
+
+        assert mock_job.retry_count == 1
+        assert mock_job.status == ImportJobStatus.PENDING
+        assert mock_job.checkpoint.get("phase") == "retry_scheduled"
+        mock_session.get.assert_awaited_once_with(ImportJob, test_job_id)
+        mock_session.commit.assert_awaited_once()
+        mock_db.close.assert_awaited_once()
