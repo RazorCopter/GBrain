@@ -43,12 +43,15 @@ from gbrain.domain.gmail import (
 from gbrain.domain.models import (
     ConnectorAccount,
     ConnectorAccountStatus,
+    GmailBackfillState,
     GmailCheckpoint,
+    GmailCoverage,
     ImportJob,
     ImportJobStatus,
     OwnerAccount,
     SourceClientCredential,
     SourcePolicy,
+    SourceSyncConfig,
 )
 from gbrain.infrastructure.source_credentials_repository import (
     SourceCredentialsRepository,
@@ -97,6 +100,9 @@ class InMemorySession:
         self.policies: dict[UUID, SourcePolicy] = {}
         self.jobs: dict[UUID, ImportJob] = {}
         self.checkpoints: dict[UUID, GmailCheckpoint] = {}
+        self.sync_configs: dict[UUID, SourceSyncConfig] = {}
+        self.backfill_states: dict[UUID, GmailBackfillState] = {}
+        self.coverages: dict[UUID, GmailCoverage] = {}
 
     async def get(self, entity: Any, ident: Any, **kwargs: Any) -> Any:
         if getattr(entity, "__tablename__", None) == "gmail_checkpoints":
@@ -107,6 +113,12 @@ class InMemorySession:
             return self.policies.get(ident)
         if getattr(entity, "__tablename__", None) == "import_jobs":
             return self.jobs.get(ident)
+        if getattr(entity, "__tablename__", None) == "source_sync_configs":
+            return self.sync_configs.get(ident)
+        if getattr(entity, "__tablename__", None) == "gmail_backfill_states":
+            return self.backfill_states.get(ident)
+        if getattr(entity, "__tablename__", None) == "gmail_coverages":
+            return self.coverages.get(ident)
         return None
 
     async def scalar(self, stmt: Any) -> Any:
@@ -116,12 +128,35 @@ class InMemorySession:
                 return cred
             return None
         if "connector_accounts" in stmt_str:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                compiled = getattr(stmt, "compile", lambda: None)()
+                params = getattr(compiled, "params", {})
+                target_owner = params.get("owner_id_1") or params.get("owner_id")
+                if target_owner is not None:
+                    for acc in self.accounts.values():
+                        if acc.owner_id == target_owner:
+                            return acc
+                    return None
             for acc in self.accounts.values():
                 return acc
             return None
         if "source_policies" in stmt_str:
             for pol in self.policies.values():
                 return pol
+            return None
+        if "source_sync_configs" in stmt_str:
+            for cfg in self.sync_configs.values():
+                return cfg
+            return None
+        if "gmail_backfill_states" in stmt_str:
+            for bfs in self.backfill_states.values():
+                return bfs
+            return None
+        if "gmail_coverages" in stmt_str:
+            for cov in self.coverages.values():
+                return cov
             return None
         if "gmail_checkpoints" in stmt_str:
             for chk in self.checkpoints.values():
@@ -173,15 +208,31 @@ class InMemorySession:
         elif isinstance(obj, SourcePolicy):
             self.policies[obj.id] = obj
         elif isinstance(obj, ImportJob):
+            if obj.created_at is None:
+                obj.created_at = datetime.now(UTC)
+            if obj.updated_at is None:
+                obj.updated_at = datetime.now(UTC)
+            if obj.processed_items is None:
+                obj.processed_items = 0
+            if obj.retry_count is None:
+                obj.retry_count = 0
             self.jobs[obj.id] = obj
         elif isinstance(obj, GmailCheckpoint):
             self.checkpoints[obj.connector_account_id] = obj
+        elif isinstance(obj, SourceSyncConfig):
+            self.sync_configs[obj.connector_account_id] = obj
+        elif isinstance(obj, GmailBackfillState):
+            self.backfill_states[obj.connector_account_id] = obj
+        elif isinstance(obj, GmailCoverage):
+            self.coverages[obj.connector_account_id] = obj
 
     async def delete(self, obj: Any) -> None:
         if isinstance(obj, SourceClientCredential):
             self.credentials.pop((obj.owner_id, obj.source_kind), None)
         elif isinstance(obj, ConnectorAccount):
             self.accounts.pop(obj.id, None)
+        elif isinstance(obj, SourceSyncConfig):
+            self.sync_configs.pop(obj.connector_account_id, None)
 
     async def flush(self) -> None:
         pass

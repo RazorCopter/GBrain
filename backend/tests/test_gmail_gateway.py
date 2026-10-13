@@ -110,7 +110,10 @@ def test_official_gateway_hardcodes_sent_and_full_format() -> None:
     resource.queue("get", _message())
     gateway = OfficialGmailGateway(_Service(resource))
     selection = GmailSelection(
-        datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 2, 1, tzinfo=UTC), 10
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 2, 1, tzinfo=UTC),
+        10,
+        query_filter="has:attachment larger:1024",
     )
 
     page = gateway.list_sent_page(selection, None, RequestBudget(5, 10))
@@ -121,6 +124,8 @@ def test_official_gateway_hardcodes_sent_and_full_format() -> None:
     assert list_args["labelIds"] == ["SENT"]
     assert list_args["includeSpamTrash"] is False
     assert str(list_args["q"]).startswith("after:")
+    assert " before:" in str(list_args["q"])
+    assert str(list_args["q"]).endswith(" (has:attachment larger:1024)")
     assert get_args == {"userId": "me", "id": "message-1", "format": "full"}
 
 

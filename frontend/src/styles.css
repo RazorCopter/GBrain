@@ -745,6 +745,295 @@ button.danger {
     font-size: .85rem;
 }
 
+/* Gmail Persistent Sync & Coverage Dashboard Panel */
+.gmail-sync-dashboard-panel {
+    background: #ffffff;
+    border: 1px solid #dbe4f0;
+    border-radius: .85rem;
+    padding: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.panel-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+}
+
+.panel-title {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+.panel-subtitle {
+    margin: .25rem 0 0;
+    font-size: .84rem;
+    color: #64748b;
+}
+
+.panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1.2rem;
+}
+
+.requires-import-alert {
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    color: #92400e;
+    padding: .85rem 1rem;
+    border-radius: .65rem;
+    font-size: .86rem;
+    line-height: 1.4;
+}
+
+.panel-status-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: .9rem;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: .75rem;
+    padding: 1rem;
+}
+
+.status-cell {
+    display: flex;
+    flex-direction: column;
+    gap: .25rem;
+}
+
+.cell-label {
+    font-size: .72rem;
+    text-transform: uppercase;
+    font-weight: 700;
+    letter-spacing: .03em;
+    color: #64748b;
+}
+
+.cell-value {
+    font-size: .92rem;
+    font-weight: 600;
+    color: #1e293b;
+}
+
+.cell-value.highlight {
+    color: #2563eb;
+}
+
+.cell-sub {
+    font-size: .78rem;
+}
+
+.badge-warning {
+    display: inline-block;
+    margin-top: .2rem;
+    background: #fef3c7;
+    color: #b45309;
+    padding: .15rem .4rem;
+    border-radius: 4px;
+    font-size: .72rem;
+    font-weight: 700;
+}
+
+.status-tag {
+    display: inline-block;
+    padding: .15rem .5rem;
+    border-radius: 999px;
+    font-size: .75rem;
+    font-weight: 700;
+}
+
+.status-tag.status-idle {
+    background: #f1f5f9;
+    color: #475569;
+}
+
+.status-tag.status-running {
+    background: #eff6ff;
+    color: #2563eb;
+}
+
+.status-tag.status-partial {
+    background: #fef9c3;
+    color: #854d0e;
+}
+
+.status-tag.status-completed {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.status-tag.status-failed {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.panel-sections-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(21rem, 1fr));
+    gap: 1.2rem;
+}
+
+.operation-card {
+    border: 1px solid #e2e8f0;
+    border-radius: .75rem;
+    padding: 1.15rem;
+    display: flex;
+    flex-direction: column;
+    gap: .95rem;
+    background: #ffffff;
+}
+
+.history-import-card {
+    border-top: 3px solid #3b82f6;
+}
+
+.continuous-sync-card {
+    border-top: 3px solid #10b981;
+}
+
+.card-heading h4 {
+    margin: 0;
+    font-size: .98rem;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+.card-desc {
+    margin: .3rem 0 0;
+    font-size: .82rem;
+    color: #64748b;
+    line-height: 1.35;
+}
+
+.card-form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: .75rem;
+}
+
+.field-group {
+    display: flex;
+    flex-direction: column;
+    gap: .3rem;
+    font-size: .8rem;
+    font-weight: 600;
+    color: #334155;
+}
+
+.field-group input {
+    padding: .45rem .6rem;
+    border: 1px solid #cbd5e1;
+    border-radius: .4rem;
+    font-size: .84rem;
+}
+
+.card-actions-row {
+    display: flex;
+    gap: .6rem;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.history-preview-results {
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    color: #166534;
+    padding: .65rem .85rem;
+    border-radius: .5rem;
+    font-size: .82rem;
+    line-height: 1.35;
+}
+
+.idempotency-callout {
+    font-size: .78rem;
+    color: #475569;
+    background: #f8fafc;
+    border: 1px dashed #cbd5e1;
+    padding: .5rem .75rem;
+    border-radius: .45rem;
+    line-height: 1.3;
+}
+
+.continuous-info-box {
+    display: flex;
+    flex-direction: column;
+    gap: .45rem;
+    background: #f8fafc;
+    padding: .85rem;
+    border-radius: .5rem;
+    font-size: .84rem;
+}
+
+.meta-pair {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: .5rem;
+}
+
+.continuous-note {
+    margin: 0;
+    font-size: .78rem;
+    line-height: 1.3;
+}
+
+.panel-config-edit-footer {
+    border-top: 1px solid #e2e8f0;
+    padding-top: .85rem;
+}
+
+.config-edit-form {
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: .65rem;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: .75rem;
+}
+
+.config-edit-form h5 {
+    margin: 0;
+    font-size: .9rem;
+    color: #0f172a;
+}
+
+.config-fields-inline {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: .75rem;
+}
+
+.config-fields-inline label {
+    display: flex;
+    flex-direction: column;
+    gap: .3rem;
+    font-size: .78rem;
+    font-weight: 600;
+    color: #475569;
+}
+
+.config-fields-inline input {
+    padding: .4rem .55rem;
+    border: 1px solid #cbd5e1;
+    border-radius: .4rem;
+    font-size: .84rem;
+}
+
+.form-buttons-row {
+    display: flex;
+    gap: .6rem;
+    align-items: center;
+}
+
 /* Job Banner Section */
 .job-banner-section {
     background: #fff;

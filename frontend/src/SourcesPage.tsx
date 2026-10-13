@@ -3,12 +3,14 @@ import {
     ApiError,
     GmailAccount,
     GmailCitation,
+    GmailPreview,
     GmailSources,
     ImportJob,
     SourceCatalogItem,
     SourceCatalogResponse,
     SourceDisconnectResponse,
     SourceStatusResponse,
+    SourceSyncConfig,
     SourceTestConnectionResponse,
     api,
     isConnectorAvailable,
@@ -42,6 +44,19 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
     const [quickSyncBusy, setQuickSyncBusy] = useState(false)
     const [globalMessage, setGlobalMessage] = useState('')
     const [globalError, setGlobalError] = useState('')
+
+    // Stato Pannello Persistente Gestione Gmail
+    const [configPanelOpen, setConfigPanelOpen] = useState(true)
+    const [editConfigMode, setEditConfigMode] = useState(false)
+    const [formAfter, setFormAfter] = useState('')
+    const [formBefore, setFormBefore] = useState('')
+    const [formLimit, setFormLimit] = useState(10000)
+    const [formBudget, setFormBudget] = useState(20000)
+    const [formBatchSize, setFormBatchSize] = useState(50)
+    const [savingConfig, setSavingConfig] = useState(false)
+    const [historyPreview, setHistoryPreview] = useState<GmailPreview | null>(null)
+    const [previewLoading, setPreviewLoading] = useState(false)
+    const [historyImportLoading, setHistoryImportLoading] = useState(false)
 
     async function loadAllData() {
         try {
@@ -127,7 +142,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         }
     }
 
-    // Azione: Sincronizza ora (incrementale o full rapido)
+    // Azione: Aggiorna ora (aggiornamento continuo backend-authoritative)
     async function handleQuickSync() {
         if (!isAliasesReady) {
             setGlobalError(
@@ -139,21 +154,83 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         setGlobalError('')
         setGlobalMessage('')
         try {
-            const isInitialComplete = Boolean(gmailStatus?.initial_import_completed)
-            const syncMode = isInitialComplete ? 'incremental' : 'full'
-            const res = await api.triggerSourceSync('gmail', {
-                mode: syncMode,
-                item_limit: 500,
-                request_budget: 200,
-                batch_size: 25,
-            })
-            setGlobalMessage(`Sincronizzazione (${res.mode ?? syncMode}) avviata (Job #${res.job_id.slice(0, 8)}).`)
+            const res = await api.startContinuousSync('gmail')
+            setGlobalMessage(`Aggiornamento continuo (${res.mode ?? 'incremental'}) avviato (Job #${res.job_id.slice(0, 8)}).`)
             const jobData = await api.gmailJob(res.job_id)
             setActiveJob(jobData)
         } catch (err) {
-            setGlobalError(err instanceof ApiError ? err.message : 'Errore durante il lancio della sincronizzazione.')
+            setGlobalError(err instanceof ApiError ? err.message : 'Errore durante il lancio dell\'aggiornamento.')
         } finally {
             setQuickSyncBusy(false)
+        }
+    }
+
+    // Azione: Salvataggio configurazione desiderata
+    async function handleSaveConfig(e: FormEvent) {
+        e.preventDefault()
+        setSavingConfig(true)
+        setGlobalError('')
+        setGlobalMessage('')
+        try {
+            const payload: Partial<SourceSyncConfig> = {
+                history_after: formAfter ? new Date(formAfter).toISOString() : new Date(Date.now() - 90 * 86400000).toISOString(),
+                history_before: formBefore ? new Date(formBefore).toISOString() : null,
+                item_limit: formLimit,
+                request_budget: formBudget,
+                batch_size: formBatchSize,
+                selection_label: 'SENT',
+                update_policy: 'continuous',
+            }
+            const updated = await api.updateSourceConfig('gmail', payload)
+            setGlobalMessage(`Configurazione aggiornata con successo (Revisione #${updated.revision}).`)
+            setEditConfigMode(false)
+            await loadAllData()
+        } catch (err) {
+            setGlobalError(err instanceof ApiError ? err.message : 'Errore nel salvataggio della configurazione.')
+        } finally {
+            setSavingConfig(false)
+        }
+    }
+
+    // Azione: Anteprima intervallo storico
+    async function handleHistoryPreview() {
+        setPreviewLoading(true)
+        setGlobalError('')
+        try {
+            const afterIso = formAfter ? new Date(formAfter).toISOString() : new Date(Date.now() - 90 * 86400000).toISOString()
+            const beforeIso = formBefore ? new Date(formBefore).toISOString() : new Date().toISOString()
+            const preview = await api.previewSourceHistory('gmail', {
+                after: afterIso,
+                before: beforeIso,
+                item_limit: formLimit,
+                request_budget: formBudget,
+                batch_size: formBatchSize,
+            })
+            setHistoryPreview(preview)
+            setGlobalMessage(`Anteprima completata: ${preview.selected_items} messaggi SENT stimati (${preview.pages_read} pagine).`)
+        } catch (err) {
+            setGlobalError(err instanceof ApiError ? err.message : 'Errore durante l\'anteprima dello storico.')
+        } finally {
+            setPreviewLoading(false)
+        }
+    }
+
+    // Azione: Avvio o ripresa importazione storico
+    async function handleStartHistoryImport() {
+        setHistoryImportLoading(true)
+        setGlobalError('')
+        setGlobalMessage('')
+        try {
+            const afterIso = formAfter ? new Date(formAfter).toISOString() : undefined
+            const beforeIso = formBefore ? new Date(formBefore).toISOString() : undefined
+            const job = await api.startSourceHistoryImport('gmail', { after: afterIso, before: beforeIso })
+            setActiveJob(job)
+            setGlobalMessage(`Importazione dello storico avviata (Job #${job.id.slice(0, 8)}).`)
+            await loadAllData()
+        } catch (err) {
+            setGlobalError(err instanceof ApiError ? err.message : 'Errore durante l\'avvio dell\'importazione storico.')
+        } finally {
+            setHistoryImportLoading(false)
         }
     }
 
@@ -377,6 +454,271 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                 <span className="meta-label">Messaggi Mappati</span>
                                 <span className="meta-value">{sourcesData?.total ?? 0} nel database</span>
                             </div>
+                        </div>
+                    )}
+
+                    {/* Pannello Persistente Gestione Gmail: Copertura, Storico e Aggiornamento Continuo */}
+                    {isConnected && (
+                        <div className="gmail-sync-dashboard-panel" aria-labelledby="gmail-panel-title">
+                            <div className="panel-header-row">
+                                <div>
+                                    <h3 id="gmail-panel-title" className="panel-title">
+                                        ⚡ Gestione Persistente Fonte & Copertura
+                                    </h3>
+                                    <p className="panel-subtitle">
+                                        Configurazione revisionata, stato backfill, copertura completata e aggiornamento continuo open-ended.
+                                    </p>
+                                </div>
+                                <button
+                                    type="button"
+                                    className="secondary compact"
+                                    onClick={() => setConfigPanelOpen(!configPanelOpen)}
+                                    aria-expanded={configPanelOpen}
+                                >
+                                    {configPanelOpen ? 'Comprimi Pannello ▲' : 'Espandi Pannello ▼'}
+                                </button>
+                            </div>
+
+                            {configPanelOpen && (
+                                <div className="panel-body">
+                                    {/* Alert se la revisione o i filtri sono cambiati e richiedono nuovo import */}
+                                    {gmailStatus?.requires_import && (
+                                        <div className="requires-import-alert" role="alert">
+                                            <strong>⚠️ Nuova Revisione / Selezione da Importare:</strong> La configurazione desiderata è cambiata rispetto alla copertura storicizzata attuale. Avvia un'importazione dello storico per allineare la fonte. Il cambio filtro è additivo: i messaggi già importati che non corrispondono più non vengono rimossi o reindicizzati automaticamente.
+                                        </div>
+                                    )}
+
+                                    {/* Schede di stato sintetico */}
+                                    <div className="panel-status-strip">
+                                        <div className="status-cell">
+                                            <span className="cell-label">Revisione Configurazione</span>
+                                            <span className="cell-value highlight">
+                                                Rev. #{gmailStatus?.sync_config?.revision ?? 1}
+                                            </span>
+                                            <span className="cell-sub text-muted" title={gmailStatus?.sync_config?.query_fingerprint ?? ''}>
+                                                FP: <code>{gmailStatus?.sync_config?.query_fingerprint ? gmailStatus.sync_config.query_fingerprint.slice(0, 10) + '…' : '—'}</code>
+                                            </span>
+                                        </div>
+
+                                        <div className="status-cell">
+                                            <span className="cell-label">Intervallo Desiderato</span>
+                                            <span className="cell-value">
+                                                {gmailStatus?.sync_config?.history_after
+                                                    ? new Date(gmailStatus.sync_config.history_after).toLocaleDateString()
+                                                    : 'Non impostato'}
+                                                {' → '}
+                                                {gmailStatus?.sync_config?.history_before
+                                                    ? new Date(gmailStatus.sync_config.history_before).toLocaleDateString()
+                                                    : 'Continuo (Now)'}
+                                            </span>
+                                            <span className="cell-sub text-muted">
+                                                Policy: <strong>{gmailStatus?.sync_config?.update_policy ?? 'continuous'}</strong>
+                                            </span>
+                                        </div>
+
+                                        <div className="status-cell">
+                                            <span className="cell-label">Copertura Effettiva</span>
+                                            <span className="cell-value">
+                                                {gmailStatus?.coverage?.covered_after || gmailStatus?.coverage?.covered_before ? (
+                                                    <>
+                                                        {gmailStatus.coverage.covered_after ? new Date(gmailStatus.coverage.covered_after).toLocaleDateString() : '—'}
+                                                        {' → '}
+                                                        {gmailStatus.coverage.covered_before ? new Date(gmailStatus.coverage.covered_before).toLocaleDateString() : '—'}
+                                                    </>
+                                                ) : (
+                                                    <span className="text-warning">Incompleta / Da importare</span>
+                                                )}
+                                            </span>
+                                            {gmailStatus?.coverage?.is_legacy && (
+                                                <span className="badge-warning">Legacy / Non verificata</span>
+                                            )}
+                                        </div>
+
+                                        <div className="status-cell">
+                                            <span className="cell-label">Stato Backfill</span>
+                                            <span className="cell-value">
+                                                <span className={`status-tag status-${gmailStatus?.backfill_state?.status ?? 'idle'}`}>
+                                                    {(gmailStatus?.backfill_state?.status ?? 'IDLE').toUpperCase()}
+                                                </span>
+                                            </span>
+                                            <span className="cell-sub text-muted">
+                                                {gmailStatus?.backfill_state?.status === 'partial'
+                                                    ? `Ripresa token attiva (${gmailStatus?.backfill_state?.items_imported} items)`
+                                                    : `${gmailStatus?.backfill_state?.items_imported ?? 0} importati`}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    {/* Griglia a due sezioni operative distinte */}
+                                    <div className="panel-sections-grid">
+                                        {/* SEZIONE 1: Importazione dello storico */}
+                                        <div className="operation-card history-import-card">
+                                            <div className="card-heading">
+                                                <h4>📥 Importazione dello Storico</h4>
+                                                <p className="card-desc">
+                                                    Finestra passata modificabile per import iniziale o backfill retroattivo. Cursore isolato con idempotenza totale senza duplicati.
+                                                </p>
+                                            </div>
+
+                                            <div className="card-form-grid">
+                                                <label className="field-group">
+                                                    <span>Data Inizio (After):</span>
+                                                    <input
+                                                        type="datetime-local"
+                                                        value={formAfter}
+                                                        onChange={(e) => setFormAfter(e.target.value)}
+                                                    />
+                                                </label>
+                                                <label className="field-group">
+                                                    <span>Data Fine (Before):</span>
+                                                    <input
+                                                        type="datetime-local"
+                                                        value={formBefore}
+                                                        onChange={(e) => setFormBefore(e.target.value)}
+                                                        placeholder="Lascia vuoto per data odierna"
+                                                    />
+                                                </label>
+                                            </div>
+
+                                            <div className="card-actions-row">
+                                                <button
+                                                    type="button"
+                                                    className="secondary compact"
+                                                    disabled={previewLoading || !formAfter}
+                                                    onClick={handleHistoryPreview}
+                                                    title="Esegue un'anteprima sicura senza mutare checkpoint o dati"
+                                                >
+                                                    {previewLoading ? 'Verifica…' : '🔍 Anteprima Storico'}
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="primary compact"
+                                                    disabled={historyImportLoading || (activeJob !== null && ['pending', 'running'].includes(activeJob.status))}
+                                                    onClick={handleStartHistoryImport}
+                                                    title="Avvia o riprende l'importazione mirata dell'intervallo storico"
+                                                >
+                                                    {historyImportLoading ? 'Avvio…' : '📥 Avvia Import / Backfill'}
+                                                </button>
+                                            </div>
+
+                                            {historyPreview && (
+                                                <div className="history-preview-results" aria-live="polite">
+                                                    <strong>Risultato Anteprima:</strong> {historyPreview.selected_items} messaggi SENT individuati ({historyPreview.pages_read} pagine lette, {historyPreview.requests_used} richieste usate).
+                                                </div>
+                                            )}
+
+                                            <div className="idempotency-callout">
+                                                <span>🛡️ <strong>Idempotenza:</strong> I messaggi già catalogati non vengono duplicati. L'espansione verso il passato mantiene invariato l'history ID incrementale.</span>
+                                            </div>
+                                        </div>
+
+                                        {/* SEZIONE 2: Aggiornamento della fonte (Aggiorna ora) */}
+                                        <div className="operation-card continuous-sync-card">
+                                            <div className="card-heading">
+                                                <h4>🔄 Aggiornamento Continuo</h4>
+                                                <p className="card-desc">
+                                                    Acquisisce nuove email <code>SENT</code> successive al checkpoint. Nessun upper bound rigido o statico: l'orizzonte temporale viene calcolato a runtime nel worker.
+                                                </p>
+                                            </div>
+
+                                            <div className="continuous-info-box">
+                                                <div className="meta-pair">
+                                                    <span className="muted">Ultimo Aggiornamento:</span>
+                                                    <span>
+                                                        {gmailStatus?.last_sync_at ? new Date(gmailStatus.last_sync_at).toLocaleString() : 'Nessuno registrato'}
+                                                    </span>
+                                                </div>
+                                                <div className="meta-pair">
+                                                    <span className="muted">History ID Checkpoint:</span>
+                                                    <span><code>{gmailStatus?.checkpoint_history_id ?? 'Non impostato'}</code></span>
+                                                </div>
+                                                <div className="meta-pair">
+                                                    <span className="muted">Filtro Perimetro:</span>
+                                                    <span>Esclusivamente <strong>SENT (posta inviata)</strong></span>
+                                                </div>
+                                            </div>
+
+                                            <div className="card-actions-row">
+                                                <button
+                                                    type="button"
+                                                    className="primary compact"
+                                                    disabled={quickSyncBusy || (activeJob !== null && ['pending', 'running'].includes(activeJob.status))}
+                                                    onClick={handleQuickSync}
+                                                    title="Lancia l'aggiornamento incrementale continuo backend-authoritative"
+                                                >
+                                                    {quickSyncBusy ? 'Accodamento…' : '🔄 Aggiorna Ora'}
+                                                </button>
+                                            </div>
+
+                                            <p className="continuous-note text-muted">
+                                                Non riutilizza la data limite dello storico. Eventuali modifiche ai filtri incrementano la revisione e preservano l'integrità del checkpoint.
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    {/* Modifica Parametri & Budget */}
+                                    <div className="panel-config-edit-footer">
+                                        {!editConfigMode ? (
+                                            <button
+                                                type="button"
+                                                className="secondary compact"
+                                                onClick={() => setEditConfigMode(true)}
+                                            >
+                                                ⚙️ Modifica Parametri & Budget Desiderati
+                                            </button>
+                                        ) : (
+                                            <form onSubmit={handleSaveConfig} className="config-edit-form">
+                                                <h5>Modifica Configurazione (Genera Nuova Revisione)</h5>
+                                                <div className="config-fields-inline">
+                                                    <label>
+                                                        <span>Limite Messaggi:</span>
+                                                        <input
+                                                            type="number"
+                                                            min={1}
+                                                            max={100000}
+                                                            value={formLimit}
+                                                            onChange={(e) => setFormLimit(Number(e.target.value))}
+                                                        />
+                                                    </label>
+                                                    <label>
+                                                        <span>Budget Richieste:</span>
+                                                        <input
+                                                            type="number"
+                                                            min={1}
+                                                            max={200000}
+                                                            value={formBudget}
+                                                            onChange={(e) => setFormBudget(Number(e.target.value))}
+                                                        />
+                                                    </label>
+                                                    <label>
+                                                        <span>Dimensione Batch:</span>
+                                                        <input
+                                                            type="number"
+                                                            min={1}
+                                                            max={500}
+                                                            value={formBatchSize}
+                                                            onChange={(e) => setFormBatchSize(Number(e.target.value))}
+                                                        />
+                                                    </label>
+                                                </div>
+                                                <div className="form-buttons-row">
+                                                    <button type="submit" className="primary compact" disabled={savingConfig}>
+                                                        {savingConfig ? 'Salvataggio…' : '💾 Salva Nuova Revisione'}
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="secondary compact"
+                                                        disabled={savingConfig}
+                                                        onClick={() => setEditConfigMode(false)}
+                                                    >
+                                                        Annulla
+                                                    </button>
+                                                </div>
+                                            </form>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     )}
 

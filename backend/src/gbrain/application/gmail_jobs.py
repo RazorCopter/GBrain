@@ -45,6 +45,7 @@ from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
 from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
 
 GatewayBuilder = Callable[[ConnectorAccount, Settings], OfficialGmailGateway]
+logger = logging.getLogger(__name__)
 
 
 class GmailJobTransientError(RuntimeError):
@@ -61,11 +62,24 @@ def _gateway(account: ConnectorAccount, settings: Settings) -> OfficialGmailGate
 
 def _selection(snapshot: dict[str, Any]) -> GmailSelection:
     try:
+        after = datetime.fromisoformat(str(snapshot["after"]))
+        purpose = snapshot.get("purpose")
+        raw_before = snapshot.get("before")
+        # Se l'aggiornamento è continuo (o before è assente nello snapshot),
+        # l'upper bound NON è un limite statico salvato nel passato:
+        # viene risolto a runtime nel worker all'istante esatto dell'esecuzione!
+        if purpose == "continuous" or raw_before is None:
+            before = datetime.now(UTC)
+        else:
+            before = datetime.fromisoformat(str(raw_before))
         return GmailSelection(
-            after=datetime.fromisoformat(str(snapshot["after"])),
-            before=datetime.fromisoformat(str(snapshot["before"])),
+            after=after,
+            before=before,
             limit=int(snapshot["item_limit"]),
             page_size=min(int(snapshot["batch_size"]), 500),
+            query_filter=(
+                str(snapshot["query_filter"]) if snapshot.get("query_filter") is not None else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise GmailJobPermanentError("Snapshot policy Gmail non valido") from exc
@@ -111,6 +125,25 @@ async def _load_job_context(
         if not account.confirmed_aliases:
             raise GmailJobPermanentError("Alias owner Gmail non confermati")
         repository = AsyncPostgresGmailRepository(session)
+        config = await repository.load_sync_config(account.id, for_update=True)
+        if job.config_revision is not None and (
+            config is None or config.revision != job.config_revision
+        ):
+            logger.warning(
+                "Job Gmail stale bloccato prima dell'avvio: job_id=%s account_id=%s "
+                "job_revision=%s current_revision=%s",
+                job.id,
+                account.id,
+                job.config_revision,
+                config.revision if config else None,
+            )
+            job.status = ImportJobStatus.CANCELLED
+            job.finished_at = datetime.now(UTC)
+            job.error_code = "stale_config_revision"
+            job.error_detail = "Configurazione Gmail modificata dopo la creazione del lavoro"
+            job.checkpoint = {**job.checkpoint, "phase": "cancelled_stale_revision"}
+            await session.commit()
+            raise asyncio.CancelledError
         checkpoint = await repository.load_checkpoint(account.id, job.source_policy_id)
         job.status = ImportJobStatus.RUNNING
         job.started_at = job.started_at or datetime.now(UTC)
@@ -259,6 +292,8 @@ async def _run_full(
             last_synced_at=now,
             reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
             version=current.version,
+            config_revision=job.config_revision,
+            query_fingerprint=job.query_fingerprint,
         )
         processed += await _persist_page(
             database,
@@ -289,6 +324,8 @@ async def _run_full(
                             reconciliation_state=current.reconciliation_state,
                             last_error_code=current.last_error_code,
                             version=current.version,
+                            config_revision=current.config_revision,
+                            query_fingerprint=current.query_fingerprint,
                         )
                         await _persist_page(
                             database,
@@ -355,6 +392,8 @@ async def _run_incremental(
             last_synced_at=datetime.now(UTC),
             reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
             version=current.version,
+            config_revision=job.config_revision,
+            query_fingerprint=job.query_fingerprint,
         )
         processed += await _persist_page(
             database,
@@ -366,6 +405,17 @@ async def _run_incremental(
             out_of_scope_ids=frozenset(out_of_scope),
         )
         await _update_progress(database, job.id, current, processed, phase="history_committed")
+        async with database.session_factory() as session:
+            repo = AsyncPostgresGmailRepository(session)
+            await repo.update_coverage(
+                account.id,
+                covered_after=None,
+                covered_before=datetime.now(UTC),
+                query_fingerprint=job.query_fingerprint,
+                config_revision=job.config_revision,
+                is_legacy=False,
+            )
+            await session.commit()
         cursor = page.next_cursor
     return processed, current
 
@@ -491,7 +541,11 @@ async def execute_gmail_job(
             await _run_preview(database, job, connector, budget, selection)
             return
 
-        effective_mode = resolve_sync_mode(checkpoint, mode)
+        purpose = job.policy_snapshot.get("purpose")
+        if purpose == "history":
+            effective_mode = GmailSyncMode.FULL
+        else:
+            effective_mode = resolve_sync_mode(checkpoint, mode)
         if effective_mode.value != mode:
             async with database.session_factory() as session:
                 persisted_job = await session.get(ImportJob, job.id)

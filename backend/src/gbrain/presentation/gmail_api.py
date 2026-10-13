@@ -18,18 +18,24 @@ from gbrain.application.gmail_oauth import (
 from gbrain.application.gmail_service import (
     GmailServiceError,
     PolicyInput,
+    SyncConfigInput,
     authorized_proof_url,
     confirm_aliases,
     create_and_enqueue_job,
+    enqueue_continuous_update_job,
+    enqueue_history_import_job,
     fetch_live_sent_evidence,
     get_gmail_account,
+    get_or_create_sync_config,
     gmail_status,
     list_imported_sources,
     policy_input,
+    preview_history_selection,
     remove_alias,
     request_job_cancellation,
     save_policy,
     search_imported_sources,
+    update_sync_config,
 )
 from gbrain.domain.models import ImportJob, SourcePolicy
 from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
@@ -53,7 +59,11 @@ from gbrain.presentation.schemas import (
     GmailPreviewResponse,
     GmailSourceListResponse,
     GmailStatusResponse,
+    HistoryImportRequest,
+    HistoryPreviewRequest,
     ImportJobResponse,
+    SourceSyncConfigRequest,
+    SourceSyncConfigResponse,
 )
 
 gmail_router = APIRouter(prefix="/api/gmail", tags=["gmail"])
@@ -462,3 +472,171 @@ async def live_evidence_endpoint(
     except (GmailOAuthError, GmailServiceError) as exc:
         raise _http_error(exc) from exc
     return GmailLiveEvidenceResponse(source_item_id=source_item_id, message=message)
+
+
+@gmail_router.get("/config", response_model=SourceSyncConfigResponse)
+async def gmail_get_config_endpoint(
+    session: DbSession,
+    principal: PrincipalDep,
+) -> SourceSyncConfigResponse:
+    account = await get_gmail_account(session, principal.owner.id)
+    assert account is not None
+    cfg = await get_or_create_sync_config(session, account)
+    return SourceSyncConfigResponse(
+        id=cfg.id,
+        revision=cfg.revision,
+        history_after=cfg.history_after,
+        history_before=cfg.history_before,
+        selection_label=cfg.selection_label,
+        query_filter=cfg.query_filter,
+        item_limit=cfg.item_limit,
+        request_budget=cfg.request_budget,
+        batch_size=cfg.batch_size,
+        update_policy=cfg.update_policy,
+        query_fingerprint=cfg.query_fingerprint,
+        created_at=cfg.created_at,
+        updated_at=cfg.updated_at,
+    )
+
+
+@gmail_router.put("/config", response_model=SourceSyncConfigResponse)
+async def gmail_update_config_endpoint(
+    payload: SourceSyncConfigRequest,
+    session: DbSession,
+    principal: CsrfPrincipalDep,
+) -> SourceSyncConfigResponse:
+    account = await get_gmail_account(session, principal.owner.id)
+    assert account is not None
+    input_data = SyncConfigInput(
+        history_after=payload.history_after,
+        history_before=payload.history_before,
+        selection_label=payload.selection_label,
+        query_filter=payload.query_filter,
+        item_limit=payload.item_limit,
+        request_budget=payload.request_budget,
+        batch_size=payload.batch_size,
+        update_policy=payload.update_policy,
+    )
+    try:
+        cfg, _ = await update_sync_config(session, account, input_data)
+    except GmailServiceError as exc:
+        if exc.code == "conflict_active_job":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message
+            ) from exc
+        raise _http_error(exc) from exc
+
+    return SourceSyncConfigResponse(
+        id=cfg.id,
+        revision=cfg.revision,
+        history_after=cfg.history_after,
+        history_before=cfg.history_before,
+        selection_label=cfg.selection_label,
+        query_filter=cfg.query_filter,
+        item_limit=cfg.item_limit,
+        request_budget=cfg.request_budget,
+        batch_size=cfg.batch_size,
+        update_policy=cfg.update_policy,
+        query_fingerprint=cfg.query_fingerprint,
+        created_at=cfg.created_at,
+        updated_at=cfg.updated_at,
+    )
+
+
+@gmail_router.post("/history/preview", response_model=GmailPreviewResponse)
+async def gmail_preview_history_endpoint(
+    payload: HistoryPreviewRequest,
+    session: DbSession,
+    settings: AppSettings,
+    principal: PrincipalDep,
+) -> GmailPreviewResponse:
+    account = await get_gmail_account(session, principal.owner.id)
+    assert account is not None
+    try:
+        preview = await preview_history_selection(
+            account,
+            settings,
+            after=payload.after,
+            before=payload.before,
+            item_limit=payload.item_limit,
+            request_budget=payload.request_budget,
+            batch_size=payload.batch_size,
+        )
+    except GmailServiceError as exc:
+        raise _http_error(exc) from exc
+    return GmailPreviewResponse(
+        job_id=None,
+        selected_items=preview.selected_items,
+        pages_read=preview.pages_read,
+        requests_used=preview.request_count,
+        state=preview.state,
+        truncated=preview.truncated,
+        policy=preview.policy,
+    )
+
+
+@gmail_router.post(
+    "/history/import",
+    response_model=ImportJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def gmail_import_history_endpoint(
+    payload: HistoryImportRequest,
+    session: DbSession,
+    queue: ProcrastinateApp,
+    principal: CsrfPrincipalDep,
+) -> ImportJob:
+    account = await get_gmail_account(session, principal.owner.id)
+    assert account is not None
+
+    async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
+        return await queue.configure_task(
+            GMAIL_TASK_NAME,
+            queue="gmail",
+            lock="gmail-heavy-global",
+        ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
+
+    try:
+        return await enqueue_history_import_job(
+            session,
+            account,
+            enqueue,
+            after=payload.after,
+            before=payload.before,
+        )
+    except GmailServiceError as exc:
+        if exc.code == "account_job_already_active":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message
+            ) from exc
+        raise _http_error(exc) from exc
+
+
+@gmail_router.post(
+    "/sync/continuous",
+    response_model=ImportJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def gmail_sync_continuous_endpoint(
+    session: DbSession,
+    queue: ProcrastinateApp,
+    principal: CsrfPrincipalDep,
+) -> ImportJob:
+    account = await get_gmail_account(session, principal.owner.id)
+    assert account is not None
+
+    async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
+        return await queue.configure_task(
+            GMAIL_TASK_NAME,
+            queue="gmail",
+            lock="gmail-heavy-global",
+        ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
+
+    try:
+        return await enqueue_continuous_update_job(session, account, enqueue)
+    except GmailServiceError as exc:
+        if exc.code == "account_job_already_active":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message
+            ) from exc
+        raise _http_error(exc) from exc

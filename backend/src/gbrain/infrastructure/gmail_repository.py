@@ -9,17 +9,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gbrain.domain.gmail import (
     GMAIL_SOURCE_KIND,
+    GmailBackfillStateData,
     GmailCheckpointState,
     GmailPersistOutcome,
     GmailReconciliationState,
+    GmailSyncConfigData,
     NormalizedGmailMessage,
 )
 from gbrain.domain.models import (
+    GmailBackfillState,
     GmailCheckpoint,
+    GmailCoverage,
     ReconciliationState,
     SourceItem,
     SourceItemState,
     SourceRevision,
+    SourceSyncConfig,
 )
 
 
@@ -42,6 +47,18 @@ class AsyncPostgresGmailRepository:
         outcomes: list[GmailPersistOutcome] = []
         now = datetime.now(UTC)
         async with self._session.begin():
+            if checkpoint.config_revision is not None:
+                config = await self._session.scalar(
+                    select(SourceSyncConfig)
+                    .where(SourceSyncConfig.connector_account_id == account_id)
+                    .with_for_update()
+                )
+                if (
+                    config is None
+                    or config.revision != checkpoint.config_revision
+                    or config.query_fingerprint != checkpoint.query_fingerprint
+                ):
+                    raise RuntimeError("stale_gmail_job_snapshot")
             for message in messages:
                 item = await self._session.scalar(
                     select(SourceItem)
@@ -286,6 +303,8 @@ class AsyncPostgresGmailRepository:
                 reconciliation_state=reconciliation_state,
                 last_error_code=state.last_error_code,
                 version=state.version,
+                config_revision=state.config_revision,
+                query_fingerprint=state.query_fingerprint,
             )
             self._session.add(checkpoint)
             return
@@ -298,6 +317,150 @@ class AsyncPostgresGmailRepository:
         checkpoint.reconciliation_state = reconciliation_state
         checkpoint.last_error_code = state.last_error_code
         checkpoint.version = state.version
+        checkpoint.config_revision = state.config_revision
+        checkpoint.query_fingerprint = state.query_fingerprint
+
+    async def load_sync_config(
+        self, account_id: uuid.UUID, *, for_update: bool = False
+    ) -> SourceSyncConfig | None:
+        query = select(SourceSyncConfig).where(SourceSyncConfig.connector_account_id == account_id)
+        if for_update:
+            query = query.with_for_update()
+        return await self._session.scalar(query)
+
+    async def upsert_sync_config(
+        self, account_id: uuid.UUID, data: GmailSyncConfigData
+    ) -> SourceSyncConfig:
+        config = await self._session.scalar(
+            select(SourceSyncConfig)
+            .where(SourceSyncConfig.connector_account_id == account_id)
+            .with_for_update()
+        )
+        if config is None:
+            config = SourceSyncConfig(
+                connector_account_id=account_id,
+                revision=data.revision,
+                history_after=data.history_after,
+                history_before=data.history_before,
+                selection_label=data.selection_label,
+                query_filter=data.query_filter,
+                item_limit=data.item_limit,
+                request_budget=data.request_budget,
+                batch_size=data.batch_size,
+                update_policy=data.update_policy,
+                query_fingerprint=data.query_fingerprint,
+            )
+            self._session.add(config)
+            return config
+
+        config.revision = data.revision
+        config.history_after = data.history_after
+        config.history_before = data.history_before
+        config.selection_label = data.selection_label
+        config.query_filter = data.query_filter
+        config.item_limit = data.item_limit
+        config.request_budget = data.request_budget
+        config.batch_size = data.batch_size
+        config.update_policy = data.update_policy
+        config.query_fingerprint = data.query_fingerprint
+        return config
+
+    async def load_backfill_state(self, account_id: uuid.UUID) -> GmailBackfillState | None:
+        return await self._session.scalar(
+            select(GmailBackfillState).where(GmailBackfillState.connector_account_id == account_id)
+        )
+
+    async def upsert_backfill_state(
+        self, account_id: uuid.UUID, data: GmailBackfillStateData
+    ) -> GmailBackfillState:
+        state = await self._session.scalar(
+            select(GmailBackfillState)
+            .where(GmailBackfillState.connector_account_id == account_id)
+            .with_for_update()
+        )
+        if state is None:
+            state = GmailBackfillState(
+                connector_account_id=account_id,
+                config_revision=data.config_revision,
+                query_fingerprint=data.query_fingerprint,
+                history_after=data.history_after,
+                history_before=data.history_before,
+                page_token=data.page_token,
+                status=data.status,
+                items_imported=data.items_imported,
+                last_run_at=data.last_run_at,
+                last_error_code=data.last_error_code,
+            )
+            self._session.add(state)
+            return state
+
+        state.config_revision = data.config_revision
+        state.query_fingerprint = data.query_fingerprint
+        state.history_after = data.history_after
+        state.history_before = data.history_before
+        state.page_token = data.page_token
+        state.status = data.status
+        state.items_imported = data.items_imported
+        state.last_run_at = data.last_run_at
+        state.last_error_code = data.last_error_code
+        return state
+
+    async def load_coverage(self, account_id: uuid.UUID) -> GmailCoverage | None:
+        return await self._session.scalar(
+            select(GmailCoverage).where(GmailCoverage.connector_account_id == account_id)
+        )
+
+    async def update_coverage(
+        self,
+        account_id: uuid.UUID,
+        *,
+        covered_after: datetime | None,
+        covered_before: datetime | None,
+        query_fingerprint: str | None = None,
+        config_revision: int | None = None,
+        is_legacy: bool = False,
+    ) -> GmailCoverage:
+        coverage = await self._session.scalar(
+            select(GmailCoverage)
+            .where(GmailCoverage.connector_account_id == account_id)
+            .with_for_update()
+        )
+        now = datetime.now(UTC)
+        if coverage is None:
+            coverage = GmailCoverage(
+                connector_account_id=account_id,
+                covered_after=covered_after,
+                covered_before=covered_before,
+                query_fingerprint=query_fingerprint,
+                config_revision=config_revision,
+                is_legacy=is_legacy,
+                last_completed_at=now,
+            )
+            self._session.add(coverage)
+            return coverage
+
+        same_selection = (
+            coverage.query_fingerprint == query_fingerprint
+            and coverage.config_revision == config_revision
+        )
+        if not same_selection:
+            # Una copertura appartiene a una precisa selezione/revisione: unirla con
+            # un'altra fingerprint dichiarerebbe coperti intervalli mai scansionati.
+            coverage.covered_after = covered_after
+            coverage.covered_before = covered_before
+        else:
+            if covered_after is not None:
+                if coverage.covered_after is None or covered_after < coverage.covered_after:
+                    coverage.covered_after = covered_after
+            if covered_before is not None:
+                if coverage.covered_before is None or covered_before > coverage.covered_before:
+                    coverage.covered_before = covered_before
+
+        coverage.query_fingerprint = query_fingerprint
+        coverage.config_revision = config_revision
+        coverage.is_legacy = is_legacy
+        coverage.last_completed_at = now
+        return coverage
 
 
 def checkpoint_from_model(model: GmailCheckpoint) -> GmailCheckpointState:
@@ -312,4 +475,6 @@ def checkpoint_from_model(model: GmailCheckpoint) -> GmailCheckpointState:
         reconciliation_state=GmailReconciliationState(model.reconciliation_state.value),
         last_error_code=model.last_error_code,
         version=model.version,
+        config_revision=model.config_revision,
+        query_fingerprint=model.query_fingerprint,
     )

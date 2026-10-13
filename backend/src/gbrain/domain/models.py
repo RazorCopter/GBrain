@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -29,10 +29,17 @@ class Base(DeclarativeBase):
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 
@@ -155,14 +162,16 @@ class ImportJob(TimestampMixin, Base):
     )
     checkpoint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    processed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processed_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_items: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(80))
     error_detail: Mapped[str | None] = mapped_column(String(500))
-    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    config_revision: Mapped[int | None] = mapped_column(Integer)
+    query_fingerprint: Mapped[str | None] = mapped_column(String(64))
 
 
 class SourceItem(TimestampMixin, Base):
@@ -372,6 +381,15 @@ class ConnectorAccount(TimestampMixin, Base):
     checkpoint_state: Mapped[GmailCheckpoint | None] = relationship(
         back_populates="connector_account", uselist=False, cascade="all, delete-orphan"
     )
+    sync_config: Mapped[SourceSyncConfig | None] = relationship(
+        back_populates="connector_account", uselist=False, cascade="all, delete-orphan"
+    )
+    backfill_state: Mapped[GmailBackfillState | None] = relationship(
+        back_populates="connector_account", uselist=False, cascade="all, delete-orphan"
+    )
+    coverage: Mapped[GmailCoverage | None] = relationship(
+        back_populates="connector_account", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class SourcePolicy(TimestampMixin, Base):
@@ -440,8 +458,96 @@ class GmailCheckpoint(TimestampMixin, Base):
     )
     last_error_code: Mapped[str | None] = mapped_column(String(80))
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    config_revision: Mapped[int | None] = mapped_column(Integer)
+    query_fingerprint: Mapped[str | None] = mapped_column(String(64))
 
     connector_account: Mapped[ConnectorAccount] = relationship(back_populates="checkpoint_state")
+
+
+class SourceSyncConfig(TimestampMixin, Base):
+    __tablename__ = "source_sync_configs"
+    __table_args__ = (
+        UniqueConstraint("connector_account_id", name="uq_source_sync_config_account"),
+        CheckConstraint("selection_label = 'SENT'", name="ck_sync_config_sent_only"),
+        CheckConstraint("item_limit > 0", name="ck_sync_config_item_limit"),
+        CheckConstraint("request_budget > 0", name="ck_sync_config_request_budget"),
+        CheckConstraint("batch_size > 0 AND batch_size <= 500", name="ck_sync_config_batch_size"),
+        CheckConstraint("revision > 0", name="ck_sync_config_revision_positive"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    history_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    history_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    selection_label: Mapped[str] = mapped_column(String(32), nullable=False, default="SENT")
+    query_filter: Mapped[str | None] = mapped_column(String(255))
+    item_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    request_budget: Mapped[int] = mapped_column(Integer, nullable=False, default=20000)
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
+    update_policy: Mapped[str] = mapped_column(String(32), nullable=False, default="continuous")
+    query_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    connector_account: Mapped[ConnectorAccount] = relationship(back_populates="sync_config")
+
+
+class GmailBackfillState(TimestampMixin, Base):
+    __tablename__ = "gmail_backfill_states"
+    __table_args__ = (
+        UniqueConstraint("connector_account_id", name="uq_gmail_backfill_state_account"),
+        CheckConstraint(
+            "status IN ('idle', 'running', 'partial', 'completed', 'failed')",
+            name="ck_backfill_state_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    config_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    query_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    history_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    history_before: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    page_token: Mapped[str | None] = mapped_column(String(1024))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle")
+    items_imported: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+
+    connector_account: Mapped[ConnectorAccount] = relationship(back_populates="backfill_state")
+
+
+class GmailCoverage(TimestampMixin, Base):
+    __tablename__ = "gmail_coverages"
+    __table_args__ = (UniqueConstraint("connector_account_id", name="uq_gmail_coverage_account"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    covered_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    covered_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    query_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    config_revision: Mapped[int | None] = mapped_column(Integer)
+    is_legacy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    connector_account: Mapped[ConnectorAccount] = relationship(back_populates="coverage")
 
 
 class AppConfiguration(Base):

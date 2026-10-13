@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import desc, func, select, text
@@ -18,8 +18,12 @@ from gbrain.domain.connectors import RequestBudget
 from gbrain.domain.gmail import (
     GMAIL_READONLY_SCOPE,
     GMAIL_SOURCE_KIND,
+    GmailBackfillStateData,
     GmailSelection,
+    GmailSyncConfigData,
+    GmailSyncMode,
     build_gmail_link,
+    compute_query_fingerprint,
     normalize_email_address,
     resolve_sync_mode,
 )
@@ -33,6 +37,7 @@ from gbrain.domain.models import (
     SourcePolicy,
     SourcePolicyStatus,
     SourceRevision,
+    SourceSyncConfig,
 )
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
 from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
@@ -75,6 +80,57 @@ class PolicyInput:
             "scope": GMAIL_READONLY_SCOPE,
             "perimeter": "SENT",
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SyncConfigInput:
+    history_after: datetime
+    history_before: datetime | None = None
+    selection_label: str = "SENT"
+    query_filter: str | None = None
+    item_limit: int = 10000
+    request_budget: int = 20000
+    batch_size: int = 50
+    update_policy: str = "continuous"
+
+    def validate(self) -> None:
+        if self.history_after.tzinfo is None:
+            raise GmailServiceError(
+                "config_period_invalid", "history_after richiede datetime timezone-aware"
+            )
+        if self.history_before is not None:
+            if self.history_before.tzinfo is None:
+                raise GmailServiceError(
+                    "config_period_invalid", "history_before richiede datetime timezone-aware"
+                )
+            if self.history_after >= self.history_before:
+                raise GmailServiceError(
+                    "config_period_invalid", "history_after deve precedere history_before"
+                )
+        if self.selection_label != "SENT":
+            raise GmailServiceError("config_label_invalid", "Solo il label SENT è supportato")
+        if self.query_filter is not None:
+            normalized_filter = " ".join(self.query_filter.split())
+            if not normalized_filter or len(normalized_filter) > 255:
+                raise GmailServiceError(
+                    "config_filter_invalid", "Filtro Gmail non valido (1-255 caratteri)"
+                )
+            if any(ord(char) < 32 for char in self.query_filter):
+                raise GmailServiceError(
+                    "config_filter_invalid", "Filtro Gmail con caratteri di controllo non ammesso"
+                )
+        if not 1 <= self.item_limit <= 100_000:
+            raise GmailServiceError(
+                "config_limit_invalid", "item_limit fuori intervallo (1-100000)"
+            )
+        if not 1 <= self.request_budget <= 200_000:
+            raise GmailServiceError(
+                "config_budget_invalid", "request_budget fuori intervallo (1-200000)"
+            )
+        if not 1 <= self.batch_size <= 500:
+            raise GmailServiceError("config_batch_invalid", "batch_size fuori intervallo (1-500)")
+        if self.update_policy not in ("continuous", "manual"):
+            raise GmailServiceError("config_policy_invalid", "update_policy non supportata")
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,7 +302,159 @@ async def save_policy(
     policy.status = SourcePolicyStatus.ACTIVE
     await session.commit()
     await session.refresh(policy)
+
+    # Sincronizza anche SourceSyncConfig per coerenza bidirezionale
+    repo = AsyncPostgresGmailRepository(session)
+    fp = compute_query_fingerprint(
+        selection_label="SENT",
+        after=value.after,
+        before=value.before,
+        aliases=account.confirmed_aliases,
+    )
+    cur_cfg = await repo.load_sync_config(account.id)
+    rev = (
+        (cur_cfg.revision + 1)
+        if cur_cfg and cur_cfg.query_fingerprint != fp
+        else (cur_cfg.revision if cur_cfg else 1)
+    )
+    await repo.upsert_sync_config(
+        account.id,
+        GmailSyncConfigData(
+            revision=rev,
+            history_after=value.after,
+            history_before=value.before,
+            selection_label="SENT",
+            item_limit=value.item_limit,
+            request_budget=value.request_budget,
+            batch_size=value.batch_size,
+            update_policy="continuous",
+            query_fingerprint=fp,
+        ),
+    )
+    await session.commit()
     return policy
+
+
+async def get_or_create_sync_config(
+    session: AsyncSession,
+    account: ConnectorAccount,
+) -> SourceSyncConfig:
+    repo = AsyncPostgresGmailRepository(session)
+    config = await repo.load_sync_config(account.id)
+    if config is not None:
+        return config
+    policy = await session.scalar(
+        select(SourcePolicy)
+        .where(SourcePolicy.connector_account_id == account.id)
+        .order_by(desc(SourcePolicy.created_at))
+        .limit(1)
+    )
+    now = datetime.now(UTC)
+    history_after = policy.period_after if policy else now - timedelta(days=90)
+    history_before = policy.period_before if policy else None
+    fp = compute_query_fingerprint(
+        selection_label="SENT",
+        after=history_after,
+        before=history_before,
+        aliases=account.confirmed_aliases,
+    )
+    data = GmailSyncConfigData(
+        revision=1,
+        history_after=history_after,
+        history_before=history_before,
+        selection_label="SENT",
+        item_limit=policy.item_limit if policy else 10000,
+        request_budget=policy.request_budget if policy else 20000,
+        batch_size=policy.batch_size if policy else 50,
+        update_policy="continuous",
+        query_fingerprint=fp,
+    )
+    config = await repo.upsert_sync_config(account.id, data)
+    await session.commit()
+    await session.refresh(config)
+    return config
+
+
+async def update_sync_config(
+    session: AsyncSession,
+    account: ConnectorAccount,
+    value: SyncConfigInput,
+) -> tuple[SourceSyncConfig, bool]:
+    value.validate()
+    # Serializza salvataggi concorrenti e creazione job sul medesimo account.
+    locked_account = await session.scalar(
+        select(ConnectorAccount).where(ConnectorAccount.id == account.id).with_for_update()
+    )
+    if locked_account is None:
+        raise GmailServiceError("gmail_not_found", "Account Gmail non trovato")
+    active_job = await session.scalar(
+        select(ImportJob)
+        .where(
+            ImportJob.connector_account_id == account.id,
+            ImportJob.status.in_((ImportJobStatus.PENDING, ImportJobStatus.RUNNING)),
+        )
+        .limit(1)
+    )
+    if active_job is not None:
+        raise GmailServiceError(
+            "conflict_active_job",
+            "Impossibile modificare la configurazione mentre è in corso un'operazione attiva",
+        )
+
+    repo = AsyncPostgresGmailRepository(session)
+    current = await repo.load_sync_config(account.id)
+    new_fp = compute_query_fingerprint(
+        selection_label=value.selection_label,
+        after=value.history_after,
+        before=value.history_before,
+        query_filter=value.query_filter,
+        aliases=account.confirmed_aliases,
+    )
+
+    if current is None:
+        new_rev = 1
+        changed = True
+    else:
+        changed = (
+            current.query_fingerprint != new_fp
+            or current.item_limit != value.item_limit
+            or current.request_budget != value.request_budget
+            or current.batch_size != value.batch_size
+            or current.update_policy != value.update_policy
+        )
+        new_rev = (current.revision + 1) if changed else current.revision
+
+    data = GmailSyncConfigData(
+        revision=new_rev,
+        history_after=value.history_after,
+        history_before=value.history_before,
+        selection_label=value.selection_label,
+        query_filter=value.query_filter,
+        item_limit=value.item_limit,
+        request_budget=value.request_budget,
+        batch_size=value.batch_size,
+        update_policy=value.update_policy,
+        query_fingerprint=new_fp,
+    )
+    saved = await repo.upsert_sync_config(account.id, data)
+
+    if changed:
+        backfill = await repo.load_backfill_state(account.id)
+        if backfill is not None and backfill.status == "partial":
+            bf_data = GmailBackfillStateData(
+                config_revision=new_rev,
+                query_fingerprint=new_fp,
+                history_after=value.history_after,
+                history_before=value.history_before or value.history_after,
+                page_token=None,
+                status="idle",
+                items_imported=0,
+            )
+            await repo.upsert_backfill_state(account.id, bf_data)
+
+    await session.commit()
+    await session.refresh(saved)
+    return saved, changed
 
 
 def policy_input(policy: SourcePolicy) -> PolicyInput:
@@ -305,7 +513,15 @@ async def create_and_enqueue_job(
         )
     if account.status != ConnectorAccountStatus.ACTIVE:
         raise GmailServiceError("gmail_not_active", "Account Gmail non attivo")
+    config = await get_or_create_sync_config(session, account)
     snapshot = policy_input(policy).snapshot()
+    purpose = (
+        "preview" if mode == "preview" else ("continuous" if mode == "incremental" else "history")
+    )
+    snapshot["purpose"] = purpose
+    snapshot["config_revision"] = config.revision
+    snapshot["query_fingerprint"] = config.query_fingerprint
+
     effective_mode: str = mode
     if mode != "preview":
         repository = AsyncPostgresGmailRepository(session)
@@ -317,9 +533,14 @@ async def create_and_enqueue_job(
         connector_account_id=account.id,
         source_policy_id=policy.id,
         mode=effective_mode,
+        config_revision=config.revision,
+        query_fingerprint=config.query_fingerprint,
         policy_snapshot=snapshot,
         checkpoint={
             "phase": "created",
+            "purpose": purpose,
+            "config_revision": config.revision,
+            "query_fingerprint": config.query_fingerprint,
             "policy": snapshot,
             "persisted_messages": 0 if effective_mode == "preview" else None,
             "checkpoint_advanced": False if effective_mode == "preview" else None,
@@ -348,6 +569,300 @@ async def create_and_enqueue_job(
         job.finished_at = datetime.now(UTC)
         await session.commit()
         raise GmailServiceError("enqueue_failed", "Accodamento Gmail non riuscito") from exc
+    job.queue_job_id = queue_id
+    job.checkpoint = {**job.checkpoint, "phase": "queued", "queue_job_id": queue_id}
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def preview_history_selection(
+    account: ConnectorAccount,
+    settings: Settings,
+    *,
+    after: datetime,
+    before: datetime,
+    item_limit: int = 10000,
+    request_budget: int = 20000,
+    batch_size: int = 50,
+    gateway_factory: GatewayFactory = gateway_for_account,
+) -> PreviewData:
+    if after.tzinfo is None or before.tzinfo is None or after >= before:
+        raise GmailServiceError("policy_period_invalid", "Periodo Gmail non valido")
+    if not account.confirmed_aliases:
+        raise GmailServiceError("alias_required", "Confermare almeno un alias prima della preview")
+    gateway = await asyncio.to_thread(gateway_factory, account, settings)
+    connector = GmailSentConnector(gateway, account.confirmed_aliases)
+    budget = RequestBudget(max_requests=request_budget, max_items=item_limit)
+    result = await asyncio.to_thread(
+        connector.preview_selection,
+        GmailSelection(
+            after=after,
+            before=before,
+            limit=item_limit,
+            page_size=min(batch_size, 500),
+        ),
+        budget,
+    )
+    return PreviewData(
+        selected_items=result.selected_items,
+        pages_read=result.pages_read,
+        request_count=result.requests_used,
+        state=result.state.value,
+        truncated=result.state.value != "complete" or result.next_cursor_present,
+        policy={
+            "after": after.astimezone(UTC).isoformat(),
+            "before": before.astimezone(UTC).isoformat(),
+            "item_limit": item_limit,
+            "request_budget": request_budget,
+            "batch_size": batch_size,
+        },
+    )
+
+
+async def enqueue_continuous_update_job(
+    session: AsyncSession,
+    account: ConnectorAccount,
+    enqueuer: QueueEnqueuer,
+) -> ImportJob:
+    if not account.confirmed_aliases:
+        raise GmailServiceError(
+            "alias_required", "Confermare almeno un alias prima dell'aggiornamento"
+        )
+    if account.status != ConnectorAccountStatus.ACTIVE:
+        raise GmailServiceError("gmail_not_active", "Account Gmail non attivo")
+
+    locked_account = await session.scalar(
+        select(ConnectorAccount).where(ConnectorAccount.id == account.id).with_for_update()
+    )
+    if locked_account is None:
+        raise GmailServiceError("gmail_not_found", "Account Gmail non trovato")
+    config = await get_or_create_sync_config(session, locked_account)
+    policy = await session.scalar(
+        select(SourcePolicy)
+        .where(SourcePolicy.connector_account_id == account.id)
+        .order_by(desc(SourcePolicy.created_at))
+        .limit(1)
+    )
+    if policy is None:
+        policy = SourcePolicy(
+            connector_account_id=account.id,
+            period_after=config.history_after,
+            period_before=datetime.now(UTC),
+            item_limit=config.item_limit,
+            request_budget=config.request_budget,
+            batch_size=config.batch_size,
+            status=SourcePolicyStatus.ACTIVE,
+        )
+        session.add(policy)
+        await session.commit()
+        await session.refresh(policy)
+
+    repository = AsyncPostgresGmailRepository(session)
+    chk = await repository.load_checkpoint(account.id, policy.id)
+    effective_mode = resolve_sync_mode(chk, None).value
+
+    # Snapshot open-ended per l'aggiornamento continuo (nessun before statico persistito!)
+    snapshot = {
+        "purpose": "continuous",
+        "config_revision": config.revision,
+        "query_fingerprint": config.query_fingerprint,
+        "after": config.history_after.astimezone(UTC).isoformat(),
+        "before": None,
+        "query_filter": config.query_filter,
+        "item_limit": config.item_limit,
+        "request_budget": config.request_budget,
+        "batch_size": config.batch_size,
+        "scope": GMAIL_READONLY_SCOPE,
+        "perimeter": "SENT",
+    }
+
+    job = ImportJob(
+        source_kind=GMAIL_SOURCE_KIND,
+        connector_account_id=account.id,
+        source_policy_id=policy.id,
+        mode=effective_mode,
+        config_revision=config.revision,
+        query_fingerprint=config.query_fingerprint,
+        policy_snapshot=snapshot,
+        checkpoint={
+            "phase": "created",
+            "purpose": "continuous",
+            "config_revision": config.revision,
+            "query_fingerprint": config.query_fingerprint,
+            "policy": snapshot,
+            "persisted_messages": None,
+            "checkpoint_advanced": None,
+            "requested_mode": "continuous",
+            "mode_resolved": effective_mode,
+        },
+        status=ImportJobStatus.PENDING,
+    )
+    session.add(job)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise GmailServiceError(
+            "account_job_already_active", "Esiste già un lavoro Gmail attivo per questo account"
+        ) from exc
+    await session.refresh(job)
+
+    try:
+        queue_id = await enqueuer(
+            job_id=str(job.id), account_id=str(account.id), mode=effective_mode
+        )
+    except Exception as exc:
+        job.status = ImportJobStatus.FAILED
+        job.error_code = "enqueue_failed"
+        job.error_detail = "Accodamento persistente non riuscito"
+        job.finished_at = datetime.now(UTC)
+        await session.commit()
+        raise GmailServiceError("enqueue_failed", "Accodamento Gmail non riuscito") from exc
+
+    job.queue_job_id = queue_id
+    job.checkpoint = {**job.checkpoint, "phase": "queued", "queue_job_id": queue_id}
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def enqueue_history_import_job(
+    session: AsyncSession,
+    account: ConnectorAccount,
+    enqueuer: QueueEnqueuer,
+    *,
+    after: datetime | None = None,
+    before: datetime | None = None,
+) -> ImportJob:
+    if not account.confirmed_aliases:
+        raise GmailServiceError(
+            "alias_required", "Confermare almeno un alias prima dell'importazione storico"
+        )
+    if account.status != ConnectorAccountStatus.ACTIVE:
+        raise GmailServiceError("gmail_not_active", "Account Gmail non attivo")
+
+    locked_account = await session.scalar(
+        select(ConnectorAccount).where(ConnectorAccount.id == account.id).with_for_update()
+    )
+    if locked_account is None:
+        raise GmailServiceError("gmail_not_found", "Account Gmail non trovato")
+    config = await get_or_create_sync_config(session, locked_account)
+    effective_after = after or config.history_after
+    effective_before = before or config.history_before or datetime.now(UTC)
+    if (
+        effective_after.tzinfo is None
+        or effective_before.tzinfo is None
+        or effective_after >= effective_before
+    ):
+        raise GmailServiceError("policy_period_invalid", "Intervallo storico Gmail non valido")
+
+    fp = compute_query_fingerprint(
+        selection_label="SENT",
+        after=effective_after,
+        before=effective_before,
+        query_filter=config.query_filter,
+        aliases=account.confirmed_aliases,
+    )
+
+    policy = await session.scalar(
+        select(SourcePolicy)
+        .where(SourcePolicy.connector_account_id == account.id)
+        .order_by(desc(SourcePolicy.created_at))
+        .limit(1)
+    )
+    if policy is None:
+        policy = SourcePolicy(
+            connector_account_id=account.id,
+            period_after=effective_after,
+            period_before=effective_before,
+            item_limit=config.item_limit,
+            request_budget=config.request_budget,
+            batch_size=config.batch_size,
+            status=SourcePolicyStatus.ACTIVE,
+        )
+        session.add(policy)
+        await session.commit()
+        await session.refresh(policy)
+
+    repo = AsyncPostgresGmailRepository(session)
+    bf_state = await repo.load_backfill_state(account.id)
+    resume_token = None
+    if bf_state and bf_state.query_fingerprint == fp and bf_state.status == "partial":
+        resume_token = bf_state.page_token
+
+    await repo.upsert_backfill_state(
+        account.id,
+        GmailBackfillStateData(
+            config_revision=config.revision,
+            query_fingerprint=fp,
+            history_after=effective_after,
+            history_before=effective_before,
+            page_token=resume_token,
+            status="running",
+            items_imported=bf_state.items_imported if (bf_state and resume_token) else 0,
+            last_run_at=datetime.now(UTC),
+        ),
+    )
+
+    snapshot = {
+        "purpose": "history",
+        "config_revision": config.revision,
+        "query_fingerprint": fp,
+        "after": effective_after.astimezone(UTC).isoformat(),
+        "before": effective_before.astimezone(UTC).isoformat(),
+        "query_filter": config.query_filter,
+        "item_limit": config.item_limit,
+        "request_budget": config.request_budget,
+        "batch_size": config.batch_size,
+        "scope": GMAIL_READONLY_SCOPE,
+        "perimeter": "SENT",
+    }
+
+    job = ImportJob(
+        source_kind=GMAIL_SOURCE_KIND,
+        connector_account_id=account.id,
+        source_policy_id=policy.id,
+        mode=GmailSyncMode.FULL.value,
+        config_revision=config.revision,
+        query_fingerprint=fp,
+        policy_snapshot=snapshot,
+        checkpoint={
+            "phase": "created",
+            "purpose": "history",
+            "config_revision": config.revision,
+            "query_fingerprint": fp,
+            "policy": snapshot,
+            "resumption_token": resume_token,
+            "persisted_messages": None,
+            "checkpoint_advanced": None,
+            "requested_mode": "history",
+            "mode_resolved": GmailSyncMode.FULL.value,
+        },
+        status=ImportJobStatus.PENDING,
+    )
+    session.add(job)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise GmailServiceError(
+            "account_job_already_active", "Esiste già un lavoro Gmail attivo per questo account"
+        ) from exc
+    await session.refresh(job)
+
+    try:
+        queue_id = await enqueuer(
+            job_id=str(job.id), account_id=str(account.id), mode=GmailSyncMode.FULL.value
+        )
+    except Exception as exc:
+        job.status = ImportJobStatus.FAILED
+        job.error_code = "enqueue_failed"
+        job.error_detail = "Accodamento persistente non riuscito"
+        job.finished_at = datetime.now(UTC)
+        await session.commit()
+        raise GmailServiceError("enqueue_failed", "Accodamento Gmail non riuscito") from exc
+
     job.queue_job_id = queue_id
     job.checkpoint = {**job.checkpoint, "phase": "queued", "queue_job_id": queue_id}
     await session.commit()

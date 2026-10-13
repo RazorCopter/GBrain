@@ -163,6 +163,10 @@ class OfficialGmailGateway:
             raise BudgetExhaustedError("elementi")
         page_size = min(selection.page_size, item_room)
         query = _temporal_query(selection)
+        if selection.query_filter:
+            # Il filtro è validato e trattato come sintassi di ricerca Gmail intenzionale;
+            # label e limiti temporali restano imposti separatamente dal backend.
+            query = f"{query} ({selection.query_filter})"
         kwargs: dict[str, object] = {
             "userId": "me",
             "labelIds": [GMAIL_SENT_LABEL],

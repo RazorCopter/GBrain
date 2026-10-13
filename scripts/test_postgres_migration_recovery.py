@@ -19,7 +19,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.engine import URL, make_url
 
-HEAD_REVISION = "20261011_0003"
+HEAD_REVISION = "20261013_0005"
 EXPECTED_ENUMS = {
     "import_job_status": ("pending", "running", "completed", "failed", "cancelled"),
     "outbox_status": ("pending", "processing", "completed", "failed"),

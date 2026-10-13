@@ -28,9 +28,15 @@ from gbrain.application.gmail_oauth import (
 from gbrain.application.gmail_service import (
     GmailServiceError,
     PolicyInput,
+    SyncConfigInput,
     create_and_enqueue_job,
+    enqueue_continuous_update_job,
+    enqueue_history_import_job,
     get_gmail_account,
+    get_or_create_sync_config,
+    preview_history_selection,
     save_policy,
+    update_sync_config,
 )
 from gbrain.domain.connectors import (
     RequestBudget,
@@ -38,8 +44,9 @@ from gbrain.domain.connectors import (
     get_source_catalog,
     get_source_descriptor,
 )
-from gbrain.domain.models import ConnectorAccountStatus
+from gbrain.domain.models import ConnectorAccountStatus, ImportJob
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
+from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
 from gbrain.infrastructure.source_credentials_repository import SourceCredentialsRepository
 from gbrain.presentation.dependencies import (
     AppSettings,
@@ -50,7 +57,13 @@ from gbrain.presentation.dependencies import (
 )
 from gbrain.presentation.schemas import (
     ConnectorCapabilitiesResponse,
+    GmailBackfillStateResponse,
+    GmailCoverageResponse,
     GmailOAuthStartResponse,
+    GmailPreviewResponse,
+    HistoryImportRequest,
+    HistoryPreviewRequest,
+    ImportJobResponse,
     ImportPolicyDescriptorResponse,
     LanWarningResponse,
     SourceCatalogItemResponse,
@@ -62,6 +75,8 @@ from gbrain.presentation.schemas import (
     SourcePreviewResponse,
     SourcePreviewSampleItem,
     SourceStatusResponse,
+    SourceSyncConfigRequest,
+    SourceSyncConfigResponse,
     SourceSyncRequest,
     SourceSyncResponse,
     SourceTestConnectionResponse,
@@ -248,6 +263,63 @@ async def get_source_status(
                     checkpoint_model
                 ).is_initial_complete
 
+        sync_config_resp: SourceSyncConfigResponse | None = None
+        coverage_resp: GmailCoverageResponse | None = None
+        backfill_resp: GmailBackfillStateResponse | None = None
+        requires_import = False
+        last_sync_at: datetime | None = None
+
+        if account:
+            repo = AsyncPostgresGmailRepository(session)
+            cfg = await get_or_create_sync_config(session, account)
+            sync_config_resp = SourceSyncConfigResponse(
+                id=cfg.id,
+                revision=cfg.revision,
+                history_after=cfg.history_after,
+                history_before=cfg.history_before,
+                selection_label=cfg.selection_label,
+                query_filter=cfg.query_filter,
+                item_limit=cfg.item_limit,
+                request_budget=cfg.request_budget,
+                batch_size=cfg.batch_size,
+                update_policy=cfg.update_policy,
+                query_fingerprint=cfg.query_fingerprint,
+                created_at=cfg.created_at,
+                updated_at=cfg.updated_at,
+            )
+
+            cov = await repo.load_coverage(account.id)
+            if cov:
+                coverage_resp = GmailCoverageResponse(
+                    covered_after=cov.covered_after,
+                    covered_before=cov.covered_before,
+                    query_fingerprint=cov.query_fingerprint,
+                    config_revision=cov.config_revision,
+                    is_legacy=cov.is_legacy,
+                    last_completed_at=cov.last_completed_at,
+                )
+                if cov.query_fingerprint != cfg.query_fingerprint or cov.is_legacy:
+                    requires_import = True
+            else:
+                requires_import = True
+
+            bf = await repo.load_backfill_state(account.id)
+            if bf:
+                backfill_resp = GmailBackfillStateResponse(
+                    config_revision=bf.config_revision,
+                    query_fingerprint=bf.query_fingerprint,
+                    history_after=bf.history_after,
+                    history_before=bf.history_before,
+                    page_token=bf.page_token,
+                    status=bf.status,
+                    items_imported=bf.items_imported,
+                    last_run_at=bf.last_run_at,
+                    last_error_code=bf.last_error_code,
+                )
+
+            if checkpoint_model and checkpoint_model.last_sync_at:
+                last_sync_at = checkpoint_model.last_sync_at
+
         return SourceStatusResponse(
             source_id=source_id,
             availability=descriptor.status.value,
@@ -266,6 +338,11 @@ async def get_source_status(
             has_checkpoint=has_checkpoint,
             checkpoint_history_id=checkpoint_history_id,
             checkpoint_page_token=checkpoint_page_token,
+            sync_config=sync_config_resp,
+            coverage=coverage_resp,
+            backfill_state=backfill_resp,
+            requires_import=requires_import,
+            last_sync_at=last_sync_at,
         )
 
     # Per connettori coming_soon
@@ -609,6 +686,33 @@ async def trigger_source_sync(
             detail="Account Gmail non connesso o non attivo.",
         )
 
+    from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
+
+    async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
+        return await procrastinate.configure_task(
+            GMAIL_TASK_NAME,
+            queue="gmail",
+            lock="gmail-heavy-global",
+        ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
+
+    # Se la richiesta è incrementale o priva di date fisse, usiamo l'aggiornamento continuo backend-authoritative
+    if body.mode == "incremental" or (body.period_after is None and body.period_before is None):
+        try:
+            job = await enqueue_continuous_update_job(session, account, enqueue)
+        except GmailServiceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=exc.safe_message,
+            ) from exc
+        return SourceSyncResponse(
+            source_id=source_id,
+            job_id=str(job.id),
+            queue_job_id=job.queue_job_id,
+            status=job.status.value,
+            mode=job.mode or "incremental",
+            message=f"Job di sincronizzazione Gmail avviato in modalità {job.mode}.",
+        )
+
     before_dt = body.period_before or datetime.now(UTC)
     after_dt = body.period_after or (before_dt - timedelta(days=30))
     if after_dt >= before_dt:
@@ -616,8 +720,6 @@ async def trigger_source_sync(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="La data iniziale (period_after) deve essere precedente alla data finale (period_before).",
         )
-
-    from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
 
     policy_data = PolicyInput(
         after=after_dt,
@@ -627,13 +729,6 @@ async def trigger_source_sync(
         batch_size=body.batch_size,
     )
     policy = await save_policy(session, account, policy_data)
-
-    async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
-        return await procrastinate.configure_task(
-            GMAIL_TASK_NAME,
-            queue="gmail",
-            lock="gmail-heavy-global",
-        ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
 
     try:
         job = await create_and_enqueue_job(
@@ -651,12 +746,205 @@ async def trigger_source_sync(
 
     return SourceSyncResponse(
         source_id=source_id,
-        job_id=job.id,
+        job_id=str(job.id),
         queue_job_id=job.queue_job_id,
         status=job.status.value,
-        mode=job.mode,
+        mode=job.mode or body.mode,
         message=f"Job di sincronizzazione Gmail avviato in modalità {job.mode}.",
     )
+
+
+@sources_router.get("/{source_id}/config", response_model=SourceSyncConfigResponse)
+async def get_source_config(
+    source_id: str,
+    session: DbSession,
+    principal: PrincipalDep,
+) -> SourceSyncConfigResponse:
+    if source_id != "gmail":
+        raise HTTPException(
+            status_code=400, detail=f"Configurazione non disponibile per '{source_id}'"
+        )
+    account = await get_gmail_account(session, principal.owner.id, required=False)
+    if (
+        account is None
+        or account.status != ConnectorAccountStatus.ACTIVE
+        or not account.oauth_token_ciphertext
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account Gmail non connesso o non attivo.",
+        )
+    cfg = await get_or_create_sync_config(session, account)
+    return SourceSyncConfigResponse(
+        id=cfg.id,
+        revision=cfg.revision,
+        history_after=cfg.history_after,
+        history_before=cfg.history_before,
+        selection_label=cfg.selection_label,
+        query_filter=cfg.query_filter,
+        item_limit=cfg.item_limit,
+        request_budget=cfg.request_budget,
+        batch_size=cfg.batch_size,
+        update_policy=cfg.update_policy,
+        query_fingerprint=cfg.query_fingerprint,
+        created_at=cfg.created_at,
+        updated_at=cfg.updated_at,
+    )
+
+
+@sources_router.put("/{source_id}/config", response_model=SourceSyncConfigResponse)
+async def update_source_config_endpoint(
+    source_id: str,
+    payload: SourceSyncConfigRequest,
+    session: DbSession,
+    principal: CsrfPrincipalDep,
+) -> SourceSyncConfigResponse:
+    if source_id != "gmail":
+        raise HTTPException(
+            status_code=400, detail=f"Configurazione non disponibile per '{source_id}'"
+        )
+    account = await get_gmail_account(session, principal.owner.id, required=False)
+    if (
+        account is None
+        or account.status != ConnectorAccountStatus.ACTIVE
+        or not account.oauth_token_ciphertext
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account Gmail non connesso o non attivo.",
+        )
+    input_data = SyncConfigInput(
+        history_after=payload.history_after,
+        history_before=payload.history_before,
+        selection_label=payload.selection_label,
+        query_filter=payload.query_filter,
+        item_limit=payload.item_limit,
+        request_budget=payload.request_budget,
+        batch_size=payload.batch_size,
+        update_policy=payload.update_policy,
+    )
+    try:
+        cfg, _ = await update_sync_config(session, account, input_data)
+    except GmailServiceError as exc:
+        if exc.code == "conflict_active_job":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=exc.safe_message
+        ) from exc
+
+    return SourceSyncConfigResponse(
+        id=cfg.id,
+        revision=cfg.revision,
+        history_after=cfg.history_after,
+        history_before=cfg.history_before,
+        selection_label=cfg.selection_label,
+        query_filter=cfg.query_filter,
+        item_limit=cfg.item_limit,
+        request_budget=cfg.request_budget,
+        batch_size=cfg.batch_size,
+        update_policy=cfg.update_policy,
+        query_fingerprint=cfg.query_fingerprint,
+        created_at=cfg.created_at,
+        updated_at=cfg.updated_at,
+    )
+
+
+@sources_router.post("/{source_id}/history/preview", response_model=GmailPreviewResponse)
+async def preview_history_endpoint(
+    source_id: str,
+    payload: HistoryPreviewRequest,
+    session: DbSession,
+    settings: AppSettings,
+    principal: PrincipalDep,
+) -> GmailPreviewResponse:
+    if source_id != "gmail":
+        raise HTTPException(status_code=400, detail=f"Anteprima non disponibile per '{source_id}'")
+    account = await get_gmail_account(session, principal.owner.id, required=False)
+    if (
+        account is None
+        or account.status != ConnectorAccountStatus.ACTIVE
+        or not account.oauth_token_ciphertext
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account Gmail non connesso o non attivo.",
+        )
+    try:
+        preview = await preview_history_selection(
+            account,
+            settings,
+            after=payload.after,
+            before=payload.before,
+            item_limit=payload.item_limit,
+            request_budget=payload.request_budget,
+            batch_size=payload.batch_size,
+        )
+    except GmailServiceError as exc:
+        raise HTTPException(status_code=400, detail=exc.safe_message) from exc
+    return GmailPreviewResponse(
+        job_id=None,
+        selected_items=preview.selected_items,
+        pages_read=preview.pages_read,
+        requests_used=preview.request_count,
+        state=preview.state,
+        truncated=preview.truncated,
+        policy=preview.policy,
+    )
+
+
+@sources_router.post(
+    "/{source_id}/history/import",
+    response_model=ImportJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def import_history_endpoint(
+    source_id: str,
+    payload: HistoryImportRequest,
+    session: DbSession,
+    procrastinate: ProcrastinateApp,
+    principal: CsrfPrincipalDep,
+) -> ImportJob:
+    if source_id != "gmail":
+        raise HTTPException(
+            status_code=400, detail=f"Importazione storico non disponibile per '{source_id}'"
+        )
+    account = await get_gmail_account(session, principal.owner.id, required=False)
+    if (
+        account is None
+        or account.status != ConnectorAccountStatus.ACTIVE
+        or not account.oauth_token_ciphertext
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account Gmail non connesso o non attivo.",
+        )
+    from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
+
+    async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
+        return await procrastinate.configure_task(
+            GMAIL_TASK_NAME,
+            queue="gmail",
+            lock="gmail-heavy-global",
+        ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
+
+    try:
+        return await enqueue_history_import_job(
+            session,
+            account,
+            enqueue,
+            after=payload.after,
+            before=payload.before,
+        )
+    except GmailServiceError as exc:
+        if exc.code == "account_job_already_active":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=exc.safe_message
+        ) from exc
 
 
 @sources_router.delete("/{source_id}", response_model=SourceDisconnectResponse)

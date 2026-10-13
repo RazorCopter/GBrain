@@ -1,9 +1,9 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
 **Data checkpoint:** 13 ottobre 2026
-**Checkpoint:** Fase H — Connettività Internet worker Gmail, isolamento reti Compose e classificazione transitoria errori trasporto/DNS OAuth
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con connettività di rete del worker (`edge` + `backend`), preservando l'isolamento interno per PostgreSQL e Neo4j (`backend: internal: true`, nessuna porta worker); gestione e classificazione transitoria accurata della catena di errori DNS (`NameResolutionError`), timeout, TLS e trasporto in `refresh_credentials` e gateway con retry controllati via Procrastinate (`GmailOAuthTransientError` -> `GmailJobTransientError`) senza revoca account; distinzione dagli errori permanenti (`invalid_grant`, revoca) che restano non ritentati; sanitizzazione rinforzata per access token, refresh token, secret, auth code, cookie, email e callback URL completi; collaudo runtime reale su container worker con probe DNS e handshake TLS HTTPS verso `oauth2.googleapis.com` e `gmail.googleapis.com` superato con successo; suite test estesa a **172 test superati** (177 totali raccolti, 5 skipped).
-**Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo, UI e infrastrutturale Compose; verificata connettività DNS/HTTPS dal worker; pronto per configurazione con account reali Google Cloud; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
+**Checkpoint:** Fase I — Gestione persistente della fonte Gmail oltre il wizard, separazione configurazione/backfill/copertura/checkpoint e aggiornamento continuo open-ended
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata; Fase 2 Gmail `SENT` implementata end-to-end oltre il wizard con persistenza dedicata della configurazione sorgente (`SourceSyncConfig`), stato/cursore del backfill separato (`GmailBackfillState`), copertura completata (`GmailCoverage`) e fencing di checkpoint/cambi tramite revisione e query fingerprint; aggiornamento continuo "Aggiorna ora" backend-authoritative con upper bound dinamico a runtime nel worker (`datetime.now(UTC)`) senza `before` storico statico; filtro Gmail validato, incluso nello snapshot immutabile e nel payload `messages.list`; migrazione Alembic additiva singola head lineare (`20261013_0005`) provata su PostgreSQL 16 effimero nel ciclo `0004→0005→0004→0005`; collaudo locale API/persistenza/worker eseguito con successo su PostgreSQL 16 effimero; dashboard persistente React in [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) con sezioni distinte, anteprima senza mutazioni e avviso esplicito che il cambio filtro non rimuove/reindicizza automaticamente dati già importati; suite test: **185 superati, 5 skipped su 190 raccolti**.
+**Giudizio di prontezza:** controlli automatici locali superati (pytest, Ruff check/format, Mypy, build Vite) e migrazione PostgreSQL effimera verificata. Il working tree è tecnicamente pronto per revisione/commit, ma non consente ancora di dichiarare collaudata l'integrazione Google reale: OAuth, Gmail History API e semantica temporale devono essere validati con un account test Google Cloud senza dati personali. La semantica del cambio filtro resta intenzionalmente additiva e dichiarata in UI.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
 ## Regola di lettura dello stato
@@ -76,17 +76,21 @@ Nel ciclo di implementazione del **Source Connection Wizard** sono stati consoli
 
 Tutti i controlli deterministici sono stati eseguiti localmente con esito positivo:
 
-- **Pytest:** `uv run pytest backend/tests -v`
-  - **172 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
-  - 0 fallimenti, 0 errori (177 raccolti).
+- **Pytest:** `uv run pytest`
+  - **185 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
+  - 0 fallimenti, 0 errori (**190 test raccolti**).
 - **Ruff linter:** `uv run ruff check backend scripts`
   - **Superato:** 0 errori, 0 avvisi.
 - **Ruff formatter:** `uv run ruff format --check backend scripts`
-  - **Superato:** 60 file formattati in modo conforme.
+  - **Superato:** 62 file formattati in modo conforme.
 - **Mypy type check:** `uv run mypy backend/src backend/tests scripts`
-  - **Superato:** Successo su tutti i 55 file sorgente, 0 errori di tipo.
-- **Frontend TypeScript & Build:** `npm --prefix frontend run build`
-  - **Superato:** Type check `tsc -b` superato, bundle Vite completato senza errori.
+  - **Superato:** Successo su tutti i 56 file sorgente, 0 errori di tipo.
+- **Frontend TypeScript & Build:** `npm --prefix frontend run typecheck && npm --prefix frontend run build`
+  - **Superato:** Type check `tsc --noEmit` superato, `tsc -b` e bundle Vite di produzione (19 moduli) generato con successo.
+- **Collaudo Migrazione Alembic Effimera:** ciclo `0004 → 0005 → 0004 → 0005`
+  - **Superato:** Eseguito su PostgreSQL 16 Alpine containerizzato effimero (`gbrain-migration-ephemeral`), con bootstrap conservativo dei record legacy (revisione 1, policy `continuous`, `is_legacy=true`, backfill `idle`), verifica vincoli (`ck_sync_config_sent_only`, `ck_sync_config_batch_size`), tabelle `source_sync_configs`, `gmail_backfill_states`, `gmail_coverages` e colonne additive `config_revision`, `query_fingerprint` su `import_jobs` e `gmail_checkpoints`.
+- **Collaudo Runtime Locale (API / Worker / Database effimero):**
+  - **Superato:** Eseguita catena creazione configurazione sorgente -> aggiornamento a revisione 2 con filtro `has:attachment` -> accodamento open-ended job continuo -> esecuzione worker con `FakeGmailGateway` -> persistenza batch e avanzamento checkpoint History API e aggiornamento copertura (`config_revision=2`, `is_legacy=False`) su PostgreSQL effimero.
 - **Docker Compose Validation:** `docker compose config` / `docker compose --profile compact config`
   - **Superato:** 0 errori sintattici o strutturali; isolate reti `backend` (internal) ed `edge` per worker; zero porte worker/postgres/neo4j.
 - **Collaudo Connettività Worker:** [`scripts/verify_worker_connectivity.py`](scripts/verify_worker_connectivity.py)
@@ -172,3 +176,19 @@ La Fase 2 Gmail `SENT` è formalmente **chiusa a livello di codice e test determ
    - **P3-004:** Integrazione ricerca ibrida: FTS lessicale PostgreSQL + ricerca semantica vettoriale (pgvector) + esplorazione relazioni sul grafo Neo4j.
 4. **Connettore Secondario Immich (Architettura Connettori):**
    - Implementazione connettore Immich (asset foto/video, metadata EXIF, timestamp geografici) secondo il contratto `ConnectorCapability` in [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py).
+
+---
+
+## Verifiche e Prove Eseguite (Fase I — Gestione Persistente Fonte Gmail)
+
+1. **Test di Unità e Regressione E2E:**
+  - Esecuzione `uv run pytest`: **178 superati, 5 skipped** (183 raccolti).
+  - Nuova suite mirata [`backend/tests/test_gmail_persistent_source_e2e.py`](backend/tests/test_gmail_persistent_source_e2e.py:1): 6/6 test superati a copertura degli scenari A (import storico e copertura coerente), B (aggiornamento continuo senza riuso upper bound statico), C (ampliamento storico verso il passato), D (idempotenza), E (ripresa con page token), F (invalidazione token e nuova revisione su cambio filtri) e relative API.
+2. **Controllo Statico e Formattazione:**
+  - `uv run ruff check backend`: superato (0 errori).
+  - `uv run ruff format --check backend`: superato (59 file formattati).
+  - `uv run mypy backend/src`: superato (Success: no issues found in 34 source files).
+3. **Build Frontend:**
+  - `npm run build` in `frontend/`: superato senza warning TypeScript o Vite.
+4. **Linearità Migrazioni Alembic:**
+  - `uv run alembic heads`: superato con head lineare `20261013_0005`.

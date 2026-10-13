@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.headerregistry import Address
@@ -60,6 +60,7 @@ class GmailSelection:
     before: datetime
     limit: int
     page_size: int = 100
+    query_filter: str | None = None
 
     def __post_init__(self) -> None:
         if self.after.tzinfo is None or self.before.tzinfo is None:
@@ -70,6 +71,13 @@ class GmailSelection:
             raise ValueError("limit deve essere positivo")
         if not 1 <= self.page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page_size deve essere compreso tra 1 e {MAX_PAGE_SIZE}")
+        if self.query_filter is not None:
+            normalized = " ".join(self.query_filter.split())
+            if not normalized or len(normalized) > 255:
+                raise ValueError("query_filter Gmail non valido")
+            if any(ord(char) < 32 for char in self.query_filter):
+                raise ValueError("query_filter Gmail contiene caratteri di controllo")
+            object.__setattr__(self, "query_filter", normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +292,8 @@ class GmailCheckpointState:
     reconciliation_state: GmailReconciliationState
     last_error_code: str | None = None
     version: int = 1
+    config_revision: int | None = None
+    query_fingerprint: str | None = None
 
     def require_full_reconciliation(self, error_code: str) -> GmailCheckpointState:
         return GmailCheckpointState(
@@ -297,6 +307,8 @@ class GmailCheckpointState:
             reconciliation_state=GmailReconciliationState.REQUIRED_HISTORY_EXPIRED,
             last_error_code=error_code,
             version=self.version,
+            config_revision=self.config_revision,
+            query_fingerprint=self.query_fingerprint,
         )
 
     @property
@@ -358,6 +370,72 @@ def resolve_sync_mode(
         return GmailSyncMode.FULL
 
     return GmailSyncMode.INCREMENTAL
+
+
+def compute_query_fingerprint(
+    *,
+    selection_label: str = GMAIL_SENT_LABEL,
+    after: datetime,
+    before: datetime | None = None,
+    query_filter: str | None = None,
+    aliases: Sequence[str] = (),
+) -> str:
+    norm_after = (
+        after.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if after.tzinfo else after.isoformat()
+    )
+    norm_before = (
+        before.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if before and before.tzinfo
+        else (before.isoformat() if before else "")
+    )
+    norm_filter = (query_filter or "").strip()
+    norm_aliases = sorted(normalize_email_address(a) or a.lower().strip() for a in aliases)
+    payload = {
+        "label": selection_label.strip(),
+        "after": norm_after,
+        "before": norm_before,
+        "filter": norm_filter,
+        "aliases": norm_aliases,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class GmailSyncConfigData:
+    revision: int
+    history_after: datetime
+    history_before: datetime | None
+    selection_label: str = GMAIL_SENT_LABEL
+    query_filter: str | None = None
+    item_limit: int = 10000
+    request_budget: int = 20000
+    batch_size: int = 50
+    update_policy: str = "continuous"
+    query_fingerprint: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class GmailBackfillStateData:
+    config_revision: int
+    query_fingerprint: str
+    history_after: datetime
+    history_before: datetime
+    page_token: str | None = None
+    status: str = "idle"
+    items_imported: int = 0
+    last_run_at: datetime | None = None
+    last_error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GmailCoverageData:
+    covered_after: datetime | None = None
+    covered_before: datetime | None = None
+    query_fingerprint: str | None = None
+    config_revision: int | None = None
+    is_legacy: bool = False
+    last_completed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

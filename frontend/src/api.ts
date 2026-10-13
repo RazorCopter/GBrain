@@ -224,6 +224,48 @@ export interface SourceStatusResponse {
     has_checkpoint?: boolean
     checkpoint_history_id?: string | null
     checkpoint_page_token?: string | null
+    sync_config?: SourceSyncConfig | null
+    coverage?: GmailCoverage | null
+    backfill_state?: GmailBackfillState | null
+    requires_import?: boolean
+    last_sync_at?: string | null
+}
+
+export interface SourceSyncConfig {
+    id: string
+    revision: number
+    history_after: string
+    history_before: string | null
+    selection_label: string
+    query_filter: string | null
+    item_limit: number
+    request_budget: number
+    batch_size: number
+    update_policy: string
+    query_fingerprint: string
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface GmailCoverage {
+    covered_after: string | null
+    covered_before: string | null
+    query_fingerprint: string | null
+    config_revision: number | null
+    is_legacy: boolean
+    last_completed_at: string | null
+}
+
+export interface GmailBackfillState {
+    config_revision: number
+    query_fingerprint: string
+    history_after: string
+    history_before: string
+    page_token: string | null
+    status: 'idle' | 'running' | 'partial' | 'completed' | 'failed' | string
+    items_imported: number
+    last_run_at: string | null
+    last_error_code: string | null
 }
 
 export interface SourceCredentialsUploadPayload {
@@ -461,5 +503,30 @@ export const api = {
     startSourceOAuth: (sourceId: string) =>
         request<GmailOAuthStartResponse>(`/api/sources/${encodeURIComponent(sourceId)}/oauth/authorize`, {
             method: 'POST',
+        }),
+    fetchSourceConfig: (sourceId: string) =>
+        request<SourceSyncConfig>(`/api/sources/${encodeURIComponent(sourceId)}/config`),
+    updateSourceConfig: (sourceId: string, payload: Partial<SourceSyncConfig>) =>
+        request<SourceSyncConfig>(`/api/sources/${encodeURIComponent(sourceId)}/config`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+        }),
+    previewSourceHistory: (
+        sourceId: string,
+        payload: { after: string; before: string; item_limit?: number; request_budget?: number; batch_size?: number },
+    ) =>
+        request<GmailPreview>(`/api/sources/${encodeURIComponent(sourceId)}/history/preview`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+        }),
+    startSourceHistoryImport: (sourceId: string, payload?: { after?: string; before?: string }) =>
+        request<ImportJob>(`/api/sources/${encodeURIComponent(sourceId)}/history/import`, {
+            method: 'POST',
+            body: payload ? JSON.stringify(payload) : undefined,
+        }),
+    startContinuousSync: (sourceId: string) =>
+        request<SourceSyncResponse>(`/api/sources/${encodeURIComponent(sourceId)}/sync`, {
+            method: 'POST',
+            body: JSON.stringify({ mode: 'incremental' }),
         }),
 }

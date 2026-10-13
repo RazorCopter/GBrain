@@ -119,7 +119,7 @@ class GmailPolicyResponse(GmailPolicyRequest):
 
 
 class GmailPreviewResponse(BaseModel):
-    job_id: UUID
+    job_id: UUID | None = None
     selected_items: int
     pages_read: int
     requests_used: int
@@ -263,6 +263,67 @@ class LanWarningResponse(BaseModel):
     message: str
 
 
+class SourceSyncConfigRequest(BaseModel):
+    history_after: datetime
+    history_before: datetime | None = None
+    selection_label: str = "SENT"
+    query_filter: str | None = None
+    item_limit: int = Field(default=10000, ge=1, le=100000)
+    request_budget: int = Field(default=20000, ge=1, le=200000)
+    batch_size: int = Field(default=50, ge=1, le=500)
+    update_policy: str = "continuous"
+
+
+class SourceSyncConfigResponse(BaseModel):
+    id: UUID
+    revision: int
+    history_after: datetime
+    history_before: datetime | None
+    selection_label: str
+    query_filter: str | None
+    item_limit: int
+    request_budget: int
+    batch_size: int
+    update_policy: str
+    query_fingerprint: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class GmailCoverageResponse(BaseModel):
+    covered_after: datetime | None = None
+    covered_before: datetime | None = None
+    query_fingerprint: str | None = None
+    config_revision: int | None = None
+    is_legacy: bool = False
+    last_completed_at: datetime | None = None
+
+
+class GmailBackfillStateResponse(BaseModel):
+    config_revision: int
+    query_fingerprint: str
+    history_after: datetime
+    history_before: datetime
+    page_token: str | None = None
+    status: str
+    items_imported: int = 0
+    last_run_at: datetime | None = None
+    last_error_code: str | None = None
+
+
+class HistoryPreviewRequest(BaseModel):
+    after: datetime
+    before: datetime
+    item_limit: int = Field(default=10000, ge=1, le=100000)
+    request_budget: int = Field(default=20000, ge=1, le=200000)
+    batch_size: int = Field(default=50, ge=1, le=500)
+
+
+class HistoryImportRequest(BaseModel):
+    after: datetime | None = None
+    before: datetime | None = None
+
+
 class SourceStatusResponse(BaseModel):
     source_id: str
     availability: str = "fully_available"
@@ -281,6 +342,11 @@ class SourceStatusResponse(BaseModel):
     has_checkpoint: bool = False
     checkpoint_history_id: str | None = None
     checkpoint_page_token: str | None = None
+    sync_config: SourceSyncConfigResponse | None = None
+    coverage: GmailCoverageResponse | None = None
+    backfill_state: GmailBackfillStateResponse | None = None
+    requires_import: bool = False
+    last_sync_at: datetime | None = None
 
 
 class SourceCredentialsUploadRequest(BaseModel):
