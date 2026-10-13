@@ -55,8 +55,11 @@ Nel ciclo di implementazione del **Source Connection Wizard** sono stati consoli
    - Conservazione confidenziale dei campi sensibili (`encrypted_client_secret`, `encrypted_extra_config`) cifrati con AES-256-GCM a 256 bit e IV casuale a 96 bit via [`backend/src/gbrain/application/crypto.py`](backend/src/gbrain/application/crypto.py:1).
    - Risoluzione gerarchica delle credenziali: il repository interroga prioritariamente il database relazionale; se assente, esegue il fallback non distruttivo sui secret montati da filesystem (`/run/secrets/gmail_oauth_client`).
 3. **Interfaccia Utente Reattiva e Source Wizard:**
-   - Componente [`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1) per la configurazione assistita in modalità upload file JSON Google o compilazione manuale dei campi (`Client ID`, `Client Secret`).
-   - Schermata panoramica [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) con raggruppamento per stato (fonti connesse vs catalogo connettori disponibili) e navigazione fluida verso il connettore Gmail o il wizard di attivazione.
+    - Componente [`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1) per la configurazione assistita in modalità upload file JSON Google o compilazione manuale dei campi (`Client ID`, `Client Secret`).
+    - Schermata panoramica [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) con raggruppamento per stato (fonti connesse vs catalogo connettori disponibili) e navigazione fluida verso il connettore Gmail o il wizard di attivazione.
+4. **Resilienza Flusso OAuth Google e Gestione Session Cookie:**
+    - Configurazione del cookie di sessione con `SameSite=Lax` (default e parametro `session_samesite_cookie` in [`backend/src/gbrain/config.py`](backend/src/gbrain/config.py:63)) per preservare la sessione autenticata durante il redirect cross-site di callback OAuth da Google.
+    - Gestione robusta dei callback OAuth con parametri di errore ed eventuale consenso negato dall'utente in [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:672) e [`backend/src/gbrain/presentation/gmail_api.py`](backend/src/gbrain/presentation/gmail_api.py:164) con reindirizzamento coerente alla vista `/sources` e feedback visivo.
 
 ---
 

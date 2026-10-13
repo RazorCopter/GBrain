@@ -38,3 +38,8 @@ def test_session_token_is_not_stored_in_plaintext() -> None:
 
     assert len(session.token_hash) == 32
     assert issued.raw_token.encode() not in session.token_hash
+
+
+def test_auth_settings_session_samesite_default_is_lax() -> None:
+    settings = _settings()
+    assert settings.session_samesite_cookie == "lax"

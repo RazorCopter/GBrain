@@ -672,17 +672,32 @@ async def start_source_oauth(
 @sources_router.get("/{source_id}/oauth/callback")
 async def source_oauth_callback(
     source_id: str,
-    code: str = Query(...),
-    state: str = Query(...),
-    session: DbSession = ...,  # type: ignore[assignment]
-    settings: AppSettings = ...,  # type: ignore[assignment]
-    principal: PrincipalDep = ...,  # type: ignore[assignment]
+    session: DbSession,
+    settings: AppSettings,
+    principal: PrincipalDep,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
 ) -> RedirectResponse:
     """Callback OAuth 2.0 di ritorno: perfeziona lo scambio del token e reindirizza alla UI."""
     if source_id != "gmail":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"OAuth callback non supportato per '{source_id}'.",
+        )
+
+    if error:
+        logger.warning("Callback OAuth rifiutata dall'utente per sorgente %s: %s", source_id, error)
+        return RedirectResponse(
+            url=f"/sources?error={error}",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    if not code or not state:
+        logger.warning("Callback OAuth incompleta per sorgente %s", source_id)
+        return RedirectResponse(
+            url="/sources?error=Callback OAuth incompleta",
+            status_code=status.HTTP_302_FOUND,
         )
 
     try:
@@ -694,7 +709,10 @@ async def source_oauth_callback(
             code=code,
             state=state,
         )
-        return RedirectResponse(url="/sources?connected=gmail", status_code=status.HTTP_302_FOUND)
+        return RedirectResponse(
+            url="/sources?connected=gmail&gmail_connected=1",
+            status_code=status.HTTP_302_FOUND,
+        )
     except GmailOAuthError as exc:
         logger.warning("Callback OAuth fallita per sorgente %s: %s", source_id, exc)
         return RedirectResponse(

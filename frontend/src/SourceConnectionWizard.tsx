@@ -132,19 +132,32 @@ export function SourceConnectionWizard({
     useEffect(() => {
         const urlParams = new URLSearchParams(window.location.search)
         const connectedParam = urlParams.get('connected')
+        const gmailConnectedParam = urlParams.get('gmail_connected')
+        const gmailParam = urlParams.get('gmail')
         const errorParam = urlParams.get('error')
 
-        if (connectedParam === 'gmail') {
+        const isGmailConnected =
+            connectedParam === 'gmail' ||
+            gmailConnectedParam === '1' ||
+            gmailParam === 'connected'
+
+        const isGmailError =
+            errorParam ||
+            (gmailParam === 'oauth_error' ? 'Errore durante autorizzazione OAuth' : null) ||
+            (gmailParam === 'consent_denied' ? 'Consenso negato da Google' : null)
+
+        if (isGmailConnected) {
             setSelectedSourceId('gmail')
             refreshStatus('gmail').then((st) => {
                 if (st?.account_connected) {
                     setCurrentStep(4)
+                    handleTestConnection('gmail')
                 }
             })
-            // Rimuovi parametri dalla query senza ricaricare la pagina
+            // Rimuovi parametri dalla query senza ricaricare la pagina preservando il path
             window.history.replaceState({}, '', window.location.pathname)
-        } else if (errorParam) {
-            setOauthError(decodeURIComponent(errorParam))
+        } else if (isGmailError) {
+            setOauthError(decodeURIComponent(isGmailError))
             refreshStatus('gmail')
             window.history.replaceState({}, '', window.location.pathname)
         } else {
@@ -301,11 +314,12 @@ export function SourceConnectionWizard({
     }
 
     // Esecuzione test connessione nello Step 4
-    async function handleTestConnection() {
+    async function handleTestConnection(targetSourceId?: string) {
+        const sourceId = typeof targetSourceId === 'string' ? targetSourceId : selectedSourceId
         setTestingConnection(true)
         setTestError('')
         try {
-            const res = await api.testSourceConnection(selectedSourceId)
+            const res = await api.testSourceConnection(sourceId)
             setTestResult(res)
             if (!res.connected) {
                 setTestError(res.message || 'La connessione alla fonte non è riuscita.')
@@ -922,7 +936,7 @@ export function SourceConnectionWizard({
                                     type="button"
                                     className="secondary"
                                     disabled={testingConnection}
-                                    onClick={handleTestConnection}
+                                    onClick={() => handleTestConnection()}
                                 >
                                     {testingConnection ? 'Test in corso…' : 'Ripeti test'}
                                 </button>

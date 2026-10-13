@@ -40,7 +40,7 @@ Il cambio di `GBRAIN_AUTH_SECRET` rende non verificabili i token/CSRF precedenti
 
 ## Bootstrap e autenticazione
 
-Il bootstrap crea un unico proprietario e si chiude transazionalmente. La password è Argon2id; i token sessione e CSRF sono memorizzati come digest. Cookie sessione: HttpOnly, SameSite Strict; cookie CSRF leggibile dal frontend e confrontato con header e digest server-side.
+Il bootstrap crea un unico proprietario e si chiude transazionalmente. La password è Argon2id; i token sessione e CSRF sono memorizzati come digest. Cookie sessione: HttpOnly, SameSite Lax (configurabile tramite `GBRAIN_SESSION_SAMESITE_COOKIE`, default `lax` per supportare il re-entry delle navigazioni di callback OAuth cross-site come Google); cookie CSRF leggibile dal frontend e confrontato con header `X-CSRF-Token` e digest server-side per qualsiasi operazione mutante.
 
 Controlli:
 
@@ -53,7 +53,7 @@ Controlli:
 
 ## TLS, cookie e reverse proxy
 
-L'app non termina TLS. In produzione un reverse proxy deve fornire TLS moderno, rinnovo certificato e restrizione dell'accesso diretto alla porta app. Impostare `GBRAIN_PUBLIC_URL` su URL HTTPS canonico e `GBRAIN_SESSION_SECURE_COOKIE=true`.
+L'app non termina TLS. In produzione un reverse proxy deve fornire TLS moderno, rinnovo certificato e restrizione dell'accesso diretto alla porta app. Impostare `GBRAIN_PUBLIC_URL` su URL HTTPS canonico e `GBRAIN_SESSION_SECURE_COOKIE=true` (con `GBRAIN_SESSION_SAMESITE_COOKIE=lax` per consentire il callback OAuth cross-site di Google, o `strict` se si isolano callback esterne).
 
 Uvicorn accetta proxy header; pertanto soltanto proxy/reti fidati devono poter raggiungere il listener. Il proxy deve riscrivere/preservare `Host` e protocollo corretti, evitare cache delle API/autenticazione, imporre dimensioni e timeout appropriati e aggiungere header di sicurezza dopo test di compatibilità. Testare cookie e redirect dal browser reale. Non dichiarare TLS sicuro sulla sola base della configurazione statica.
 

@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     session_cookie_name: str = "gbrain_session"
     session_ttl_seconds: int = Field(default=43_200, ge=300, le=2_592_000)
     session_secure_cookie: bool = False
+    session_samesite_cookie: Literal["lax", "strict", "none"] = "lax"
 
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"

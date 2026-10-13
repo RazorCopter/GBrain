@@ -57,20 +57,24 @@ def test_session_cookies_have_expected_security_attributes() -> None:
     csrf_cookie = next(value for value in cookies if value.startswith("gbrain_csrf="))
     assert "HttpOnly" in session_cookie
     assert "Secure" in session_cookie
-    assert "SameSite=strict" in session_cookie
+    assert "SameSite=lax" in session_cookie
+    assert "Path=/" in session_cookie
     assert "HttpOnly" not in csrf_cookie
     assert "Secure" in csrf_cookie
-    assert "SameSite=strict" in csrf_cookie
+    assert "SameSite=lax" in csrf_cookie
+    assert "Path=/" in csrf_cookie
 
 
 def test_clear_session_cookies_invalidates_both_cookies() -> None:
     response = Response()
 
-    _clear_session_cookies(response, _settings())
+    _clear_session_cookies(response, _settings(session_secure_cookie=True))
     cookies = response.headers.getlist("set-cookie")
 
     assert len(cookies) == 2
     assert all("Max-Age=0" in value for value in cookies)
+    assert all("SameSite=lax" in value for value in cookies)
+    assert all("Path=/" in value for value in cookies)
     assert any(value.startswith("gbrain_session=") for value in cookies)
     assert any(value.startswith("gbrain_csrf=") for value in cookies)
 

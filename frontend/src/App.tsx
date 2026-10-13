@@ -158,7 +158,23 @@ function PrivateShell({
     session: SessionState
     onLogout: () => void
 }) {
-    const [view, setView] = useState<View>('dashboard')
+    const [view, setView] = useState<View>(() => {
+        const pathname = window.location.pathname
+        const search = new URLSearchParams(window.location.search)
+        if (
+            pathname.startsWith('/sources') ||
+            search.get('view') === 'sources' ||
+            search.has('connected') ||
+            search.has('gmail_connected') ||
+            search.has('gmail')
+        ) {
+            return 'sources'
+        }
+        if (pathname.startsWith('/settings') || search.get('view') === 'settings') {
+            return 'settings'
+        }
+        return 'dashboard'
+    })
     const [statusState, setStatusState] = useState<StatusState | null>(null)
     const [imports, setImports] = useState<ImportJobs | null>(null)
     const [demoStatus, setDemoStatus] = useState<DemoFixtureStatus | null>(null)
@@ -196,9 +212,24 @@ function PrivateShell({
                 </div>
             </header>
             <nav aria-label="Navigazione principale">
-                <button aria-current={view === 'dashboard' ? 'page' : undefined} onClick={() => setView('dashboard')}>Stato</button>
-                <button aria-current={view === 'sources' ? 'page' : undefined} onClick={() => setView('sources')}>Fonti</button>
-                <button aria-current={view === 'settings' ? 'page' : undefined} onClick={() => setView('settings')}>Impostazioni</button>
+                <button aria-current={view === 'dashboard' ? 'page' : undefined} onClick={() => {
+                    setView('dashboard')
+                    if (window.location.pathname !== '/') {
+                        window.history.pushState({}, '', '/')
+                    }
+                }}>Stato</button>
+                <button aria-current={view === 'sources' ? 'page' : undefined} onClick={() => {
+                    setView('sources')
+                    if (window.location.pathname !== '/sources') {
+                        window.history.pushState({}, '', '/sources')
+                    }
+                }}>Fonti</button>
+                <button aria-current={view === 'settings' ? 'page' : undefined} onClick={() => {
+                    setView('settings')
+                    if (window.location.pathname !== '/settings') {
+                        window.history.pushState({}, '', '/settings')
+                    }
+                }}>Impostazioni</button>
             </nav>
             <main className="content">
                 {error && <p className="error" role="alert">{error}</p>}

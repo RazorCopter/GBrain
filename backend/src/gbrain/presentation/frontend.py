@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, Response
 from gbrain.application.auth import authenticate_session
 
 frontend_router = APIRouter()
-_PUBLIC_FRONTEND_PATHS = frozenset({"/", "/login", "/bootstrap"})
+_PUBLIC_FRONTEND_PATHS = frozenset({"/", "/login", "/bootstrap", "/sources"})
 
 
 def _frontend_file(frontend_dir: Path, requested_path: str) -> Path | None:

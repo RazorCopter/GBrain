@@ -53,7 +53,7 @@ def _set_session_cookies(
         max_age=settings.session_ttl_seconds,
         httponly=True,
         secure=settings.session_secure_cookie,
-        samesite="strict",
+        samesite=settings.session_samesite_cookie,
         path="/",
     )
     response.set_cookie(
@@ -62,7 +62,7 @@ def _set_session_cookies(
         max_age=settings.session_ttl_seconds,
         httponly=False,
         secure=settings.session_secure_cookie,
-        samesite="strict",
+        samesite=settings.session_samesite_cookie,
         path="/",
     )
 
@@ -73,14 +73,14 @@ def _clear_session_cookies(response: Response, settings: AppSettings) -> None:
         path="/",
         secure=settings.session_secure_cookie,
         httponly=True,
-        samesite="strict",
+        samesite=settings.session_samesite_cookie,
     )
     response.delete_cookie(
         "gbrain_csrf",
         path="/",
         secure=settings.session_secure_cookie,
         httponly=False,
-        samesite="strict",
+        samesite=settings.session_samesite_cookie,
     )
 
 

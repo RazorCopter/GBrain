@@ -164,7 +164,7 @@ async def oauth_callback_endpoint(
     error: str | None = None,
 ) -> RedirectResponse:
     if error:
-        return RedirectResponse("/?view=sources&gmail=consent_denied", status_code=303)
+        return RedirectResponse(f"/sources?error={error}", status_code=303)
     try:
         await complete_oauth(
             session,
@@ -176,8 +176,8 @@ async def oauth_callback_endpoint(
         )
     except GmailOAuthError as exc:
         request.app.state.gmail_oauth_last_error = exc.code
-        return RedirectResponse("/?view=sources&gmail=oauth_error", status_code=303)
-    return RedirectResponse("/?view=sources&gmail=connected", status_code=303)
+        return RedirectResponse(f"/sources?error={exc.safe_message}", status_code=303)
+    return RedirectResponse("/sources?connected=gmail&gmail_connected=1", status_code=303)
 
 
 @gmail_router.post("/disconnect", response_model=GmailDisconnectResponse)

@@ -823,3 +823,118 @@ def test_security_unauthenticated_and_csrf_and_no_leak() -> None:
     )
     assert resp_cred.status_code == 200
     assert "SUPER_SECRET_VALUE_MUST_NOT_LEAK" not in resp_cred.text
+
+
+def test_source_oauth_callback_flow_and_security() -> None:
+    client_auth, _, _ = _build_test_client()
+
+    # 1. Successo: complete_oauth mockata con successo -> redirect verso /sources?connected=gmail&gmail_connected=1
+    with patch(
+        "gbrain.presentation.sources_api.complete_oauth", new_callable=AsyncMock
+    ) as mock_complete:
+        resp = client_auth.get(
+            "/api/sources/gmail/oauth/callback?code=valid-code&state=valid-state",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/sources?connected=gmail&gmail_connected=1"
+        mock_complete.assert_awaited_once()
+
+    # 2. Errore da Google (es. utente nega il consenso) -> redirect verso /sources?error=access_denied
+    resp_err = client_auth.get(
+        "/api/sources/gmail/oauth/callback?error=access_denied",
+        follow_redirects=False,
+    )
+    assert resp_err.status_code == 302
+    assert resp_err.headers["location"] == "/sources?error=access_denied"
+
+    # 3. Parametri mancanti -> redirect verso /sources?error=...
+    resp_missing = client_auth.get(
+        "/api/sources/gmail/oauth/callback",
+        follow_redirects=False,
+    )
+    assert resp_missing.status_code == 302
+    assert "/sources?error=" in resp_missing.headers["location"]
+
+    # 4. Fallimento di complete_oauth (es. state non valido) -> redirect con messaggio sicuro
+    with patch(
+        "gbrain.presentation.sources_api.complete_oauth",
+        side_effect=GmailOAuthError("invalid_state", "Stato OAuth non valido o scaduto"),
+    ):
+        resp_oauth_fail = client_auth.get(
+            "/api/sources/gmail/oauth/callback?code=bad&state=bad",
+            follow_redirects=False,
+        )
+        assert resp_oauth_fail.status_code == 302
+        assert "error=" in resp_oauth_fail.headers["location"]
+
+
+def test_source_oauth_callback_requires_authenticated_principal() -> None:
+    # La callback non deve essere anonima: senza autenticazione deve fallire con 401
+    settings = _test_settings()
+    app = FastAPI()
+    app.state.settings = settings
+    app.include_router(api_router)
+    app.dependency_overrides[get_settings] = lambda: settings
+
+    class AuthDbSession:
+        async def scalar(self, *args: Any, **kwargs: Any) -> Any:
+            return None
+
+    async def override_auth_db() -> Any:
+        return AuthDbSession()
+
+    app.dependency_overrides[get_db_session] = override_auth_db
+    client = TestClient(app)
+
+    resp = client.get(
+        "/api/sources/gmail/oauth/callback?code=code&state=state",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Autenticazione richiesta"}
+
+
+def test_gmail_api_oauth_callback_flow() -> None:
+    from gbrain.presentation.gmail_api import gmail_router
+
+    settings = _test_settings()
+    app = FastAPI()
+    app.state.settings = settings
+    app.include_router(gmail_router)
+
+    test_owner = OwnerAccount(
+        id=uuid4(),
+        owner_slot=1,
+        username="admin",
+        display_name="Amministratore",
+        password_hash="hash",  # noqa: S106
+    )
+
+    async def override_principal() -> Principal:
+        return Principal(owner=test_owner, session=None)  # type: ignore[arg-type]
+
+    app.dependency_overrides[require_principal] = override_principal
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: InMemorySession()
+    client = TestClient(app)
+
+    # 1. Successo -> /sources?connected=gmail&gmail_connected=1
+    with patch(
+        "gbrain.presentation.gmail_api.complete_oauth", new_callable=AsyncMock
+    ) as mock_complete:
+        resp = client.get(
+            "/api/gmail/oauth/callback?code=abc&state=xyz",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/sources?connected=gmail&gmail_connected=1"
+        mock_complete.assert_awaited_once()
+
+    # 2. Errore da Google -> /sources?error=consent_denied
+    resp_err = client.get(
+        "/api/gmail/oauth/callback?error=consent_denied",
+        follow_redirects=False,
+    )
+    assert resp_err.status_code == 303
+    assert resp_err.headers["location"] == "/sources?error=consent_denied"

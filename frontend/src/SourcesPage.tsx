@@ -63,9 +63,18 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
     useEffect(() => {
         loadAllData()
 
-        // Controlla se la pagina è stata ricaricata con ?connected=gmail o ?error=...
+        // Controlla se la pagina è stata aperta/ricaricata con ritorno OAuth
         const urlParams = new URLSearchParams(window.location.search)
-        if (urlParams.has('connected') || urlParams.has('error')) {
+        const isConnected =
+            urlParams.get('connected') === 'gmail' ||
+            urlParams.get('gmail_connected') === '1' ||
+            urlParams.get('gmail') === 'connected'
+        const hasError =
+            urlParams.has('error') ||
+            urlParams.get('gmail') === 'oauth_error' ||
+            urlParams.get('gmail') === 'consent_denied'
+
+        if (isConnected || hasError) {
             setWizardOpen(true)
             setWizardSourceId('gmail')
         }

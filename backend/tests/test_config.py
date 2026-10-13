@@ -95,6 +95,17 @@ def test_production_requires_https_public_url() -> None:
         )
 
 
+def test_session_samesite_cookie_defaults_to_lax() -> None:
+    settings = Settings(
+        _env_file=None,
+        postgres_password=SecretStr("pg-secret"),
+        auth_secret=SecretStr("a" * 40),
+        neo4j_password=SecretStr("neo-secret"),
+    )
+
+    assert settings.session_samesite_cookie == "lax"
+
+
 def test_demo_mode_defaults_to_off() -> None:
     settings = Settings(
         _env_file=None,
