@@ -77,6 +77,14 @@ class ConnectorStatus(StrEnum):
     DEPRECATED = "deprecated"
 
 
+class SourceOperationalStatus(StrEnum):
+    NOT_CONFIGURED = "not_configured"
+    CREDENTIALS_CONFIGURED = "credentials_configured"
+    CONNECTED = "connected"
+    ERROR = "error"
+    SUSPENDED = "suspended"
+
+
 @dataclass(frozen=True, slots=True)
 class SourceFieldDescriptor:
     name: str

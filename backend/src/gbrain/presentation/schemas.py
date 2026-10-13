@@ -235,6 +235,7 @@ class SourceCatalogItemResponse(BaseModel):
     icon: str
     auth_method: str
     status: str
+    availability: str = "fully_available"
     test_available: bool
     sync_capabilities: ConnectorCapabilitiesResponse | None = None
     config_fields: list[SourceFieldDescriptorResponse] = Field(default_factory=list)
@@ -255,6 +256,7 @@ class LanWarningResponse(BaseModel):
 
 class SourceStatusResponse(BaseModel):
     source_id: str
+    availability: str = "fully_available"
     configured: bool
     auth_source: str | None = None
     client_id_preview: str | None = None

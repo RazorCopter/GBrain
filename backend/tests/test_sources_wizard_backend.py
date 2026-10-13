@@ -419,12 +419,16 @@ def test_sources_catalog_and_status_endpoints() -> None:
     data = resp.json()
     assert data["total"] == 9
     assert len(data["items"]) == 9
+    gmail_item = next(it for it in data["items"] if it["id"] == "gmail")
+    assert gmail_item["status"] == "fully_available"
+    assert gmail_item["availability"] == "fully_available"
 
     # GET /api/sources/gmail/status (localhost: nessun warning)
     resp_gmail = client.get("/api/sources/gmail/status", headers={"host": "localhost:8000"})
     assert resp_gmail.status_code == 200
     status_data = resp_gmail.json()
     assert status_data["source_id"] == "gmail"
+    assert status_data["availability"] == "fully_available"
     assert status_data["status"] == "not_configured"
     assert status_data["configured"] is False
     assert status_data["lan_warning"] is None

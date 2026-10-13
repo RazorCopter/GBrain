@@ -32,6 +32,7 @@ from gbrain.application.gmail_service import (
 )
 from gbrain.domain.connectors import (
     RequestBudget,
+    SourceOperationalStatus,
     get_source_catalog,
     get_source_descriptor,
 )
@@ -81,10 +82,11 @@ def detect_lan_http_warning(base_url: str) -> LanWarningResponse | None:
                     is_private_ip=True,
                     warning_code="private_ip_http_unsupported_by_google",
                     message=(
-                        f"L'indirizzo host rilevato ({hostname}) è un IP numerico privato non accettato "
-                        "da Google Cloud Console con protocollo HTTP. Per completare l'autorizzazione Google, "
-                        "accedere tramite localhost (es. tunnel SSH `ssh -L 8000:localhost:8000`) o "
-                        "configurare un hostname locale con proxy HTTPS."
+                        f"L'indirizzo host rilevato ({hostname}) è un IP privato numerico non accettato "
+                        "da Google Cloud Console per applicazioni Web OAuth 2.0 con protocollo HTTP. "
+                        "Google richiede un hostname o localhost. Soluzioni raccomandate: "
+                        "1) Assegnare un hostname locale nel file hosts (es. gbrain.local) e impostare GBRAIN_PUBLIC_URL; "
+                        "2) Usare un reverse proxy locale con TLS (HTTPS)."
                     ),
                 )
         except ValueError:
@@ -143,6 +145,7 @@ async def list_source_catalog(principal: PrincipalDep) -> SourceCatalogResponse:
                 icon=desc.icon,
                 auth_method=desc.auth_method.value,
                 status=desc.status.value,
+                availability=desc.status.value,
                 test_available=desc.test_available,
                 sync_capabilities=sync_caps,
                 config_fields=fields,
@@ -190,14 +193,25 @@ async def get_source_status(
         external_account_id = account.external_account_id if account else None
 
         if account_connected and account:
-            st = account.status.value
+            st = SourceOperationalStatus.CONNECTED.value
+        elif account and account.status in {
+            ConnectorAccountStatus.REVOKED,
+            ConnectorAccountStatus.DISABLED,
+            ConnectorAccountStatus.REAUTH_REQUIRED,
+        }:
+            st = (
+                SourceOperationalStatus.ERROR.value
+                if account.status == ConnectorAccountStatus.REAUTH_REQUIRED
+                else SourceOperationalStatus.SUSPENDED.value
+            )
         elif configured:
-            st = "pending_authorization"
+            st = SourceOperationalStatus.CREDENTIALS_CONFIGURED.value
         else:
-            st = "not_configured"
+            st = SourceOperationalStatus.NOT_CONFIGURED.value
 
         return SourceStatusResponse(
             source_id=source_id,
+            availability=descriptor.status.value,
             configured=configured,
             auth_source=auth_source,
             client_id_preview=client_id_preview,
@@ -212,13 +226,14 @@ async def get_source_status(
     # Per connettori coming_soon
     return SourceStatusResponse(
         source_id=source_id,
+        availability=descriptor.status.value,
         configured=False,
         auth_source=None,
         client_id_preview=None,
         account_connected=False,
         external_account_id=None,
         primary_email=None,
-        status=descriptor.status.value,
+        status=SourceOperationalStatus.NOT_CONFIGURED.value,
         detected_callback_url=detected_callback,
         lan_warning=lan_warning,
     )

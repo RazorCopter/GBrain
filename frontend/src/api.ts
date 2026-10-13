@@ -170,6 +170,15 @@ export interface ImportPolicyDescriptor {
     label_restriction: string | null
 }
 
+export type ConnectorAvailability = 'fully_available' | 'coming_soon' | 'maintenance' | 'deprecated'
+export type ConnectorOperationalStatus = 'not_configured' | 'credentials_configured' | 'connected' | 'error' | 'suspended'
+
+export function isConnectorAvailable(item: { status?: string; availability?: string } | null | undefined): boolean {
+    if (!item) return false
+    const val = item.availability || item.status
+    return val === 'fully_available' || val === 'available'
+}
+
 export interface SourceCatalogItem {
     id: string
     name: string
@@ -177,7 +186,8 @@ export interface SourceCatalogItem {
     description: string
     icon: string
     auth_method: string
-    status: 'available' | 'coming_soon' | 'deprecated' | string
+    status: ConnectorAvailability | string
+    availability?: ConnectorAvailability | string
     test_available: boolean
     sync_capabilities: ConnectorCapabilities | null
     config_fields: SourceFieldDescriptor[]
@@ -198,13 +208,14 @@ export interface LanWarningResponse {
 
 export interface SourceStatusResponse {
     source_id: string
+    availability?: ConnectorAvailability | string
     configured: boolean
     auth_source: string | null
     client_id_preview: string | null
     account_connected: boolean
     external_account_id: string | null
     primary_email: string | null
-    status: string
+    status: ConnectorOperationalStatus | string
     detected_callback_url: string
     lan_warning: LanWarningResponse | null
 }

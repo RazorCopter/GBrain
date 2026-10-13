@@ -8,6 +8,7 @@ import {
     SourceSyncPayload,
     SourceTestConnectionResponse,
     api,
+    isConnectorAvailable,
 } from './api'
 
 export interface SourceConnectionWizardProps {
@@ -78,6 +79,7 @@ export function SourceConnectionWizard({
     const [showSecret, setShowSecret] = useState(false)
     const [redirectUriOverride, setRedirectUriOverride] = useState('')
     const [copySuccess, setCopySuccess] = useState(false)
+    const [copiedKey, setCopiedKey] = useState<string | null>(null)
     const [credSaving, setCredSaving] = useState(false)
     const [credError, setCredError] = useState('')
     const [credSuccessMessage, setCredSuccessMessage] = useState('')
@@ -175,16 +177,37 @@ export function SourceConnectionWizard({
         return () => window.clearInterval(intervalId)
     }, [activeJob])
 
-    // Funzione copia Redirect URI
+    // Funzione copia con fallback universale (supporta anche contesti HTTP non protetti su LAN)
+    async function copyText(text: string, key = 'uri') {
+        if (!text) return
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text)
+            } else {
+                const textarea = document.createElement('textarea')
+                textarea.value = text
+                textarea.style.position = 'fixed'
+                textarea.style.opacity = '0'
+                document.body.appendChild(textarea)
+                textarea.focus()
+                textarea.select()
+                document.execCommand('copy')
+                document.body.removeChild(textarea)
+            }
+            if (key === 'uri') setCopySuccess(true)
+            setCopiedKey(key)
+            setTimeout(() => {
+                if (key === 'uri') setCopySuccess(false)
+                setCopiedKey(null)
+            }, 2500)
+        } catch {
+            // fallback opaco
+        }
+    }
+
     async function copyRedirectUri() {
         if (!sourceStatus?.detected_callback_url) return
-        try {
-            await navigator.clipboard.writeText(sourceStatus.detected_callback_url)
-            setCopySuccess(true)
-            setTimeout(() => setCopySuccess(false), 2500)
-        } catch {
-            // fallback
-        }
+        await copyText(sourceStatus.detected_callback_url, 'uri')
     }
 
     // Gestione upload JSON (drag & drop o file input)
@@ -406,7 +429,7 @@ export function SourceConnectionWizard({
 
                             <div className="source-catalog-grid">
                                 {catalogItems.map((item) => {
-                                    const isAvailable = item.status === 'available'
+                                    const isAvailable = isConnectorAvailable(item)
                                     const isSelected = selectedSourceId === item.id
                                     return (
                                         <div
@@ -432,14 +455,18 @@ export function SourceConnectionWizard({
                                                 <span className="source-card-icon" aria-hidden="true">
                                                     {item.id === 'gmail' ? '✉️' : item.icon === 'chat' ? '💬' : item.icon === 'workspace' ? '📁' : '🔗'}
                                                 </span>
-                                                <span className={`source-status-pill ${item.status}`}>
+                                                <span className={`source-status-pill ${isAvailable ? 'available' : 'coming_soon'}`}>
                                                     {isAvailable ? 'Disponibile' : 'Prossimamente'}
                                                 </span>
                                             </div>
                                             <div className="source-card-name">{item.name}</div>
                                             <div className="source-card-category">{item.category.toUpperCase()}</div>
                                             <p className="source-card-desc">{item.description}</p>
-                                            {!isAvailable && (
+                                            {isAvailable ? (
+                                                <div className="source-card-note available-note">
+                                                    ✓ Disponibile - Pronto per la configurazione
+                                                </div>
+                                            ) : (
                                                 <div className="source-card-note">
                                                     Connettore pianificato per le prossime versioni del sistema.
                                                 </div>
@@ -456,7 +483,7 @@ export function SourceConnectionWizard({
                                 <button
                                     type="button"
                                     className="primary"
-                                    disabled={!selectedCatalogItem || selectedCatalogItem.status !== 'available'}
+                                    disabled={!selectedCatalogItem || !isConnectorAvailable(selectedCatalogItem)}
                                     onClick={() => {
                                         refreshStatus(selectedSourceId)
                                         setCurrentStep(2)
@@ -476,38 +503,123 @@ export function SourceConnectionWizard({
                                 Registra un'applicazione in <strong>Google Cloud Console</strong> e fornisci le credenziali OAuth 2.0 (Client ID e Client Secret). Le credenziali vengono cifrate a riposo con <strong>AES-256-GCM</strong>.
                             </p>
 
-                            {/* Avviso Redirect URI e vincolo LAN */}
-                            <div className="wizard-callout info">
-                                <div className="callout-header">
-                                    <strong>Redirect URI Autorizzato per Google Cloud Console</strong>
-                                </div>
-                                <p>Copia questo URI e incollalo nei <em>"Redirect URI autorizzati"</em> della tua applicazione Google OAuth:</p>
-                                <div className="copy-uri-box">
-                                    <code>{sourceStatus?.detected_callback_url || 'Caricamento URI…'}</code>
-                                    <button
-                                        type="button"
-                                        className="secondary compact"
-                                        onClick={copyRedirectUri}
-                                        disabled={!sourceStatus?.detected_callback_url}
-                                    >
-                                        {copySuccess ? '✓ Copiato!' : 'Copia negli appunti'}
-                                    </button>
-                                </div>
-                            </div>
+                            {/* Rilevamento dati di rete locale */}
+                            {(() => {
+                                const currentHost = window.location.host
+                                const currentHostname = window.location.hostname
+                                const currentPort = window.location.port ? `:${window.location.port}` : ''
+                                const isPrivateIp =
+                                    Boolean(sourceStatus?.lan_warning?.is_private_ip) ||
+                                    /^(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})$/.test(currentHostname)
+                                const effectiveCallbackUrl =
+                                    sourceStatus?.detected_callback_url || `${window.location.origin}/api/sources/${selectedSourceId}/oauth/callback`
+                                const recommendedHostsEntry = `${currentHostname || '10.0.0.105'} gbrain.local`
+                                const recommendedPublicUrl = `http://gbrain.local${currentPort || ':8185'}`
+                                const recommendedCallbackUrl = `http://gbrain.local${currentPort || ':8185'}/api/sources/${selectedSourceId}/oauth/callback`
 
-                            {/* Alert LAN IP privato HTTP se rilevato */}
-                            {sourceStatus?.lan_warning && (
-                                <div className="wizard-callout warning">
-                                    <div className="callout-header">
-                                        <span aria-hidden="true">⚠️</span>
-                                        <strong>Attenzione: Vincolo IP LAN Privato Google OAuth</strong>
-                                    </div>
-                                    <p>{sourceStatus.lan_warning.message}</p>
-                                    <div className="callout-tip">
-                                        💡 <strong>Consiglio pratico</strong>: Accedi all'interfaccia via <code>http://localhost:8185</code> oppure configura un nome host locale nel router o nel file hosts prima di procedere.
-                                    </div>
-                                </div>
-                            )}
+                                return (
+                                    <>
+                                        {/* Box Redirect URI attualmente calcolato dal sistema */}
+                                        <div className="wizard-callout info">
+                                            <div className="callout-header">
+                                                <strong>Redirect URI Calcolato per Google Cloud Console</strong>
+                                            </div>
+                                            <p>Copia questo URI e incollalo nella sezione <em>"URI di reindirizzamento autorizzati"</em> della tua applicazione Google OAuth:</p>
+                                            <div className="copy-uri-box">
+                                                <code>{effectiveCallbackUrl}</code>
+                                                <button
+                                                    type="button"
+                                                    className="secondary compact"
+                                                    onClick={() => copyText(effectiveCallbackUrl, 'uri')}
+                                                    disabled={!effectiveCallbackUrl}
+                                                >
+                                                    {copiedKey === 'uri' ? '✓ Copiato!' : 'Copia URI negli appunti'}
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        {/* Avviso contestuale dettagliato per accesso su IP privato LAN */}
+                                        {isPrivateIp && (
+                                            <div className="wizard-callout warning lan-warning-box">
+                                                <div className="callout-header">
+                                                    <span aria-hidden="true" style={{ fontSize: '1.2rem' }}>⚠️</span>
+                                                    <strong>Avviso Vincolo Google OAuth su Rete Locale LAN ({currentHost})</strong>
+                                                </div>
+                                                <p className="lan-reason-text">
+                                                    <strong>a) Perché Google rifiuta gli indirizzi IP privati numerici?</strong><br />
+                                                    Google Cloud Console <strong>non consente</strong> per policy di sicurezza l'inserimento di indirizzi IP privati nudi (es. <code>{currentHostname}</code>) negli <em>"URI di reindirizzamento autorizzati"</em> per client Web OAuth 2.0. Google ammette esclusivamente <code>http://localhost</code>, <code>http://127.0.0.1</code> oppure nomi di dominio/hostname validi con estensione.
+                                                </p>
+
+                                                <div className="lan-solutions-container">
+                                                    <div className="solution-item">
+                                                        <div className="solution-title">
+                                                            <strong>b.1) Soluzione Raccomandata: Assegna un Hostname Locale (File hosts)</strong>
+                                                        </div>
+                                                        <ol className="solution-steps">
+                                                            <li>
+                                                                Sul PC client da cui usi il browser, apri il file <code>hosts</code> con permessi di amministratore:
+                                                                <ul>
+                                                                    <li><strong>Windows</strong>: <code>C:\Windows\System32\drivers\etc\hosts</code> (apri Blocco Note come Amministratore)</li>
+                                                                    <li><strong>Linux / macOS</strong>: <code>/etc/hosts</code> (es. <code>sudo nano /etc/hosts</code>)</li>
+                                                                </ul>
+                                                                Aggiungi questa riga:
+                                                                <div className="copy-code-inline">
+                                                                    <code>{recommendedHostsEntry}</code>
+                                                                    <button
+                                                                        type="button"
+                                                                        className="secondary compact mini-btn"
+                                                                        onClick={() => copyText(recommendedHostsEntry, 'hosts')}
+                                                                    >
+                                                                        {copiedKey === 'hosts' ? '✓ Copiato!' : 'Copia'}
+                                                                    </button>
+                                                                </div>
+                                                            </li>
+                                                            <li>
+                                                                Nel file <code>.env</code> di GBrain sul server, imposta o aggiorna la variabile:
+                                                                <div className="copy-code-inline">
+                                                                    <code>GBRAIN_PUBLIC_URL={recommendedPublicUrl}</code>
+                                                                    <button
+                                                                        type="button"
+                                                                        className="secondary compact mini-btn"
+                                                                        onClick={() => copyText(`GBRAIN_PUBLIC_URL=${recommendedPublicUrl}`, 'env')}
+                                                                    >
+                                                                        {copiedKey === 'env' ? '✓ Copiato!' : 'Copia'}
+                                                                    </button>
+                                                                </div>
+                                                            </li>
+                                                            <li>
+                                                                In Google Cloud Console, aggiungi negli <em>"URI di reindirizzamento autorizzati"</em>:
+                                                                <div className="copy-code-inline">
+                                                                    <code>{recommendedCallbackUrl}</code>
+                                                                    <button
+                                                                        type="button"
+                                                                        className="secondary compact mini-btn"
+                                                                        onClick={() => copyText(recommendedCallbackUrl, 'rec_uri')}
+                                                                    >
+                                                                        {copiedKey === 'rec_uri' ? '✓ Copiato!' : 'Copia URI'}
+                                                                    </button>
+                                                                </div>
+                                                            </li>
+                                                            <li>
+                                                                Accedi a GBrain navigando nel browser all'indirizzo <code>{recommendedPublicUrl}</code>.
+                                                            </li>
+                                                        </ol>
+                                                    </div>
+
+                                                    <div className="solution-item">
+                                                        <div className="solution-title">
+                                                            <strong>b.2) Soluzione Alternativa: Reverse Proxy Locale con HTTPS (TLS)</strong>
+                                                        </div>
+                                                        <p className="solution-desc">
+                                                            Configura un reverse proxy locale (come Caddy, Nginx o Traefik) con un certificato TLS/SSL (es. mkcert o Let's Encrypt), inoltrando le richieste HTTPS a GBrain e impostando <code>GBRAIN_PUBLIC_URL=https://...</code>. Google Cloud Console accetta domini o hostname con protocollo HTTPS.
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </>
+                                )
+                            })()}
 
                             {/* Indicatore se le credenziali sono già configurate */}
                             {sourceStatus?.configured && (

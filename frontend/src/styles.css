@@ -567,14 +567,40 @@ button.danger {
     color: #d9480f;
 }
 
-.status-pill.available {
-    background: #e6fcf5;
-    color: #0ca678;
+.status-pill.fully_available,
+.status-pill.available,
+.source-status-pill.fully_available,
+.source-status-pill.available {
+    background: #d3f9d8;
+    color: #2b8a3e;
 }
 
-.status-pill.coming_soon {
+.status-pill.coming_soon,
+.source-status-pill.coming_soon {
     background: #e9ecef;
     color: #495057;
+}
+
+.status-pill.not_configured {
+    background: #edf2f7;
+    color: #4a5568;
+}
+
+.source-status-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: .15rem .55rem;
+    border-radius: 999px;
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+}
+
+.source-card-note.available-note {
+    color: #2b8a3e;
+    font-style: normal;
+    font-weight: 600;
 }
 
 /* Connected Source Card */
@@ -1276,6 +1302,88 @@ button.danger {
     font-style: italic;
     color: #94a3b8;
     margin-top: .4rem;
+}
+
+.source-card-note.available-note {
+    color: #2b8a3e;
+    font-style: normal;
+    font-weight: 600;
+}
+
+/* LAN Warning Box & Solutions */
+.lan-warning-box {
+    border-left: 4px solid #d97706;
+}
+
+.lan-reason-text {
+    margin: .5rem 0 .75rem;
+    line-height: 1.45;
+}
+
+.lan-solutions-container {
+    display: flex;
+    flex-direction: column;
+    gap: .75rem;
+    margin-top: .75rem;
+    padding-top: .75rem;
+    border-top: 1px solid #fde68a;
+}
+
+.solution-item {
+    background: rgba(255, 255, 255, .7);
+    border: 1px solid #fed7aa;
+    border-radius: .5rem;
+    padding: .75rem .9rem;
+}
+
+.solution-title {
+    margin-bottom: .4rem;
+    font-size: .88rem;
+    color: #92400e;
+}
+
+.solution-steps {
+    margin: .4rem 0 0 1.2rem;
+    padding: 0;
+    font-size: .82rem;
+    line-height: 1.5;
+}
+
+.solution-steps li {
+    margin-bottom: .4rem;
+}
+
+.solution-desc {
+    margin: 0;
+    font-size: .82rem;
+    line-height: 1.45;
+}
+
+.copy-code-inline {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    margin: .25rem 0;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: .35rem;
+    padding: .2rem .5rem;
+    width: fit-content;
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+.copy-code-inline code {
+    font-size: .8rem;
+    color: #0f172a;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.mini-btn {
+    padding: .15rem .45rem;
+    font-size: .72rem;
+    height: auto;
+    line-height: 1.2;
 }
 
 /* Step 2 Credential Form & Dropzone */

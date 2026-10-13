@@ -11,6 +11,7 @@ import {
     SourceStatusResponse,
     SourceTestConnectionResponse,
     api,
+    isConnectorAvailable,
 } from './api'
 import { SourceConnectionWizard } from './SourceConnectionWizard'
 
@@ -179,8 +180,9 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         }
     }
 
-    const isConnected = Boolean(gmailStatus?.account_connected)
-    const isConfigured = Boolean(gmailStatus?.configured)
+    const isConnected = Boolean(gmailStatus?.account_connected || gmailStatus?.status === 'connected')
+    const isConfigured = Boolean(gmailStatus?.configured || gmailStatus?.status === 'credentials_configured')
+    const isError = Boolean(gmailStatus?.status === 'error' || gmailStatus?.status === 'suspended')
 
     return (
         <section className="sources-hub" aria-labelledby="sources-hub-title">
@@ -232,8 +234,8 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                             <div>
                                 <div className="connected-source-title-row">
                                     <h3>Google Gmail (SENT Messages)</h3>
-                                    <span className={`status-pill ${isConnected ? 'active' : isConfigured ? 'pending' : 'revoked'}`}>
-                                        {isConnected ? '● Connesso & Attivo' : isConfigured ? 'Pronto per Autorizzazione' : 'Non Configurato'}
+                                    <span className={`status-pill ${isConnected ? 'active' : isConfigured ? 'pending' : isError ? 'revoked' : 'not_configured'}`}>
+                                        {isConnected ? '● Connesso & Attivo' : isConfigured ? 'Credenziali Configurate' : isError ? 'Errore Autorizzazione' : 'Non Configurato'}
                                     </span>
                                     {demoMode && <span className="status-pill warning">Demo Sintetica</span>}
                                 </div>
@@ -241,8 +243,10 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                     {isConnected && gmailStatus?.primary_email
                                         ? `Account autorizzato: ${gmailStatus.primary_email}`
                                         : isConfigured
-                                            ? 'Credenziali client memorizzate con AES-256-GCM. In attesa di consenso OAuth.'
-                                            : 'Nessuna credenziale client configurata.'}
+                                            ? 'Credenziali client memorizzate con AES-256-GCM. In attesa di autorizzazione account.'
+                                            : isError
+                                                ? 'Stato account in errore o autorizzazione revocata. È necessario riautorizzare.'
+                                                : 'Nessuna credenziale client configurata.'}
                                 </p>
                             </div>
                         </div>
@@ -382,7 +386,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
 
                 <div className="hub-catalog-grid">
                     {catalog.map((item) => {
-                        const isAvailable = item.status === 'available'
+                        const isAvailable = isConnectorAvailable(item)
                         const isThisConnected = item.id === 'gmail' && isConnected
                         return (
                             <article key={item.id} className={`hub-catalog-card ${!isAvailable ? 'card-coming-soon' : ''}`}>
@@ -390,7 +394,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                     <span className="card-source-icon" aria-hidden="true">
                                         {item.id === 'gmail' ? '✉️' : item.icon === 'chat' ? '💬' : item.icon === 'workspace' ? '📁' : '🔗'}
                                     </span>
-                                    <span className={`status-pill ${isThisConnected ? 'active' : item.status}`}>
+                                    <span className={`status-pill ${isThisConnected ? 'active' : isAvailable ? 'available' : 'coming_soon'}`}>
                                         {isThisConnected ? 'Collegato' : isAvailable ? 'Disponibile' : 'Prossimamente'}
                                     </span>
                                 </div>
@@ -410,7 +414,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                             {isThisConnected ? 'Gestisci configurazione' : 'Connetti ora →'}
                                         </button>
                                     ) : (
-                                        <span className="coming-soon-label">Fase successiva</span>
+                                        <span className="coming-soon-label">Prossimamente</span>
                                     )}
                                 </div>
                             </article>
