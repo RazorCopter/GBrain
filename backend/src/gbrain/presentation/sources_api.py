@@ -211,6 +211,9 @@ async def get_source_status(
         else:
             st = SourceOperationalStatus.NOT_CONFIGURED.value
 
+        aliases_ready = bool(account and account.confirmed_aliases)
+        confirmed_aliases = list(account.confirmed_aliases or []) if account else []
+
         return SourceStatusResponse(
             source_id=source_id,
             availability=descriptor.status.value,
@@ -220,6 +223,8 @@ async def get_source_status(
             account_connected=account_connected,
             external_account_id=external_account_id,
             primary_email=primary_email,
+            aliases_ready=aliases_ready,
+            confirmed_aliases=confirmed_aliases,
             status=st,
             detected_callback_url=detected_callback,
             lan_warning=lan_warning,

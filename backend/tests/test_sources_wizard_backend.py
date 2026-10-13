@@ -376,8 +376,11 @@ def _build_test_client(
     auth_session: Any = None,
     procrastinate_mock: Any = None,
 ) -> tuple[TestClient, InMemorySession, OwnerAccount]:
+    from gbrain.presentation.gmail_api import gmail_router
+
     app = FastAPI()
     app.include_router(api_router)
+    app.include_router(gmail_router)
 
     session = db_session or InMemorySession()
     test_owner = owner or OwnerAccount(
@@ -1023,3 +1026,60 @@ def test_decrypt_credentials_expiry_compatibility() -> None:
     assert restored.expired is False
     assert restored.expiry is not None
     assert restored.expiry.tzinfo is None  # Deve essere naive per compatibilità con google.auth
+
+
+def test_gmail_account_and_alias_confirmation_flow() -> None:
+    client, session, owner = _build_test_client()
+    settings = _test_settings()
+
+    # Senza account: GET /api/gmail/account -> 404
+    resp_no_acc = client.get("/api/gmail/account")
+    assert resp_no_acc.status_code == 404
+
+    # Creiamo account attivo senza alias confermati
+    creds = _synthetic_credentials()
+    ciphertext = encrypt_credentials(creds, settings)
+    account = ConnectorAccount(
+        id=uuid4(),
+        owner_id=owner.id,
+        connector_kind="gmail",
+        external_account_id="user@testdomain.com",
+        primary_email="user@testdomain.com",
+        status=ConnectorAccountStatus.ACTIVE,
+        oauth_token_ciphertext=ciphertext,
+        oauth_token_format_version=1,
+        confirmed_aliases=[],
+    )
+    session.add(account)
+
+    # Verifica stato da /api/sources/gmail/status: aliases_ready è False
+    st_resp = client.get("/api/sources/gmail/status")
+    assert st_resp.status_code == 200
+    st_data = st_resp.json()
+    assert st_data["aliases_ready"] is False
+    assert st_data["confirmed_aliases"] == []
+
+    # GET /api/gmail/account ora restituisce l'account con aliases_ready False
+    acc_resp = client.get("/api/gmail/account")
+    assert acc_resp.status_code == 200
+    acc_data = acc_resp.json()
+    assert acc_data["primary_email"] == "user@testdomain.com"
+    assert acc_data["aliases_ready"] is False
+    assert acc_data["confirmed_aliases"] == []
+
+    # PUT /api/gmail/aliases con confirmed_addresses (payload flessibile per frontend)
+    confirm_resp = client.put(
+        "/api/gmail/aliases",
+        json={"confirmed_addresses": ["user@testdomain.com"]},
+    )
+    assert confirm_resp.status_code == 200
+    confirmed_data = confirm_resp.json()
+    assert confirmed_data["aliases_ready"] is True
+    assert confirmed_data["confirmed_aliases"] == ["user@testdomain.com"]
+
+    # Verifica che /api/sources/gmail/status rifletta aliases_ready True
+    st_resp2 = client.get("/api/sources/gmail/status")
+    assert st_resp2.status_code == 200
+    st_data2 = st_resp2.json()
+    assert st_data2["aliases_ready"] is True
+    assert st_data2["confirmed_aliases"] == ["user@testdomain.com"]

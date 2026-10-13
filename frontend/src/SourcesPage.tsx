@@ -31,6 +31,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
     // Stato modali e wizard
     const [wizardOpen, setWizardOpen] = useState(false)
     const [wizardSourceId, setWizardSourceId] = useState('gmail')
+    const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2 | 3 | 4 | 5 | 6 | undefined>(undefined)
     const [disconnectModalOpen, setDisconnectModalOpen] = useState(false)
     const [removeStoredCredentials, setRemoveStoredCredentials] = useState(false)
     const [disconnecting, setDisconnecting] = useState(false)
@@ -97,6 +98,15 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         return () => window.clearInterval(timer)
     }, [activeJob])
 
+    const isConnected = Boolean(gmailStatus?.account_connected || gmailStatus?.status === 'connected')
+    const isConfigured = Boolean(gmailStatus?.configured || gmailStatus?.status === 'credentials_configured')
+    const isError = Boolean(gmailStatus?.status === 'error' || gmailStatus?.status === 'suspended')
+    const isAliasesReady = Boolean(
+        gmailStatus?.aliases_ready ||
+        (gmailAccount?.aliases_ready && (gmailAccount.confirmed_aliases?.length ?? 0) > 0)
+    )
+    const confirmedAliasesList = gmailStatus?.confirmed_aliases || gmailAccount?.confirmed_aliases || []
+
     // Azione: Test connessione rapido per Gmail
     async function handleQuickTestConnection() {
         setTestingConnection(true)
@@ -119,6 +129,12 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
 
     // Azione: Sincronizza ora (incrementale o full rapido)
     async function handleQuickSync() {
+        if (!isAliasesReady) {
+            setGlobalError(
+                "Confermare almeno un alias email del proprietario prima di avviare la sincronizzazione. Usa il pulsante 'Gestisci Alias'."
+            )
+            return
+        }
         setQuickSyncBusy(true)
         setGlobalError('')
         setGlobalMessage('')
@@ -189,10 +205,6 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         }
     }
 
-    const isConnected = Boolean(gmailStatus?.account_connected || gmailStatus?.status === 'connected')
-    const isConfigured = Boolean(gmailStatus?.configured || gmailStatus?.status === 'credentials_configured')
-    const isError = Boolean(gmailStatus?.status === 'error' || gmailStatus?.status === 'suspended')
-
     return (
         <section className="sources-hub" aria-labelledby="sources-hub-title">
             {/* Header Hub */}
@@ -246,6 +258,23 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                     <span className={`status-pill ${isConnected ? 'active' : isConfigured ? 'pending' : isError ? 'revoked' : 'not_configured'}`}>
                                         {isConnected ? '● Connesso & Attivo' : isConfigured ? 'Credenziali Configurate' : isError ? 'Errore Autorizzazione' : 'Non Configurato'}
                                     </span>
+                                    {isConnected && (
+                                        isAliasesReady ? (
+                                            <span
+                                                className="status-pill active"
+                                                title={`Alias attivi: ${confirmedAliasesList.join(', ')}`}
+                                            >
+                                                ✓ {confirmedAliasesList.length === 1 ? '1 Alias Confermato' : `${confirmedAliasesList.length} Alias Confermati`}
+                                            </span>
+                                        ) : (
+                                            <span
+                                                className="status-pill warning"
+                                                title="Conferma esplicita degli alias del proprietario obbligatoria prima dell'importazione"
+                                            >
+                                                ⚠️ Alias Non Confermati
+                                            </span>
+                                        )
+                                    )}
                                     {demoMode && <span className="status-pill warning">Demo Sintetica</span>}
                                 </div>
                                 <p className="connected-source-subtitle">
@@ -257,6 +286,27 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                                 ? 'Stato account in errore o autorizzazione revocata. È necessario riautorizzare.'
                                                 : 'Nessuna credenziale client configurata.'}
                                 </p>
+                                {isConnected && !isAliasesReady && (
+                                    <div className="source-alias-warning" role="alert">
+                                        <div className="warning-text">
+                                            <strong>⚠️ Identità autobiografica non confermata:</strong>
+                                            <span>
+                                                {' '}Devi confermare almeno un alias email prima di poter sincronizzare le email inviate (SENT).
+                                            </span>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            className="primary compact"
+                                            onClick={() => {
+                                                setWizardSourceId('gmail')
+                                                setWizardInitialStep(4)
+                                                setWizardOpen(true)
+                                            }}
+                                        >
+                                            Conferma alias ora
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         </div>
 
@@ -531,6 +581,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                 <SourceConnectionWizard
                     catalogItems={catalog}
                     initialSourceId={wizardSourceId}
+                    initialStep={wizardInitialStep}
                     onClose={() => setWizardOpen(false)}
                     onSuccess={() => {
                         setWizardOpen(false)

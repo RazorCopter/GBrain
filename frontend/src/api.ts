@@ -215,6 +215,8 @@ export interface SourceStatusResponse {
     account_connected: boolean
     external_account_id: string | null
     primary_email: string | null
+    aliases_ready?: boolean
+    confirmed_aliases?: string[]
     status: ConnectorOperationalStatus | string
     detected_callback_url: string
     lan_warning: LanWarningResponse | null
@@ -376,10 +378,14 @@ export const api = {
         '/api/gmail/disconnect',
         { method: 'POST' },
     ),
-    gmailConfirmAliases: (aliases: string[]) => request<GmailAccount>('/api/gmail/aliases', {
-        method: 'PUT',
-        body: JSON.stringify({ aliases }),
-    }),
+    gmailGetAccount: () => request<GmailAccount>('/api/gmail/account'),
+    gmailConfirmAliases: (payload: string[] | { confirmed_addresses?: string[]; aliases?: string[] }) => {
+        const list = Array.isArray(payload) ? payload : (payload.confirmed_addresses ?? payload.aliases ?? [])
+        return request<GmailAccount>('/api/gmail/aliases', {
+            method: 'PUT',
+            body: JSON.stringify({ aliases: list, confirmed_addresses: list }),
+        })
+    },
     gmailRemoveAlias: (alias: string) => request<GmailAccount>(
         `/api/gmail/aliases/${encodeURIComponent(alias)}`,
         { method: 'DELETE' },

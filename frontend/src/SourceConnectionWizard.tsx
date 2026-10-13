@@ -14,6 +14,7 @@ import {
 export interface SourceConnectionWizardProps {
     catalogItems: SourceCatalogItem[]
     initialSourceId?: string
+    initialStep?: WizardStep
     onClose: () => void
     onSuccess: () => void
 }
@@ -61,14 +62,26 @@ function parseJsonConfig(content: string): { ok: boolean; data?: Record<string, 
 export function SourceConnectionWizard({
     catalogItems,
     initialSourceId = 'gmail',
+    initialStep,
     onClose,
     onSuccess,
 }: SourceConnectionWizardProps) {
-    const [currentStep, setCurrentStep] = useState<WizardStep>(1)
+    const [currentStep, setCurrentStep] = useState<WizardStep>(initialStep ?? 1)
     const [selectedSourceId, setSelectedSourceId] = useState<string>(initialSourceId)
     const [sourceStatus, setSourceStatus] = useState<SourceStatusResponse | null>(null)
     const [loadingStatus, setLoadingStatus] = useState(false)
     const [statusError, setStatusError] = useState('')
+
+    // Gestione Alias Autobiografici (Gmail)
+    const [confirmedAliases, setConfirmedAliases] = useState<string[]>([])
+    const [aliasesReady, setAliasesReady] = useState(false)
+    const [proposedAliases, setProposedAliases] = useState<string[]>([])
+    const [selectedAliases, setSelectedAliases] = useState<string[]>([])
+    const [newAliasInput, setNewAliasInput] = useState('')
+    const [confirmingAliases, setConfirmingAliases] = useState(false)
+    const [aliasError, setAliasError] = useState('')
+    const [aliasSuccessMessage, setAliasSuccessMessage] = useState('')
+    const [isEditingAliases, setIsEditingAliases] = useState(false)
 
     // Step 2: Credenziali
     const [credMode, setCredMode] = useState<'upload' | 'manual'>('upload')
@@ -118,6 +131,26 @@ export function SourceConnectionWizard({
         try {
             const res = await api.fetchSourceStatus(sourceId)
             setSourceStatus(res)
+            if (sourceId === 'gmail') {
+                const conf = res.confirmed_aliases || []
+                const isReady = Boolean(res.aliases_ready && conf.length > 0)
+                setConfirmedAliases(conf)
+                setAliasesReady(isReady)
+
+                setProposedAliases((prev) => {
+                    const set = new Set(prev)
+                    if (res.primary_email) set.add(res.primary_email)
+                    conf.forEach((a) => set.add(a))
+                    return Array.from(set)
+                })
+
+                if (conf.length > 0) {
+                    setSelectedAliases((prev) => (prev.length > 0 ? prev : conf))
+                } else if (res.primary_email) {
+                    const primary = res.primary_email
+                    setSelectedAliases((prev) => (prev.length > 0 ? prev : [primary]))
+                }
+            }
             return res
         } catch (err) {
             const msg = err instanceof ApiError ? err.message : 'Errore nel caricamento dello stato della fonte.'
@@ -126,6 +159,73 @@ export function SourceConnectionWizard({
         } finally {
             setLoadingStatus(false)
         }
+    }
+
+    // Conferma esplicita degli alias del proprietario tramite PUT /api/gmail/aliases
+    async function handleConfirmAliases(aliasesToConfirm?: string[]): Promise<boolean> {
+        const listToConfirm = aliasesToConfirm ?? selectedAliases
+        if (listToConfirm.length === 0) {
+            setAliasError('Seleziona o specifica almeno un indirizzo email da confermare.')
+            return false
+        }
+        setConfirmingAliases(true)
+        setAliasError('')
+        setAliasSuccessMessage('')
+        try {
+            const updatedAccount = await api.gmailConfirmAliases({ confirmed_addresses: listToConfirm })
+            const freshStatus = await api.fetchSourceStatus('gmail')
+            setSourceStatus(freshStatus)
+
+            const confirmed = updatedAccount.confirmed_aliases || freshStatus.confirmed_aliases || listToConfirm
+            const isReady = updatedAccount.aliases_ready ?? freshStatus.aliases_ready ?? (confirmed.length > 0)
+
+            setConfirmedAliases(confirmed)
+            setAliasesReady(isReady)
+            setSelectedAliases(confirmed)
+            setIsEditingAliases(false)
+            setAliasSuccessMessage(
+                `Identità proprietario confermata: ${confirmed.length === 1 ? '1 indirizzo confermato' : `${confirmed.length} indirizzi confermati`
+                } per l'attribuzione SENT.`
+            )
+            return true
+        } catch (err) {
+            const msg = err instanceof ApiError ? err.message : 'Errore durante la conferma degli alias.'
+            setAliasError(msg)
+            return false
+        } finally {
+            setConfirmingAliases(false)
+        }
+    }
+
+    // Aggiunta manuale di un nuovo alias proposto
+    function handleAddCustomAlias(e?: FormEvent) {
+        if (e) e.preventDefault()
+        const trimmed = newAliasInput.trim().toLowerCase()
+        if (!trimmed) return
+        if (!trimmed.includes('@') || !trimmed.includes('.')) {
+            setAliasError('Inserisci un indirizzo email valido (es. nome@dominio.com).')
+            return
+        }
+        setAliasError('')
+        if (!proposedAliases.includes(trimmed)) {
+            setProposedAliases((prev) => [...prev, trimmed])
+        }
+        if (!selectedAliases.includes(trimmed)) {
+            setSelectedAliases((prev) => [...prev, trimmed])
+        }
+        setNewAliasInput('')
+    }
+
+    // Toggle selezione checkbox alias
+    function toggleAliasSelection(email: string) {
+        setAliasError('')
+        setSelectedAliases((prev) => {
+            if (prev.includes(email)) {
+                return prev.filter((item) => item !== email)
+            } else {
+                return [...prev, email]
+            }
+        })
     }
 
     // Effetto iniziale per caricare lo stato o rilevare il callback OAuth
@@ -323,6 +423,19 @@ export function SourceConnectionWizard({
             setTestResult(res)
             if (!res.connected) {
                 setTestError(res.message || 'La connessione alla fonte non è riuscita.')
+            } else if (sourceId === 'gmail') {
+                setProposedAliases((prev) => {
+                    const set = new Set(prev)
+                    if (res.primary_identity) set.add(res.primary_identity)
+                    if (res.aliases) res.aliases.forEach((a) => set.add(a))
+                    return Array.from(set)
+                })
+                setSelectedAliases((prev) => {
+                    if (prev.length > 0) return prev
+                    if (res.primary_identity) return [res.primary_identity]
+                    return res.aliases || []
+                })
+                await refreshStatus('gmail')
             }
         } catch (err) {
             const msg = err instanceof ApiError ? err.message : 'Errore durante il test di connessione.'
@@ -356,6 +469,10 @@ export function SourceConnectionWizard({
 
     // Avvio sincronizzazione nello Step 6
     async function handleTriggerSync() {
+        if (selectedSourceId === 'gmail' && !aliasesReady) {
+            setSyncError("Confermare almeno un alias email del proprietario prima di avviare l'importazione.")
+            return
+        }
         setSyncStarting(true)
         setSyncError('')
         try {
@@ -926,6 +1043,125 @@ export function SourceConnectionWizard({
                                 </div>
                             )}
 
+                            {/* Sezione Conferma Alias Autobiografici (obbligatoria per Gmail) */}
+                            {selectedSourceId === 'gmail' && (testResult?.connected || sourceStatus?.account_connected) && (
+                                <div className="alias-confirmation-card">
+                                    <div className="alias-card-header">
+                                        <span className="alias-card-icon" aria-hidden="true">🛡️</span>
+                                        <div>
+                                            <h4>Identità Autobiografica e Conferma Alias</h4>
+                                            <p className="muted">
+                                                GBrain importa e indicizza <strong>esclusivamente i messaggi inviati (SENT)</strong> attribuibili a te. Prima di sincronizzare, devi confermare esplicitamente quale indirizzo email ti appartiene.
+                                            </p>
+                                        </div>
+                                        <div className="alias-header-badge">
+                                            {aliasesReady ? (
+                                                <span className="status-pill active">● Identità Confermata</span>
+                                            ) : (
+                                                <span className="status-pill warning">⚠️ In attesa di conferma</span>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    <div className="alias-primary-row">
+                                        <span className="detail-label">Indirizzo Primario Autenticato:</span>
+                                        <strong className="primary-email-badge">
+                                            ✉️ {sourceStatus?.primary_email || testResult?.primary_identity || 'Non rilevato'}
+                                        </strong>
+                                    </div>
+
+                                    {aliasesReady && !isEditingAliases ? (
+                                        <div className="confirmed-aliases-view">
+                                            <div>
+                                                <span className="detail-label">Alias confermati e attivi per l'attribuzione SENT:</span>
+                                                <div className="alias-badges-list">
+                                                    {confirmedAliases.map((addr) => (
+                                                        <span key={addr} className="alias-confirmed-pill">
+                                                            ✓ {addr}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                            <div className="confirmed-aliases-actions">
+                                                <button
+                                                    type="button"
+                                                    className="secondary compact"
+                                                    onClick={() => setIsEditingAliases(true)}
+                                                >
+                                                    ✏️ Modifica o aggiungi alias
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="alias-selection-form">
+                                            <p className="alias-selection-intro">
+                                                Seleziona gli indirizzi da cui invii o hai inviato email come proprietario:
+                                            </p>
+
+                                            <div className="alias-checklist">
+                                                {proposedAliases.map((addr) => {
+                                                    const isChecked = selectedAliases.includes(addr)
+                                                    const isPrimary = addr === (sourceStatus?.primary_email || testResult?.primary_identity)
+                                                    const isAlreadyConfirmed = confirmedAliases.includes(addr)
+                                                    return (
+                                                        <label key={addr} className={`alias-check-item ${isChecked ? 'checked' : ''}`}>
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={isChecked}
+                                                                onChange={() => toggleAliasSelection(addr)}
+                                                            />
+                                                            <span className="alias-check-label">
+                                                                {addr}
+                                                                {isPrimary && <span className="sub-badge">Primario</span>}
+                                                                {isAlreadyConfirmed && <span className="sub-badge confirmed">Già confermato</span>}
+                                                            </span>
+                                                        </label>
+                                                    )
+                                                })}
+                                            </div>
+
+                                            <form className="add-alias-inline" onSubmit={handleAddCustomAlias}>
+                                                <input
+                                                    type="email"
+                                                    placeholder="Aggiungi un altro alias (es. me@azienda.com)"
+                                                    value={newAliasInput}
+                                                    onChange={(e) => setNewAliasInput(e.target.value)}
+                                                />
+                                                <button type="submit" className="secondary compact" disabled={!newAliasInput.trim()}>
+                                                    + Aggiungi
+                                                </button>
+                                            </form>
+
+                                            {aliasError && <p className="error" role="alert">{aliasError}</p>}
+                                            {aliasSuccessMessage && <p className="success-msg" role="status">✅ {aliasSuccessMessage}</p>}
+
+                                            <div className="alias-action-bar">
+                                                <button
+                                                    type="button"
+                                                    className="primary"
+                                                    disabled={confirmingAliases || selectedAliases.length === 0}
+                                                    onClick={() => handleConfirmAliases()}
+                                                >
+                                                    {confirmingAliases ? 'Conferma in corso…' : '✓ Conferma Alias Selezionati'}
+                                                </button>
+                                                {isEditingAliases && aliasesReady && (
+                                                    <button
+                                                        type="button"
+                                                        className="secondary compact"
+                                                        onClick={() => {
+                                                            setIsEditingAliases(false)
+                                                            setSelectedAliases(confirmedAliases)
+                                                        }}
+                                                    >
+                                                        Annulla modifiche
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
                             {testError && <p className="error" role="alert">{testError}</p>}
 
                             <div className="wizard-actions">
@@ -1077,6 +1313,22 @@ export function SourceConnectionWizard({
                                     <strong className="summary-val">{sourceStatus?.primary_email ?? '—'}</strong>
                                 </div>
                                 <div className="summary-item">
+                                    <span className="summary-key">Alias Confermati</span>
+                                    {selectedSourceId === 'gmail' ? (
+                                        aliasesReady && confirmedAliases.length > 0 ? (
+                                            <strong className="summary-val text-success">
+                                                ✅ {confirmedAliases.join(', ')}
+                                            </strong>
+                                        ) : (
+                                            <strong className="summary-val text-warning">
+                                                ⚠️ Nessun alias confermato
+                                            </strong>
+                                        )
+                                    ) : (
+                                        <strong className="summary-val">Non applicabile</strong>
+                                    )}
+                                </div>
+                                <div className="summary-item">
                                     <span className="summary-key">Intervallo Temporale</span>
                                     <strong className="summary-val">
                                         {new Date(periodAfter).toLocaleDateString('it-IT')} → {new Date(periodBefore).toLocaleDateString('it-IT')}
@@ -1145,16 +1397,69 @@ export function SourceConnectionWizard({
                                     )}
                                 </div>
                             ) : (
-                                <div className="start-sync-box">
-                                    <button
-                                        type="button"
-                                        className="primary big-action-btn"
-                                        disabled={syncStarting}
-                                        onClick={handleTriggerSync}
-                                    >
-                                        {syncStarting ? 'Avvio job in corso…' : '🚀 Avvia Sincronizzazione Iniziale'}
-                                    </button>
-                                </div>
+                                <>
+                                    {selectedSourceId === 'gmail' && !aliasesReady && (
+                                        <div className="alias-blocker-callout" role="alert">
+                                            <div className="callout-header">
+                                                <span className="callout-icon" aria-hidden="true">⚠️</span>
+                                                <div>
+                                                    <h4>Conferma Alias Richiesta prima dell'Importazione</h4>
+                                                    <p className="muted">
+                                                        Per la policy di sicurezza autobiografica, GBrain non può sincronizzare la posta inviata finché non confermi esplicitamente la tua identità email.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            <div className="callout-actions">
+                                                {(sourceStatus?.primary_email || testResult?.primary_identity) && (
+                                                    <button
+                                                        type="button"
+                                                        className="primary compact"
+                                                        disabled={confirmingAliases}
+                                                        onClick={() =>
+                                                            handleConfirmAliases([
+                                                                sourceStatus?.primary_email || testResult?.primary_identity!,
+                                                            ])
+                                                        }
+                                                    >
+                                                        {confirmingAliases
+                                                            ? 'Conferma in corso…'
+                                                            : `✓ Conferma "${sourceStatus?.primary_email || testResult?.primary_identity}" ora`}
+                                                    </button>
+                                                )}
+                                                <button
+                                                    type="button"
+                                                    className="secondary compact"
+                                                    onClick={() => setCurrentStep(4)}
+                                                >
+                                                    ⚙️ Gestisci alias nello Step 4
+                                                </button>
+                                            </div>
+                                            {aliasError && <p className="error" role="alert">{aliasError}</p>}
+                                            {aliasSuccessMessage && <p className="success-msg" role="status">✅ {aliasSuccessMessage}</p>}
+                                        </div>
+                                    )}
+
+                                    <div className="start-sync-box">
+                                        <button
+                                            type="button"
+                                            className="primary big-action-btn"
+                                            disabled={syncStarting || (selectedSourceId === 'gmail' && !aliasesReady)}
+                                            onClick={handleTriggerSync}
+                                            title={
+                                                selectedSourceId === 'gmail' && !aliasesReady
+                                                    ? 'Conferma almeno un alias prima di avviare'
+                                                    : undefined
+                                            }
+                                        >
+                                            {syncStarting ? 'Avvio job in corso…' : '🚀 Avvia Sincronizzazione Iniziale'}
+                                        </button>
+                                        {selectedSourceId === 'gmail' && !aliasesReady && (
+                                            <p className="muted hint-disabled">
+                                                ⚠️ Sincronizzazione bloccata: conferma il tuo indirizzo email o alias sopra prima di procedere.
+                                            </p>
+                                        )}
+                                    </div>
+                                </>
                             )}
 
                             {syncError && <p className="error" role="alert">{syncError}</p>}

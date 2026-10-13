@@ -86,7 +86,16 @@ class GmailDisconnectResponse(BaseModel):
 
 
 class GmailAliasesRequest(BaseModel):
-    aliases: list[str] = Field(min_length=1, max_length=50)
+    aliases: list[str] = Field(default_factory=list, max_length=50)
+    confirmed_addresses: list[str] | None = Field(default=None, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_aliases_or_confirmed(self) -> GmailAliasesRequest:
+        if not self.aliases and self.confirmed_addresses:
+            self.aliases = self.confirmed_addresses
+        if not self.aliases:
+            raise ValueError("Confermare almeno un alias")
+        return self
 
 
 class GmailPolicyRequest(BaseModel):
@@ -263,6 +272,8 @@ class SourceStatusResponse(BaseModel):
     account_connected: bool = False
     external_account_id: str | None = None
     primary_email: str | None = None
+    aliases_ready: bool = False
+    confirmed_aliases: list[str] = Field(default_factory=list)
     status: str
     detected_callback_url: str
     lan_warning: LanWarningResponse | None = None

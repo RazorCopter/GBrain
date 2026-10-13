@@ -137,6 +137,20 @@ async def status_endpoint(
     )
 
 
+@gmail_router.get("/account", response_model=GmailAccountResponse)
+async def account_endpoint(
+    session: DbSession,
+    principal: PrincipalDep,
+) -> GmailAccountResponse:
+    account = await get_gmail_account(session, principal.owner.id, required=False)
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account Gmail non trovato.",
+        )
+    return _account_response(account)
+
+
 @gmail_router.post("/oauth/start", response_model=GmailOAuthStartResponse)
 async def oauth_start_endpoint(
     session: DbSession,

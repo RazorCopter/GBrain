@@ -1,8 +1,8 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
 **Data checkpoint:** 13 ottobre 2026
-**Checkpoint:** Fase F — Source Connection Wizard, connettori estensibili, credenziali cifrate e compatibilità Google OAuth
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il nuovo **Source Connection Wizard**, catalogo modulare dei connettori, gestione credenziali cifrate AES-256-GCM su PostgreSQL (Alembic head `20261012_0004`), fallback trasparente su filesystem, compatibilità robusta per datetime offset-naive delle credenziali Google e suite test deterministica estesa a 151 test (156 totali).
+**Checkpoint:** Fase F — Source Connection Wizard, conferma esplicita alias, connettori estensibili, credenziali cifrate e compatibilità Google OAuth
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il nuovo **Source Connection Wizard** comprensivo di conferma esplicita obbligatoria degli alias Gmail prima della sincronizzazione, catalogo modulare dei connettori, gestione credenziali cifrate AES-256-GCM su PostgreSQL (Alembic head `20261012_0004`), fallback trasparente su filesystem, compatibilità robusta per datetime offset-naive delle credenziali Google e suite test deterministica estesa a 152 test (157 totali).
 **Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo e UI; pronto per il collaudo infrastrutturale Docker/Linux e configurazione con account reali; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
@@ -11,7 +11,7 @@
 Questo checkpoint distingue rigorosamente:
 
 - **codice predisposto:** file, schemi, API e UI esistono, sono stati revisionati trasversalmente e allineati;
-- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (151 test superati tra backend e frontend);
+- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (152 test backend superati + typecheck/build frontend);
 - **test integrazione pendente:** test marcati esplicitamente con `@pytest.mark.skip` (3 test) che richiedono demone Docker Linux, PostgreSQL reale con estensioni o credenziali Google Cloud autorizzate;
 - **integrazione reale non eseguita:** non eseguito collaudo runtime con account Google reale o container Docker su Linux host.
 
@@ -91,10 +91,10 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - [`backend/migrations/versions/20261012_0004_source_credentials.py`](backend/migrations/versions/20261012_0004_source_credentials.py:1) — Migrazione Alembic (head `20261012_0004`) per la tabella `source_credentials`.
   - [`backend/src/gbrain/application/crypto.py`](backend/src/gbrain/application/crypto.py:1) — Modulo crittografico unificato AES-256-GCM con autenticazione AAD e derivazione di chiave.
   - [`backend/src/gbrain/infrastructure/source_credentials_repository.py`](backend/src/gbrain/infrastructure/source_credentials_repository.py:1) — Repository relazionale asincrono per il ciclo di vita delle credenziali fonti.
-  - [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:1) — Router FastAPI con endpoint `/api/sources/catalog` e `/api/sources/{source_id}/credentials`.
-  - [`backend/tests/test_sources_wizard_backend.py`](backend/tests/test_sources_wizard_backend.py:1) — Suite di 15 test per il catalogo fonti, cifratura credenziali, API private e fallback filesystem.
-  - [`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1) — Componente React per la configurazione guidata delle fonti con upload JSON e form manuale.
-  - [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) — Pagina catalogo fonti con schede connettori, stato di connessione e filtri di categoria.
+  - [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:1) — Router FastAPI con endpoint `/api/sources/catalog` e `/api/sources/{source_id}/credentials`, arricchito con flag `aliases_ready` e lista `confirmed_aliases`.
+  - [`backend/tests/test_sources_wizard_backend.py`](backend/tests/test_sources_wizard_backend.py:1) — Suite di 17 test per il catalogo fonti, cifratura credenziali, API private, fallback filesystem e flusso conferma esplicita alias.
+  - [`frontend/src/SourceConnectionWizard.tsx`](frontend/src/SourceConnectionWizard.tsx:1) — Componente React per la configurazione guidata delle fonti con upload JSON, form manuale e step dedicato per la conferma/modifica esplicita degli alias proprietario prima della prima sincronizzazione.
+  - [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) — Pagina catalogo fonti con schede connettori, stato di connessione, badge di prontezza alias e avvio guidato del wizard al passaggio alias.
 - **Modificati:**
   - [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py:1) — Estensione contrattuale con dataclass dei metadata connettori e catalogo registry.
   - [`backend/src/gbrain/domain/models.py`](backend/src/gbrain/domain/models.py:1) — Definizione ORM del modello [`SourceCredentialsModel`](backend/src/gbrain/domain/models.py:171).
@@ -109,8 +109,10 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - [`backend/tests/test_sources_wizard_backend.py`](backend/tests/test_sources_wizard_backend.py:1) — Suite estesa (16 test) con validazione di preview e aggiornamento token su database.
   - [`frontend/src/api.ts`](frontend/src/api.ts:1) — Client API con metodi per catalogo fonti e salvataggio credenziali cifrate.
   - [`frontend/src/GmailSourcesPage.tsx`](frontend/src/GmailSourcesPage.tsx:1) — Integrazione del wizard e pulsante di configurazione rapida credenziali.
-  - [`frontend/src/styles.css`](frontend/src/styles.css:1) — Stili responsivi per wizard di onboarding, card del catalogo fonti e upload box.
-  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con fix datetime offset-naive e diagnostica sanitizzata gateway.
+  - [`frontend/src/styles.css`](frontend/src/styles.css:1) — Stili responsivi per wizard di onboarding, card del catalogo fonti, upload box e interfaccia di selezione/conferma alias.
+  - [`backend/src/gbrain/presentation/gmail_api.py`](backend/src/gbrain/presentation/gmail_api.py:1) — Endpoint dedicato `GET /api/gmail/account` per recupero account e supporto validazione flessibile alias.
+  - [`backend/src/gbrain/presentation/schemas.py`](backend/src/gbrain/presentation/schemas.py:1) — Estensione schema `GmailAliasesRequest` per supportare `confirmed_addresses` e arricchimento `SourceStatusResponse` con `aliases_ready` e `confirmed_aliases`.
+  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con flusso di conferma esplicita degli alias Gmail nel Source Connection Wizard prima del sync.
 
 ---
 
