@@ -148,7 +148,15 @@ def serialize_credentials(credentials: Credentials) -> bytes:
         "client_id": credentials.client_id,
         "client_secret": credentials.client_secret,
         "scopes": sorted(scopes),
-        "expiry": credentials.expiry.astimezone(UTC).isoformat() if credentials.expiry else None,
+        "expiry": (
+            (
+                credentials.expiry.replace(tzinfo=UTC).isoformat()
+                if credentials.expiry.tzinfo is None
+                else credentials.expiry.astimezone(UTC).isoformat()
+            )
+            if credentials.expiry is not None
+            else None
+        ),
     }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -158,14 +166,19 @@ def deserialize_credentials(payload: bytes) -> StoredToken:
         value = json.loads(payload)
         scopes = tuple(str(scope) for scope in value["scopes"])
         expiry_value = value.get("expiry")
+        parsed_expiry: datetime | None = None
+        if expiry_value:
+            parsed_expiry = datetime.fromisoformat(str(expiry_value))
+            if parsed_expiry.tzinfo is not None:
+                parsed_expiry = parsed_expiry.astimezone(UTC).replace(tzinfo=None)
         result = StoredToken(
             token=str(value["token"]),
             refresh_token=(str(value["refresh_token"]) if value.get("refresh_token") else None),
             token_uri=str(value["token_uri"]),
-            client_id=str(value["client_id"]),
-            client_secret=str(value["client_secret"]),
+            client_id=str(value.get("client_id") or ""),
+            client_secret=str(value.get("client_secret") or ""),
             scopes=scopes,
-            expiry=datetime.fromisoformat(str(expiry_value)) if expiry_value else None,
+            expiry=parsed_expiry,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise GmailOAuthError(
@@ -179,14 +192,17 @@ def deserialize_credentials(payload: bytes) -> StoredToken:
 
 
 def credentials_from_stored(stored: StoredToken) -> Credentials:
+    expiry = stored.expiry
+    if expiry is not None and expiry.tzinfo is not None:
+        expiry = expiry.astimezone(UTC).replace(tzinfo=None)
     return Credentials(  # type: ignore[no-untyped-call]
         token=stored.token,
         refresh_token=stored.refresh_token,
         token_uri=stored.token_uri,
-        client_id=stored.client_id,
-        client_secret=stored.client_secret,
+        client_id=stored.client_id or None,
+        client_secret=stored.client_secret or None,
         scopes=list(stored.scopes),
-        expiry=stored.expiry,
+        expiry=expiry,
     )
 
 
@@ -231,12 +247,16 @@ def refresh_credentials(credentials: Credentials, settings: Settings) -> Credent
     scopes = frozenset(credentials.scopes or ())
     if scopes != frozenset({GMAIL_READONLY_SCOPE}):
         raise GmailOAuthError("scope_mismatch", "Refresh Gmail rifiutato: scope non esatto")
+    if credentials.expiry is not None and credentials.expiry.tzinfo is not None:
+        credentials.expiry = credentials.expiry.astimezone(UTC).replace(tzinfo=None)
     try:
         credentials.refresh(GoogleAuthRequest())  # type: ignore[no-untyped-call]
     except Exception as exc:
         raise GmailOAuthError(
-            "refresh_failed", "Rinnovo autorizzazione Gmail non riuscito"
+            "refresh_failed", f"Rinnovo autorizzazione Gmail non riuscito: {exc}"
         ) from exc
+    if credentials.expiry is not None and credentials.expiry.tzinfo is not None:
+        credentials.expiry = credentials.expiry.astimezone(UTC).replace(tzinfo=None)
     refreshed_scopes = frozenset(credentials.scopes or credentials.granted_scopes or ())
     if refreshed_scopes != frozenset({GMAIL_READONLY_SCOPE}):
         raise GmailOAuthError("scope_mismatch", "Refresh Gmail ha restituito scope non valido")

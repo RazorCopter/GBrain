@@ -20,8 +20,10 @@ from gbrain.application.gmail_oauth import (
     complete_oauth,
     decrypt_credentials,
     disconnect_account,
+    encrypt_credentials,
     is_gmail_configured,
     normalize_google_client_config,
+    refresh_credentials,
 )
 from gbrain.application.gmail_service import (
     GmailServiceError,
@@ -370,10 +372,20 @@ async def test_source_connection(
 
     start_time = time.perf_counter()
     try:
+        if not credentials.valid and credentials.refresh_token:
+            await asyncio.to_thread(refresh_credentials, credentials, settings)
+            account.oauth_token_ciphertext = encrypt_credentials(credentials, settings)
+            await session.commit()
+
+        initial_token = credentials.token
         gateway = OfficialGmailGateway.from_credentials(credentials)
         profile = await asyncio.to_thread(
             gateway.get_profile, RequestBudget(max_requests=1, max_items=1)
         )
+        if credentials.token != initial_token:
+            account.oauth_token_ciphertext = encrypt_credentials(credentials, settings)
+            await session.commit()
+
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         email_address = str(profile.get("emailAddress") or account.primary_email or "")
         return SourceTestConnectionResponse(
@@ -434,6 +446,15 @@ async def preview_source_import(
         )
 
     credentials = decrypt_credentials(account, settings)
+    if not credentials.valid and credentials.refresh_token:
+        try:
+            await asyncio.to_thread(refresh_credentials, credentials, settings)
+            account.oauth_token_ciphertext = encrypt_credentials(credentials, settings)
+            await session.commit()
+        except Exception as exc:
+            logger.warning("Refresh credenziali preview fallito: %s", exc)
+
+    initial_token = credentials.token
     gateway = OfficialGmailGateway.from_credentials(credentials)
     after_epoch = int(after_dt.timestamp())
     before_epoch = int(before_dt.timestamp())
@@ -495,6 +516,10 @@ async def preview_source_import(
                         snippet="Anteprima non disponibile",
                     )
                 )
+
+        if credentials.token != initial_token:
+            account.oauth_token_ciphertext = encrypt_credentials(credentials, settings)
+            await session.commit()
 
         estimated_count = len(sample_items)
         return SourcePreviewResponse(

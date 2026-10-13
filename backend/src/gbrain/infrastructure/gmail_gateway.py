@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import logging
 import random
+import re
 import socket
 import time
 from collections.abc import Callable, Mapping
@@ -10,11 +13,11 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Protocol, TypeVar, cast
 
 from google.auth.credentials import Credentials
-from google.auth.exceptions import RefreshError, TransportError
+from google.auth.exceptions import GoogleAuthError, RefreshError, TransportError
 from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from httplib2 import Http
+from httplib2 import Http, HttpLib2Error
 
 from gbrain.domain.connectors import (
     BudgetExhaustedError,
@@ -37,6 +40,7 @@ from gbrain.domain.gmail import (
 
 _T = TypeVar("_T")
 _SAFE_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+logger = logging.getLogger(__name__)
 
 
 class ExecutableRequest(Protocol):
@@ -118,6 +122,9 @@ class OfficialGmailGateway:
                 ConnectorErrorCategory.AUTH,
                 "Le credenziali Gmail devono avere esclusivamente lo scope readonly",
             )
+        # Normalizzazione difensiva di expiry: google.auth richiede naive UTC
+        if credentials.expiry is not None and credentials.expiry.tzinfo is not None:
+            credentials.expiry = credentials.expiry.astimezone(UTC).replace(tzinfo=None)
         effective_retry = retry_policy or RetryPolicy()
         authorized_http = AuthorizedHttp(
             credentials,
@@ -330,6 +337,14 @@ class OfficialGmailGateway:
                 raise
             except Exception as exc:
                 error = _classify_error(exc, operation, history_operation=history_operation)
+                logger.warning(
+                    "Operazione Gmail '%s' fallita (tentativo %d/%d, %s): %s",
+                    operation,
+                    attempt + 1,
+                    self._retry.max_attempts,
+                    exc.__class__.__name__,
+                    error.safe_message,
+                )
                 if not error.retryable or attempt + 1 >= self._retry.max_attempts:
                     raise error from exc
                 if budget.requests_remaining <= 0:
@@ -355,6 +370,35 @@ def _temporal_query(selection: GmailSelection) -> str:
     return f"after:{after} before:{before}"
 
 
+def _sanitize_error_text(text: str) -> str:
+    if not text:
+        return ""
+    # Maschera token Bearer
+    sanitized = re.sub(
+        r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", text, flags=re.IGNORECASE
+    )
+    # Maschera access token tipici di Google (ya29.xxx)
+    sanitized = re.sub(r"ya29\.[A-Za-z0-9_\-]+", "[REDACTED_TOKEN]", sanitized)
+    # Maschera client secret / password / secret / key / client_id
+    sanitized = re.sub(
+        r'(client_secret|secret|password|client_id)\s*[:=]\s*["\']?[^"\'\s&]+["\']?',
+        r"\1=[REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    # Maschera indirizzi email
+    sanitized = re.sub(
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[REDACTED_EMAIL]", sanitized
+    )
+    # Rimuovi query string dagli URL (https://...?... -> https://...)
+    sanitized = re.sub(r"(https?://[^\s\?]+)\?[^\s]+", r"\1", sanitized)
+    # Comprimi spazi multipli e ritorni a capo
+    sanitized = " ".join(sanitized.split())
+    if len(sanitized) > 300:
+        sanitized = sanitized[:297] + "..."
+    return sanitized
+
+
 def _classify_error(
     exc: BaseException,
     operation: str,
@@ -363,51 +407,90 @@ def _classify_error(
 ) -> ConnectorError:
     if isinstance(exc, HttpError):
         status = int(getattr(exc.resp, "status", 0) or 0)
+        reason_phrase = str(getattr(exc.resp, "reason", "") or "").strip()
+        raw_reason = getattr(exc, "reason", "") or ""
+        sanitized_reason = _sanitize_error_text(str(raw_reason))
+        http_desc = (
+            f"Google HTTP {status} {reason_phrase}".strip()
+            if reason_phrase
+            else f"Google HTTP {status}"
+        )
+        detail_suffix = (
+            f": {sanitized_reason}"
+            if sanitized_reason and sanitized_reason.lower() != reason_phrase.lower()
+            else ""
+        )
         if history_operation and status == 404:
             return ConnectorError(
                 ConnectorErrorCategory.HISTORY_EXPIRED,
-                "Checkpoint Gmail history scaduto; riconciliazione full necessaria",
+                f"Checkpoint Gmail history scaduto durante {operation} ({http_desc}); riconciliazione full necessaria",
                 status_code=status,
             )
         if status in {401, 403}:
             return ConnectorError(
                 ConnectorErrorCategory.AUTH,
-                "Autorizzazione Gmail non valida, revocata o insufficiente",
+                f"Autorizzazione Gmail non valida, revocata o insufficiente durante {operation} ({http_desc}{detail_suffix})",
                 status_code=status,
             )
         if status == 429:
             return ConnectorError(
                 ConnectorErrorCategory.QUOTA,
-                "Quota Gmail temporaneamente esaurita",
+                f"Quota Gmail temporaneamente esaurita durante {operation} ({http_desc}{detail_suffix})",
                 retryable=True,
                 status_code=status,
             )
         if status in _SAFE_TRANSIENT_STATUSES:
             return ConnectorError(
                 ConnectorErrorCategory.TRANSIENT,
-                f"Errore transitorio Gmail durante {operation}",
+                f"Errore transitorio Gmail durante {operation} ({http_desc}{detail_suffix})",
                 retryable=True,
                 status_code=status,
             )
         return ConnectorError(
             ConnectorErrorCategory.PERMANENT,
-            f"Errore Gmail permanente durante {operation}",
+            f"Errore permanente Gmail durante {operation} ({http_desc}{detail_suffix})",
             status_code=status,
         )
     if isinstance(exc, RefreshError):
+        sanitized = _sanitize_error_text(str(exc))
+        detail = f": {sanitized}" if sanitized else ""
         return ConnectorError(
             ConnectorErrorCategory.AUTH,
-            "Refresh OAuth Gmail fallito o token revocato",
+            f"Refresh OAuth Gmail fallito o token revocato durante {operation} ({exc.__class__.__name__}{detail})",
         )
-    if isinstance(exc, (TimeoutError, socket.timeout, TransportError, OSError)):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
         return ConnectorError(
             ConnectorErrorCategory.TRANSIENT,
-            f"Errore di trasporto transitorio durante {operation}",
+            f"Timeout di rete durante {operation} ({exc.__class__.__name__})",
             retryable=True,
         )
+    if isinstance(exc, (TransportError, OSError, HttpLib2Error, socket.error)):
+        sanitized = _sanitize_error_text(str(exc))
+        detail = f": {sanitized}" if sanitized else ""
+        return ConnectorError(
+            ConnectorErrorCategory.TRANSIENT,
+            f"Errore di trasporto transitorio durante {operation} ({exc.__class__.__name__}{detail})",
+            retryable=True,
+        )
+    if isinstance(exc, GoogleAuthError):
+        sanitized = _sanitize_error_text(str(exc))
+        detail = f": {sanitized}" if sanitized else ""
+        return ConnectorError(
+            ConnectorErrorCategory.AUTH,
+            f"Errore autenticazione Google durante {operation} ({exc.__class__.__name__}{detail})",
+        )
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError)):
+        sanitized = _sanitize_error_text(str(exc))
+        detail = f": {sanitized}" if sanitized else ""
+        return ConnectorError(
+            ConnectorErrorCategory.PARSE,
+            f"Risposta o formato Gmail non valido durante {operation} ({exc.__class__.__name__}{detail})",
+        )
+    sanitized = _sanitize_error_text(str(exc))
+    detail = f": {sanitized}" if sanitized else ""
     return ConnectorError(
         ConnectorErrorCategory.PERMANENT,
-        f"Risposta o contenuto Gmail non valido durante {operation}",
+        f"Errore Gmail durante {operation} ({exc.__class__.__name__}{detail})",
     )
 
 

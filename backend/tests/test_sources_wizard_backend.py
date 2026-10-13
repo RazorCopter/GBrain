@@ -600,6 +600,48 @@ def test_source_connection_live_mocked() -> None:
         assert data_fail["latency_ms"] is not None
         assert "non riuscita" in data_fail["message"]
 
+    # 4. Test connessione con token scaduto e refresh proattivo
+    from gbrain.application.gmail_oauth import decrypt_credentials as _decrypt
+
+    with (
+        patch("gbrain.presentation.sources_api.refresh_credentials") as mock_refresh,
+        patch("gbrain.presentation.sources_api.OfficialGmailGateway") as mock_gw_cls,
+    ):
+
+        def fake_refresh(creds: Any, setts: Any) -> Any:
+            creds.token = "refreshed-live-token"  # noqa: S105
+            return creds
+
+        mock_refresh.side_effect = fake_refresh
+        mock_gateway = mock_gw_cls.from_credentials.return_value
+        mock_gateway.get_profile.return_value = {
+            "emailAddress": "user@testdomain.com",
+            "messagesTotal": 42,
+        }
+
+        # Impostiamo il token nel DB con expiry nel passato
+        account.oauth_token_ciphertext = encrypt_credentials(
+            Credentials(  # type: ignore[no-untyped-call]
+                token="expired-token",  # noqa: S106
+                refresh_token="ref-tok",  # noqa: S106
+                token_uri="https://oauth2.googleapis.com/token",  # noqa: S106
+                client_id="cid",
+                client_secret="sec",  # noqa: S106
+                scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+                expiry=datetime.now(UTC) - timedelta(hours=2),
+            ),
+            settings,
+        )
+
+        resp_refreshed = client.post("/api/sources/gmail/test-connection")
+        assert resp_refreshed.status_code == 200
+        data_ref = resp_refreshed.json()
+        assert data_ref["connected"] is True
+        mock_refresh.assert_called_once()
+        # Verifica che il token rinnovato sia stato salvato nel database
+        decrypted_after = _decrypt(account, settings)
+        assert decrypted_after.token == "refreshed-live-token"  # noqa: S105
+
 
 def test_source_preview_sent_messages() -> None:
     client, session, owner = _build_test_client()
@@ -938,3 +980,46 @@ def test_gmail_api_oauth_callback_flow() -> None:
     )
     assert resp_err.status_code == 303
     assert resp_err.headers["location"] == "/sources?error=consent_denied"
+
+
+def test_decrypt_credentials_expiry_compatibility() -> None:
+    import uuid
+    from datetime import UTC, datetime, timedelta
+
+    from google.oauth2.credentials import Credentials
+
+    from gbrain.application.gmail_oauth import (
+        decrypt_credentials,
+        encrypt_credentials,
+    )
+    from gbrain.domain.gmail import GMAIL_READONLY_SCOPE
+    from gbrain.domain.models import ConnectorAccount, ConnectorAccountStatus
+
+    settings = _test_settings()
+    # Creiamo credenziali con expiry aware (es. da serializzazione json UTC)
+    future = datetime.now(UTC) + timedelta(hours=1)
+    creds = Credentials(  # type: ignore[no-untyped-call]
+        token="access_tok",  # noqa: S106
+        refresh_token="refresh_tok",  # noqa: S106
+        token_uri="https://oauth2.googleapis.com/token",  # noqa: S106
+        client_id="cid.apps.googleusercontent.com",
+        client_secret="secret",  # noqa: S106
+        scopes=[GMAIL_READONLY_SCOPE],
+        expiry=future,
+    )
+    ciphertext = encrypt_credentials(creds, settings)
+    account = ConnectorAccount(
+        owner_id=uuid.uuid4(),
+        connector_kind="gmail",
+        status=ConnectorAccountStatus.ACTIVE,
+        oauth_token_ciphertext=ciphertext,
+        oauth_token_format_version=1,
+    )
+
+    restored = decrypt_credentials(account, settings)
+    # Verifica fondamentale: l'accesso a valid / expired NON deve sollevare:
+    # TypeError: can't compare offset-naive and offset-aware datetimes
+    assert restored.valid is True
+    assert restored.expired is False
+    assert restored.expiry is not None
+    assert restored.expiry.tzinfo is None  # Deve essere naive per compatibilità con google.auth

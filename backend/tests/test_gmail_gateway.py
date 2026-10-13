@@ -5,7 +5,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from google.auth.exceptions import RefreshError
+from google.oauth2.credentials import Credentials
 from googleapiclient.errors import HttpError
+from httplib2.error import ServerNotFoundError
 
 from gbrain.domain.connectors import (
     BudgetExhaustedError,
@@ -13,8 +16,18 @@ from gbrain.domain.connectors import (
     ConnectorErrorCategory,
     RequestBudget,
 )
-from gbrain.domain.gmail import GmailHistoryCursor, GmailLocator, GmailSelection
-from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway, RetryPolicy
+from gbrain.domain.gmail import (
+    GMAIL_READONLY_SCOPE,
+    GmailHistoryCursor,
+    GmailLocator,
+    GmailSelection,
+)
+from gbrain.infrastructure.gmail_gateway import (
+    OfficialGmailGateway,
+    RetryPolicy,
+    _classify_error,
+    _sanitize_error_text,
+)
 
 
 class _Request:
@@ -204,3 +217,50 @@ def test_history_mixed_events_return_locators_for_refetch_not_payloads() -> None
     assert {locator.message_id for locator in page.locators} == {"sent", "changed"}
     assert page.deleted_message_ids == ("removed",)
     assert page.latest_history_id == "102"
+
+
+def test_sanitize_error_text_removes_tokens_emails_and_query_strings() -> None:
+    raw = (
+        "Error accessing https://gmail.googleapis.com/v1/users/me/profile?key=secret123&other=val "
+        "with token ya29.a0AfH6_SECRET and Bearer my-bearer-tok and user secret_agent@example.com, client_secret='topsecret'"
+    )
+    sanitized = _sanitize_error_text(raw)
+    assert "secret123" not in sanitized
+    assert "ya29" not in sanitized
+    assert "secret_agent@example.com" not in sanitized
+    assert "[REDACTED_EMAIL]" in sanitized
+    assert "[REDACTED_TOKEN]" in sanitized
+    assert "Bearer [REDACTED]" in sanitized
+    assert "client_secret=[REDACTED]" in sanitized
+    assert "?key=" not in sanitized
+
+
+def test_classify_error_httplib2_server_not_found() -> None:
+    exc = ServerNotFoundError("Unable to find the server at gmail.googleapis.com")
+    error = _classify_error(exc, "profile.get", history_operation=False)
+    assert error.category == ConnectorErrorCategory.TRANSIENT
+    assert error.retryable is True
+    assert "ServerNotFoundError" in error.safe_message
+    assert "profile.get" in error.safe_message
+
+
+def test_classify_error_refresh_error() -> None:
+    exc = RefreshError("invalid_grant: Bad Request")  # type: ignore[no-untyped-call]
+    error = _classify_error(exc, "profile.get", history_operation=False)
+    assert error.category == ConnectorErrorCategory.AUTH
+    assert error.retryable is False
+    assert "RefreshError" in error.safe_message
+    assert "invalid_grant" in error.safe_message
+
+
+def test_from_credentials_normalizes_aware_expiry() -> None:
+    creds = Credentials(  # type: ignore[no-untyped-call]
+        token="test_token",  # noqa: S106
+        scopes=[GMAIL_READONLY_SCOPE],
+        expiry=datetime.now(UTC),
+    )
+    assert creds.expiry is not None and creds.expiry.tzinfo is not None
+    # La costruzione del gateway normalizza expiry eliminando tzinfo per compatibilità google.auth
+    gateway = OfficialGmailGateway.from_credentials(creds)
+    assert gateway is not None
+    assert creds.expiry.tzinfo is None
