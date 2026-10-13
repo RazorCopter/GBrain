@@ -21,6 +21,7 @@ from gbrain.domain.gmail import (
     GmailSelection,
     build_gmail_link,
     normalize_email_address,
+    resolve_sync_mode,
 )
 from gbrain.domain.models import (
     ConnectorAccount,
@@ -34,6 +35,7 @@ from gbrain.domain.models import (
     SourceRevision,
 )
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
+from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
 
 JobMode = Literal["preview", "full", "incremental", "reconciliation"]
 
@@ -304,17 +306,25 @@ async def create_and_enqueue_job(
     if account.status != ConnectorAccountStatus.ACTIVE:
         raise GmailServiceError("gmail_not_active", "Account Gmail non attivo")
     snapshot = policy_input(policy).snapshot()
+    effective_mode: str = mode
+    if mode != "preview":
+        repository = AsyncPostgresGmailRepository(session)
+        chk = await repository.load_checkpoint(account.id, policy.id)
+        effective_mode = resolve_sync_mode(chk, mode).value
+
     job = ImportJob(
         source_kind=GMAIL_SOURCE_KIND,
         connector_account_id=account.id,
         source_policy_id=policy.id,
-        mode=mode,
+        mode=effective_mode,
         policy_snapshot=snapshot,
         checkpoint={
             "phase": "created",
             "policy": snapshot,
-            "persisted_messages": 0 if mode == "preview" else None,
-            "checkpoint_advanced": False if mode == "preview" else None,
+            "persisted_messages": 0 if effective_mode == "preview" else None,
+            "checkpoint_advanced": False if effective_mode == "preview" else None,
+            "requested_mode": mode,
+            "mode_resolved": effective_mode,
         },
         status=ImportJobStatus.PENDING,
     )
@@ -328,7 +338,9 @@ async def create_and_enqueue_job(
         ) from exc
     await session.refresh(job)
     try:
-        queue_id = await enqueuer(job_id=str(job.id), account_id=str(account.id), mode=mode)
+        queue_id = await enqueuer(
+            job_id=str(job.id), account_id=str(account.id), mode=effective_mode
+        )
     except Exception as exc:
         job.status = ImportJobStatus.FAILED
         job.error_code = "enqueue_failed"

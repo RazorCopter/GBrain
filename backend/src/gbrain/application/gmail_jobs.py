@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ from gbrain.domain.gmail import (
     GmailReconciliationState,
     GmailSelection,
     GmailSyncMode,
+    resolve_sync_mode,
 )
 from gbrain.domain.models import (
     ConnectorAccount,
@@ -154,6 +156,7 @@ async def _finish(
     processed: int | None = None,
     error_code: str | None = None,
     error_detail: str | None = None,
+    is_partial: bool = False,
 ) -> None:
     async with database.session_factory() as session:
         job = await session.get(ImportJob, job_id)
@@ -163,10 +166,18 @@ async def _finish(
         job.finished_at = datetime.now(UTC)
         if processed is not None:
             job.processed_items = processed
+        phase = "partial" if is_partial else status.value
         if checkpoint is not None:
-            job.checkpoint = _checkpoint_payload(checkpoint, phase=status.value)
+            is_initial_complete = not is_partial and checkpoint.is_initial_complete
+            job.checkpoint = _checkpoint_payload(
+                checkpoint,
+                phase=phase,
+                is_initial_complete=is_initial_complete,
+                partial=is_partial,
+                resumption_token=checkpoint.page_token if is_partial else None,
+            )
         else:
-            job.checkpoint = {**job.checkpoint, "phase": status.value}
+            job.checkpoint = {**job.checkpoint, "phase": phase, "partial": is_partial}
         job.error_code = error_code
         job.error_detail = error_detail
         await session.commit()
@@ -208,7 +219,7 @@ async def _run_full(
 ) -> tuple[int, GmailCheckpointState]:
     assert job.source_policy_id is not None
     cursor = GmailCursor(checkpoint.page_token) if checkpoint.page_token else None
-    processed = job.processed_items
+    processed = job.processed_items or 0
     current = checkpoint
     while True:
         if await _cancel_requested(database, job.id):
@@ -259,6 +270,36 @@ async def _run_full(
         await _update_progress(database, job.id, current, processed, phase="page_committed")
         cursor = page.next_cursor
         if cursor is None or page.state != PageState.COMPLETE:
+            # Se la scansione completa ha terminato tutte le pagine ma history_id è ancora None
+            # (nessun messaggio inviato nel range), richiediamo il reale historyId dell'account a Google
+            if cursor is None and page.state == PageState.COMPLETE and current.history_id is None:
+                try:
+                    profile = await asyncio.to_thread(connector._gateway.get_profile, budget)
+                    profile_history = getattr(profile, "get", lambda _: None)("historyId")
+                    if profile_history:
+                        current = GmailCheckpointState(
+                            account_id=current.account_id,
+                            policy_id=current.policy_id,
+                            history_id=str(profile_history),
+                            page_token=current.page_token,
+                            coverage_after=current.coverage_after,
+                            coverage_before=current.coverage_before,
+                            last_synced_at=current.last_synced_at,
+                            reconciliation_state=current.reconciliation_state,
+                            last_error_code=current.last_error_code,
+                            version=current.version,
+                        )
+                        await _persist_page(
+                            database,
+                            account.id,
+                            job.source_policy_id,
+                            [],
+                            current,
+                        )
+                except Exception:
+                    logging.getLogger(__name__).debug(
+                        "Lettura profile fallback per historyId non riuscita"
+                    )
             return processed, current
 
 
@@ -269,12 +310,15 @@ async def _run_incremental(
     connector: GmailSentConnector,
     checkpoint: GmailCheckpointState,
     budget: RequestBudget,
+    selection: GmailSelection | None = None,
 ) -> tuple[int, GmailCheckpointState]:
     assert job.source_policy_id is not None
     if not checkpoint.history_id:
+        if selection is not None:
+            return await _run_full(database, job, account, connector, checkpoint, budget, selection)
         raise GmailJobPermanentError("L'incrementale richiede un checkpoint history")
     cursor: GmailHistoryCursor | None = GmailHistoryCursor(checkpoint.history_id)
-    processed = job.processed_items
+    processed = job.processed_items or 0
     current = checkpoint
     while cursor is not None:
         if await _cancel_requested(database, job.id):
@@ -421,6 +465,7 @@ async def execute_gmail_job(
         job, account, checkpoint = await _load_job_context(
             database, parsed_job_id, parsed_account_id
         )
+        processed = job.processed_items or 0
         credentials = decrypt_credentials(account, settings)
         if not credentials.valid and credentials.refresh_token:
             await asyncio.to_thread(refresh_credentials, credentials, settings)
@@ -444,32 +489,71 @@ async def execute_gmail_job(
         if mode == "preview":
             await _run_preview(database, job, connector, budget, selection)
             return
+
+        effective_mode = resolve_sync_mode(checkpoint, mode)
+        if effective_mode.value != mode:
+            async with database.session_factory() as session:
+                persisted_job = await session.get(ImportJob, job.id)
+                if persisted_job is not None:
+                    persisted_job.mode = effective_mode.value
+                    persisted_job.checkpoint = {
+                        **persisted_job.checkpoint,
+                        "mode_resolved": effective_mode.value,
+                        "original_mode": mode,
+                    }
+                    await session.commit()
+            mode = effective_mode.value
+
+        is_partial = False
         if mode == GmailSyncMode.FULL.value:
             processed, checkpoint = await _run_full(
                 database, job, account, connector, checkpoint, budget, selection
             )
+            is_partial = checkpoint.page_token is not None
         elif mode == GmailSyncMode.INCREMENTAL.value:
-            processed, checkpoint = await _run_incremental(
-                database, job, account, connector, checkpoint, budget
-            )
+            try:
+                processed, checkpoint = await _run_incremental(
+                    database, job, account, connector, checkpoint, budget, selection
+                )
+            except ConnectorError as exc:
+                if exc.category == ConnectorErrorCategory.HISTORY_EXPIRED:
+                    assert job.source_policy_id is not None
+                    required = checkpoint.require_full_reconciliation("gmail_history_expired")
+                    async with database.session_factory() as session:
+                        await AsyncPostgresGmailRepository(session).mark_reconciliation_required(
+                            account.id, job.source_policy_id, required
+                        )
+                    # Fallback controllato a riconciliazione full
+                    processed, checkpoint = await _run_reconciliation(
+                        database, job, account, connector, required, budget, selection
+                    )
+                else:
+                    raise
         elif mode == GmailSyncMode.RECONCILIATION.value:
             processed, checkpoint = await _run_reconciliation(
                 database, job, account, connector, checkpoint, budget, selection
             )
         else:
             raise GmailJobPermanentError("Modalità lavoro Gmail non valida")
+
         await _finish(
             database,
             job.id,
             status=ImportJobStatus.COMPLETED,
             checkpoint=checkpoint,
             processed=processed,
+            is_partial=is_partial,
         )
     except asyncio.CancelledError:
         return
     except ConnectorError as exc:
         if exc.category == ConnectorErrorCategory.HISTORY_EXPIRED and checkpoint is not None:
             required = checkpoint.require_full_reconciliation("gmail_history_expired")
+            if job.source_policy_id is not None:
+                async with database.session_factory() as session:
+                    await AsyncPostgresGmailRepository(session).mark_reconciliation_required(
+                        account.id, job.source_policy_id, required
+                    )
             await _finish(
                 database,
                 parsed_job_id,
@@ -478,6 +562,7 @@ async def execute_gmail_job(
                 processed=processed,
                 error_code="gmail_history_expired",
                 error_detail="Cronologia Gmail scaduta: riconciliazione completa richiesta",
+                is_partial=True,
             )
             return
         if exc.category in {ConnectorErrorCategory.TRANSIENT, ConnectorErrorCategory.QUOTA}:
@@ -511,4 +596,5 @@ async def execute_gmail_job(
             processed=processed,
             error_code=str(code),
             error_detail=str(detail)[:500],
+            is_partial=checkpoint.page_token is not None if checkpoint else False,
         )

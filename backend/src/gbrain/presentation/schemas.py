@@ -277,6 +277,10 @@ class SourceStatusResponse(BaseModel):
     status: str
     detected_callback_url: str
     lan_warning: LanWarningResponse | None = None
+    initial_import_completed: bool = False
+    has_checkpoint: bool = False
+    checkpoint_history_id: str | None = None
+    checkpoint_page_token: str | None = None
 
 
 class SourceCredentialsUploadRequest(BaseModel):

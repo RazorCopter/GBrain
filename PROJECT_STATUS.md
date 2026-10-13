@@ -1,8 +1,8 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
 **Data checkpoint:** 13 ottobre 2026
-**Checkpoint:** Fase F — Source Connection Wizard, conferma esplicita alias, connettori estensibili, credenziali cifrate e compatibilità Google OAuth
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il nuovo **Source Connection Wizard** comprensivo di conferma esplicita obbligatoria degli alias Gmail prima della sincronizzazione, catalogo modulare dei connettori, gestione credenziali cifrate AES-256-GCM su PostgreSQL (Alembic head `20261012_0004`), fallback trasparente su filesystem, compatibilità robusta per datetime offset-naive delle credenziali Google, ascolto worker esteso alla coda `gmail` e suite test deterministica estesa a 154 test (159 totali).
+**Checkpoint:** Fase G — Risoluzione autoritativa modalità di sincronizzazione (full vs incremental), gestione robusta checkpoint e ripresa esatta
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il Source Connection Wizard e con la **determinazione autoritativa backend-driven della modalità di sincronizzazione** (`resolve_sync_mode`), validazione rigorosa del completamento iniziale (`is_initial_complete`), fallback su `users.getProfile` per acquisizione `historyId` su caselle senza messaggi nel range, gestione affidabile della ripresa checkpoint parziale con token di paginazione, e suite di test deterministica estesa a **161 test superati** (166 totali raccolti, 5 skipped).
 **Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo e UI; pronto per il collaudo infrastrutturale Docker/Linux e configurazione con account reali; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
@@ -11,8 +11,8 @@
 Questo checkpoint distingue rigorosamente:
 
 - **codice predisposto:** file, schemi, API e UI esistono, sono stati revisionati trasversalmente e allineati;
-- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (154 test backend superati + typecheck/build frontend);
-- **test integrazione pendente:** test marcati esplicitamente con `@pytest.mark.skip` (3 test) che richiedono demone Docker Linux, PostgreSQL reale con estensioni o credenziali Google Cloud autorizzate;
+- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (161 test backend superati + typecheck/build frontend);
+- **test integrazione pendente:** test marcati esplicitamente con `@pytest.mark.skip` (5 test) che richiedono demone Docker Linux, PostgreSQL reale con estensioni o credenziali Google Cloud autorizzate;
 - **integrazione reale non eseguita:** non eseguito collaudo runtime con account Google reale o container Docker su Linux host.
 
 Un elemento predisposto o coperto da fixture/fake non equivale a un collaudo runtime. I rapporti precedenti ([`docs/RAPPORTO_COLLAUDO_FASE1_2026-10-11.md`](docs/RAPPORTO_COLLAUDO_FASE1_2026-10-11.md), sottocompiti A–E) rimangono storici; la sintesi ufficiale corrente della Fase 2 e dell'infrastruttura connettori è questo documento.
@@ -64,6 +64,11 @@ Nel ciclo di implementazione del **Source Connection Wizard** sono stati consoli
     - Gestione timezone-naive/aware normalizzata su UTC per `expiry` di `google.oauth2.credentials.Credentials` in [`backend/src/gbrain/application/gmail_oauth.py`](backend/src/gbrain/application/gmail_oauth.py:148) e [`backend/src/gbrain/application/gmail_oauth.py`](backend/src/gbrain/application/gmail_oauth.py:192), eliminando l'errore `TypeError: can't compare offset-naive and offset-aware datetimes` durante il refresh automatico interno della libreria Google.
     - Disaccoppiamento del test di connessione da `users.getProfile` mediante fallback trasparente su `OfficialGmailGateway.list_history` o conteggio messaggi quando `users.getProfile` non è disponibile per gli scope autorizzati (`gmail.readonly`).
     - Classificazione degli errori HTTP e di refresh Google con diagnostica sanitizzata esente da segreti in [`backend/src/gbrain/infrastructure/gmail_gateway.py`](backend/src/gbrain/infrastructure/gmail_gateway.py:400) e persistenza del token rinfrescato in anteprima su [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:520).
+6. **Risoluzione Autoritativa Modalità di Sincronizzazione e Gestione Robusta Checkpoint:**
+    - Determinazione autoritativa backend-driven in [`backend/src/gbrain/domain/gmail.py`](backend/src/gbrain/domain/gmail.py:320) (`resolve_sync_mode`): forza la scansione `full` se l'importazione iniziale non è conclusa con successo (assenza di checkpoint, assenza di `history_id` valido o `page_token` residuo), consentendo la modalità `incremental` solo a fronte di checkpoint iniziale integro e forzando `reconciliation` in caso di `REQUIRED_HISTORY_EXPIRED`.
+    - Resilienza a range vuoto: acquisizione automatica di `historyId` tramite fallback su `users.getProfile` quando la scansione iniziale copre un periodo privo di email inviate, prevenendo loop infiniti di riesecuzione `full`.
+    - Checkpoint parziali e resumption token: supporto al tracciamento di `is_initial_complete=False` e salvataggio del token di paginazione corrente in caso di interruzione/raggiungimento budget, garantendo la continuazione senza salti.
+    - Esposizione stato alle API e UI: inclusione di `initial_import_completed`, `has_checkpoint`, `checkpoint_history_id`, `checkpoint_page_token` in `GET /api/sources/{source_id}/status` e selezione automatica della modalità `full` vs `incremental` nel trigger rapido di sincronizzazione in [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:142).
 
 ---
 
@@ -72,14 +77,14 @@ Nel ciclo di implementazione del **Source Connection Wizard** sono stati consoli
 Tutti i controlli deterministici sono stati eseguiti localmente con esito positivo:
 
 - **Pytest:** `uv run pytest backend/tests -v`
-  - **151 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
-  - 0 fallimenti, 0 errori (156 raccolti).
+  - **161 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
+  - 0 fallimenti, 0 errori (166 raccolti).
 - **Ruff linter:** `uv run ruff check backend`
   - **Superato:** 0 errori, 0 avvisi.
 - **Ruff formatter:** `uv run ruff format --check backend`
-  - **Superato:** 55 file formattati in modo conforme.
+  - **Superato:** 56 file formattati in modo conforme.
 - **Mypy type check:** `uv run mypy backend/src backend/tests`
-  - **Superato:** Successo su tutti i 50 file sorgente, 0 errori di tipo.
+  - **Superato:** Successo su tutti i 51 file sorgente, 0 errori di tipo.
 - **Frontend TypeScript & Build:** `npm --prefix frontend run build`
   - **Superato:** Type check `tsc -b` superato, bundle Vite completato senza errori.
 
@@ -114,7 +119,15 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - [`backend/src/gbrain/presentation/schemas.py`](backend/src/gbrain/presentation/schemas.py:1) — Estensione schema `GmailAliasesRequest` per supportare `confirmed_addresses` e arricchimento `SourceStatusResponse` con `aliases_ready` e `confirmed_aliases`.
   - [`backend/src/gbrain/worker.py`](backend/src/gbrain/worker.py:1) — Inclusione della coda `gmail` nelle code di ascolto del worker Procrastinate (`WORKER_QUEUES`).
   - [`backend/tests/test_worker_lifecycle.py`](backend/tests/test_worker_lifecycle.py:1) — Verifica parametri di avvio e registrazione code ascoltate dal worker Procrastinate.
-  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con configurazione code di ascolto worker e flusso di conferma esplicita degli alias Gmail nel Source Connection Wizard.
+  - [`backend/src/gbrain/domain/gmail.py`](backend/src/gbrain/domain/gmail.py:1) — Definizione delle logiche di dominio autoritative: `resolve_sync_mode()`, `is_initial_import_completed()` e property `is_initial_complete` su `GmailCheckpointState`.
+  - [`backend/src/gbrain/application/gmail_jobs.py`](backend/src/gbrain/application/gmail_jobs.py:1) — Supporto a checkpoint parziali e resumption token, risoluzione autoritativa del sync mode in esecuzione job Procrastinate, fallback su `get_profile` per `historyId` a range vuoto.
+  - [`backend/src/gbrain/application/gmail_sync.py`](backend/src/gbrain/application/gmail_sync.py:1) — Determinazione autoritativa del sync mode all'interno di `GmailSyncEngine`, preservazione token di paginazione su budget parziale e lettura profilo su completamento scansione vuota.
+  - [`backend/src/gbrain/application/gmail_service.py`](backend/src/gbrain/application/gmail_service.py:1) — Risoluzione autoritativa della modalità in `create_and_enqueue_job` e popolamento stato checkpoint.
+  - [`backend/src/gbrain/presentation/sources_api.py`](backend/src/gbrain/presentation/sources_api.py:1) — Esposizione di `initial_import_completed`, `has_checkpoint`, `checkpoint_history_id`, `checkpoint_page_token` e normalizzazione sincronizzazione su `POST /api/sources/{source_id}/sync`.
+  - [`backend/tests/test_gmail_sync_mode_and_checkpoints.py`](backend/tests/test_gmail_sync_mode_and_checkpoints.py:1) — Suite esaustiva (7 test) per determinazione autoritativa del sync mode, gestione range vuoto con fallback `historyId`, ripresa incrementale e ripresa da checkpoint parziale.
+  - [`frontend/src/api.ts`](frontend/src/api.ts:1) — Tipizzazione estesa `SourceStatusResponse` con i flag di checkpoint e completamento iniziale.
+  - [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) — Selezione dinamica e automatica di `incremental` vs `full` nel trigger rapido di sincronizzazione basata sullo stato autoritativo del backend.
+  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con risoluzione autoritativa sync mode, robustezza checkpoint e suite test a 161 test superati.
 
 ---
 

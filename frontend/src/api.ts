@@ -220,6 +220,10 @@ export interface SourceStatusResponse {
     status: ConnectorOperationalStatus | string
     detected_callback_url: string
     lan_warning: LanWarningResponse | null
+    initial_import_completed?: boolean
+    has_checkpoint?: boolean
+    checkpoint_history_id?: string | null
+    checkpoint_page_token?: string | null
 }
 
 export interface SourceCredentialsUploadPayload {

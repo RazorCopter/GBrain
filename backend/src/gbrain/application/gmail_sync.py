@@ -34,6 +34,7 @@ from gbrain.domain.gmail import (
     GmailSyncMode,
     GmailSyncResult,
     NormalizedGmailMessage,
+    resolve_sync_mode,
 )
 
 
@@ -292,14 +293,108 @@ class GmailSyncEngine:
             # Nessun checkpoint viene avanzato per una pagina non completamente
             # fetchata: il replay riparte dal suo token precedente senza skip.
             state = PageState.PARTIAL_BUDGET
+        # Se la scansione completa termina ma il checkpoint non ha history_id
+        # (es. nessuna email inviata nel range), tentiamo di leggere il reale historyId dal profilo Google
+        if state == PageState.COMPLETE and current_checkpoint.history_id is None:
+            try:
+                profile = self._connector._gateway.get_profile(budget)
+                profile_history = getattr(profile, "get", lambda _: None)("historyId")
+                if profile_history:
+                    current_checkpoint = GmailCheckpointState(
+                        account_id=current_checkpoint.account_id,
+                        policy_id=current_checkpoint.policy_id,
+                        history_id=str(profile_history),
+                        page_token=current_checkpoint.page_token,
+                        coverage_after=current_checkpoint.coverage_after,
+                        coverage_before=current_checkpoint.coverage_before,
+                        last_synced_at=current_checkpoint.last_synced_at,
+                        reconciliation_state=current_checkpoint.reconciliation_state,
+                        last_error_code=current_checkpoint.last_error_code,
+                        version=current_checkpoint.version,
+                    )
+                    self._commit_batch((), current_checkpoint, counters)
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "Lettura profile fallback per historyId non riuscita"
+                )
         return counters.result(GmailSyncMode.FULL, state, current_checkpoint)
+
+    def sync(
+        self,
+        selection: GmailSelection,
+        checkpoint: GmailCheckpointState,
+        budget: RequestBudget,
+        requested_mode: GmailSyncMode | str | None = None,
+    ) -> GmailSyncResult:
+        """Sincronizzazione unificata e autoritativa.
+
+        Risolve la modalità reale secondo lo stato del checkpoint (mai cieca fiducia nel chiamante).
+        Se la history è scaduta durante l'incrementale, esegue fallback controllato a full_reconcile.
+        """
+        mode = resolve_sync_mode(checkpoint, requested_mode)
+        if mode == GmailSyncMode.FULL:
+            return self.full_sync(selection, checkpoint, budget)
+        if mode == GmailSyncMode.RECONCILIATION:
+            return self.full_reconcile(selection, checkpoint, budget)
+
+        # Modalità INCREMENTAL con fallback controllato a riconciliazione se history scaduto
+        try:
+            result = self.incremental_sync(checkpoint, budget, selection=selection)
+            if "full_reconciliation_required" in result.detail_codes:
+                reconcile_checkpoint = result.checkpoint
+                reconcile_result = self.full_reconcile(selection, reconcile_checkpoint, budget)
+                return GmailSyncResult(
+                    mode=GmailSyncMode.RECONCILIATION,
+                    persisted_items=result.persisted_items + reconcile_result.persisted_items,
+                    revised_items=result.revised_items + reconcile_result.revised_items,
+                    unchanged_items=result.unchanged_items + reconcile_result.unchanged_items,
+                    rejected_items=result.rejected_items + reconcile_result.rejected_items,
+                    removed_items=result.removed_items + reconcile_result.removed_items,
+                    pages=result.pages + reconcile_result.pages,
+                    state=reconcile_result.state,
+                    checkpoint=reconcile_result.checkpoint,
+                    detail_codes=(
+                        "history_expired_fallback_reconciled",
+                        *reconcile_result.detail_codes,
+                    ),
+                )
+            return result
+        except ConnectorError as exc:
+            if exc.category == ConnectorErrorCategory.HISTORY_EXPIRED:
+                reconcile_checkpoint = checkpoint.require_full_reconciliation(
+                    "gmail_history_expired"
+                )
+                self._uow.mark_reconciliation_required(reconcile_checkpoint)
+                reconcile_result = self.full_reconcile(selection, reconcile_checkpoint, budget)
+                return GmailSyncResult(
+                    mode=GmailSyncMode.RECONCILIATION,
+                    persisted_items=reconcile_result.persisted_items,
+                    revised_items=reconcile_result.revised_items,
+                    unchanged_items=reconcile_result.unchanged_items,
+                    rejected_items=reconcile_result.rejected_items,
+                    removed_items=reconcile_result.removed_items,
+                    pages=reconcile_result.pages,
+                    state=reconcile_result.state,
+                    checkpoint=reconcile_result.checkpoint,
+                    detail_codes=(
+                        "history_expired_fallback_reconciled",
+                        *reconcile_result.detail_codes,
+                    ),
+                )
+            raise
 
     def incremental_sync(
         self,
         checkpoint: GmailCheckpointState,
         budget: RequestBudget,
+        *,
+        selection: GmailSelection | None = None,
     ) -> GmailSyncResult:
         if not checkpoint.history_id:
+            if selection is not None:
+                return self.full_sync(selection, checkpoint, budget)
             raise ValueError("L'incrementale richiede history_id")
         cursor: GmailHistoryCursor | None = GmailHistoryCursor(checkpoint.history_id)
         counters = _Counters()

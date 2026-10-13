@@ -43,6 +43,7 @@ from gbrain.domain.gmail import (
 from gbrain.domain.models import (
     ConnectorAccount,
     ConnectorAccountStatus,
+    GmailCheckpoint,
     ImportJob,
     ImportJobStatus,
     OwnerAccount,
@@ -95,6 +96,18 @@ class InMemorySession:
         self.accounts: dict[UUID, ConnectorAccount] = {}
         self.policies: dict[UUID, SourcePolicy] = {}
         self.jobs: dict[UUID, ImportJob] = {}
+        self.checkpoints: dict[UUID, GmailCheckpoint] = {}
+
+    async def get(self, entity: Any, ident: Any, **kwargs: Any) -> Any:
+        if getattr(entity, "__tablename__", None) == "gmail_checkpoints":
+            return self.checkpoints.get(ident)
+        if getattr(entity, "__tablename__", None) == "connector_accounts":
+            return self.accounts.get(ident)
+        if getattr(entity, "__tablename__", None) == "source_policies":
+            return self.policies.get(ident)
+        if getattr(entity, "__tablename__", None) == "import_jobs":
+            return self.jobs.get(ident)
+        return None
 
     async def scalar(self, stmt: Any) -> Any:
         stmt_str = str(stmt).lower()
@@ -110,6 +123,10 @@ class InMemorySession:
             for pol in self.policies.values():
                 return pol
             return None
+        if "gmail_checkpoints" in stmt_str:
+            for chk in self.checkpoints.values():
+                return chk
+            return None
         if "import_jobs" in stmt_str:
             # Ritorna l'ultimo job attivo (se presente)
             for job in reversed(list(self.jobs.values())):
@@ -117,6 +134,36 @@ class InMemorySession:
                     return job
             return None
         return None
+
+    async def execute(self, stmt: Any) -> Any:
+        class _ExecResult:
+            def all(self) -> list[Any]:
+                return []
+
+            def __iter__(self) -> Any:
+                return iter(())
+
+        return _ExecResult()
+
+    async def scalars(self, stmt: Any) -> Any:
+        class _Result:
+            def __iter__(self) -> Any:
+                return iter(())
+
+            def all(self) -> list[Any]:
+                return []
+
+        return _Result()
+
+    def begin(self) -> Any:
+        class _Context:
+            async def __aenter__(self) -> None:
+                pass
+
+            async def __aexit__(self, *args: Any) -> None:
+                pass
+
+        return _Context()
 
     def add(self, obj: Any) -> None:
         if isinstance(obj, SourceClientCredential):
@@ -127,12 +174,17 @@ class InMemorySession:
             self.policies[obj.id] = obj
         elif isinstance(obj, ImportJob):
             self.jobs[obj.id] = obj
+        elif isinstance(obj, GmailCheckpoint):
+            self.checkpoints[obj.connector_account_id] = obj
 
     async def delete(self, obj: Any) -> None:
         if isinstance(obj, SourceClientCredential):
             self.credentials.pop((obj.owner_id, obj.source_kind), None)
         elif isinstance(obj, ConnectorAccount):
             self.accounts.pop(obj.id, None)
+
+    async def flush(self) -> None:
+        pass
 
     async def commit(self) -> None:
         pass
@@ -739,6 +791,8 @@ def test_source_sync_enqueue() -> None:
     )
     session.add(account)
 
+    # 1. Senza checkpoint valido, la richiesta (anche se richiede incremental)
+    # deve essere autoritativamente risolta su "full" dal backend.
     resp_sync = client.post(
         "/api/sources/gmail/sync",
         json={"mode": "incremental", "item_limit": 50},
@@ -747,9 +801,34 @@ def test_source_sync_enqueue() -> None:
     sync_data = resp_sync.json()
     assert sync_data["source_id"] == "gmail"
     assert sync_data["status"] == "pending"
-    assert sync_data["mode"] == "incremental"
+    assert sync_data["mode"] == "full"
     assert sync_data["queue_job_id"] == 999
     assert "avviato" in sync_data["message"]
+
+    # Simula completamento job
+    for j in session.jobs.values():
+        j.status = ImportJobStatus.COMPLETED
+
+    # 2. Con checkpoint completato con history_id, la richiesta "incremental"
+    # viene correttamente accodata in modalità "incremental".
+    from gbrain.domain.models import ReconciliationState
+
+    chk = GmailCheckpoint(
+        connector_account_id=account.id,
+        source_policy_id=uuid4(),
+        history_id="123456",
+        page_token=None,
+        reconciliation_state=ReconciliationState.NOT_REQUIRED,
+    )
+    session.add(chk)
+
+    resp_sync_inc = client.post(
+        "/api/sources/gmail/sync",
+        json={"mode": "incremental", "item_limit": 50},
+    )
+    assert resp_sync_inc.status_code == 200, resp_sync_inc.json()
+    sync_data_inc = resp_sync_inc.json()
+    assert sync_data_inc["mode"] == "incremental"
 
 
 def test_source_disconnect() -> None:

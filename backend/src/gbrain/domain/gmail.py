@@ -299,6 +299,66 @@ class GmailCheckpointState:
             version=self.version,
         )
 
+    @property
+    def is_initial_complete(self) -> bool:
+        """Indica se l'importazione iniziale risulta conclusa con un history_id valido."""
+        return (
+            self.history_id is not None
+            and bool(self.history_id.strip())
+            and self.page_token is None
+            and self.reconciliation_state != GmailReconciliationState.REQUIRED_HISTORY_EXPIRED
+        )
+
+
+def is_initial_import_completed(checkpoint: GmailCheckpointState | None) -> bool:
+    """Verifica autoritativa: l'importazione iniziale è terminata solo se esiste history_id,
+    non vi sono cursori di paginazione parziale in sospeso e la history non è scaduta."""
+    if checkpoint is None:
+        return False
+    return checkpoint.is_initial_complete
+
+
+def resolve_sync_mode(
+    checkpoint: GmailCheckpointState | None,
+    requested_mode: GmailSyncMode | str | None = None,
+) -> GmailSyncMode:
+    """Risoluzione autoritativa della modalità di sincronizzazione (backend single-source of truth).
+
+    Regole:
+    1. Se la history è scaduta o richiede riconciliazione (REQUIRED_HISTORY_EXPIRED),
+       forza RECONCILIATION.
+    2. Se l'importazione iniziale non è ancora completata (manca checkpoint, manca history_id,
+       oppure l'importazione è stata interrotta con page_token pendente), forza FULL.
+    3. Se l'importazione iniziale è completata:
+       - Se requested_mode == FULL: rispetta FULL (richiesta esplicita di re-import).
+       - Se requested_mode == RECONCILIATION: rispetta RECONCILIATION.
+       - In ogni altro caso (incluso INCREMENTAL o None): usa INCREMENTAL.
+    """
+    if isinstance(requested_mode, str):
+        try:
+            mode = GmailSyncMode(requested_mode)
+        except ValueError:
+            mode = None
+    else:
+        mode = requested_mode
+
+    if mode == GmailSyncMode.RECONCILIATION:
+        return GmailSyncMode.RECONCILIATION
+
+    if (
+        checkpoint is not None
+        and checkpoint.reconciliation_state == GmailReconciliationState.REQUIRED_HISTORY_EXPIRED
+    ):
+        return GmailSyncMode.RECONCILIATION
+
+    if not is_initial_import_completed(checkpoint):
+        return GmailSyncMode.FULL
+
+    if mode == GmailSyncMode.FULL:
+        return GmailSyncMode.FULL
+
+    return GmailSyncMode.INCREMENTAL
+
 
 @dataclass(frozen=True, slots=True)
 class GmailPersistOutcome:

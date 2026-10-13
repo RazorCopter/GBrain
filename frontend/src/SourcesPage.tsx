@@ -139,13 +139,15 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         setGlobalError('')
         setGlobalMessage('')
         try {
+            const isInitialComplete = Boolean(gmailStatus?.initial_import_completed)
+            const syncMode = isInitialComplete ? 'incremental' : 'full'
             const res = await api.triggerSourceSync('gmail', {
-                mode: 'incremental',
+                mode: syncMode,
                 item_limit: 500,
                 request_budget: 200,
                 batch_size: 25,
             })
-            setGlobalMessage(`Sincronizzazione avviata (Job #${res.job_id.slice(0, 8)}).`)
+            setGlobalMessage(`Sincronizzazione (${res.mode ?? syncMode}) avviata (Job #${res.job_id.slice(0, 8)}).`)
             const jobData = await api.gmailJob(res.job_id)
             setActiveJob(jobData)
         } catch (err) {
@@ -328,7 +330,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                         className="secondary compact"
                                         disabled={quickSyncBusy || (activeJob !== null && ['pending', 'running'].includes(activeJob.status))}
                                         onClick={handleQuickSync}
-                                        title="Avvia sincronizzazione incrementale"
+                                        title={gmailStatus?.initial_import_completed ? 'Avvia sincronizzazione incrementale' : 'Avvia sincronizzazione iniziale completa'}
                                     >
                                         {quickSyncBusy ? 'Avvio…' : '🔄 Sincronizza Ora'}
                                     </button>

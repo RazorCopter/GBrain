@@ -214,6 +214,40 @@ async def get_source_status(
         aliases_ready = bool(account and account.confirmed_aliases)
         confirmed_aliases = list(account.confirmed_aliases or []) if account else []
 
+        initial_import_completed = False
+        has_checkpoint = False
+        checkpoint_history_id = None
+        checkpoint_page_token = None
+        if account:
+            from sqlalchemy import select
+
+            from gbrain.domain.models import GmailCheckpoint
+            from gbrain.infrastructure.gmail_repository import checkpoint_from_model
+
+            checkpoint_model = None
+            if hasattr(session, "get"):
+                try:
+                    checkpoint_model = await session.get(GmailCheckpoint, account.id)
+                except Exception:
+                    checkpoint_model = None
+            if checkpoint_model is None:
+                try:
+                    checkpoint_model = await session.scalar(
+                        select(GmailCheckpoint).where(
+                            GmailCheckpoint.connector_account_id == account.id
+                        )
+                    )
+                except Exception:
+                    checkpoint_model = None
+
+            if checkpoint_model is not None:
+                has_checkpoint = True
+                checkpoint_history_id = checkpoint_model.history_id
+                checkpoint_page_token = checkpoint_model.page_token
+                initial_import_completed = checkpoint_from_model(
+                    checkpoint_model
+                ).is_initial_complete
+
         return SourceStatusResponse(
             source_id=source_id,
             availability=descriptor.status.value,
@@ -228,6 +262,10 @@ async def get_source_status(
             status=st,
             detected_callback_url=detected_callback,
             lan_warning=lan_warning,
+            initial_import_completed=initial_import_completed,
+            has_checkpoint=has_checkpoint,
+            checkpoint_history_id=checkpoint_history_id,
+            checkpoint_page_token=checkpoint_page_token,
         )
 
     # Per connettori coming_soon
@@ -616,8 +654,8 @@ async def trigger_source_sync(
         job_id=job.id,
         queue_job_id=job.queue_job_id,
         status=job.status.value,
-        mode=body.mode,
-        message=f"Job di sincronizzazione Gmail avviato in modalità {body.mode}.",
+        mode=job.mode,
+        message=f"Job di sincronizzazione Gmail avviato in modalità {job.mode}.",
     )
 
 
