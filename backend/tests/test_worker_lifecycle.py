@@ -5,12 +5,13 @@ import inspect
 import sys
 from collections.abc import Generator
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import procrastinate
 import procrastinate.exceptions
 import pytest
 
+from gbrain.application.gmail_jobs import GmailJobTransientError
 from gbrain.config import get_settings
 from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME, create_procrastinate_app
 
@@ -194,7 +195,18 @@ def test_gmail_job_and_worker_tasks_registered_on_procrastinate_app() -> None:
     assert gmail_task.lock == "gmail-heavy-global"
     assert isinstance(gmail_task.retry_strategy, procrastinate.RetryStrategy)
 
-    assert gmail_task.retry_strategy.max_attempts == settings.gmail_job_retry_budget
+    strategy = gmail_task.retry_strategy
+    assert strategy.max_attempts == settings.gmail_job_retry_budget + 1
+    transient = GmailJobTransientError("errore transitorio sintetico")
+    for attempt in range(1, settings.gmail_job_retry_budget + 1):
+        job = MagicMock(attempts=attempt)
+        assert strategy.get_retry_decision(exception=transient, job=job) is not None
+    exhausted_job = MagicMock(attempts=settings.gmail_job_retry_budget + 1)
+    assert strategy.get_retry_decision(exception=transient, job=exhausted_job) is None
+    assert (
+        strategy.get_retry_decision(exception=RuntimeError("permanente"), job=MagicMock(attempts=1))
+        is None
+    )
 
     # Verifica gli altri task infrastrutturali registrati
     assert "gbrain.heartbeat" in tasks

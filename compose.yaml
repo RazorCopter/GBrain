@@ -94,6 +94,7 @@ services:
       - neo4j_password
     volumes: *app-volumes
     networks:
+      - edge
       - backend
     depends_on:
       app:

@@ -62,7 +62,9 @@ async def consume_outbox_placeholder(event_id: str) -> None:
     queue="gmail",
     lock="gmail-heavy-global",
     retry=procrastinate.RetryStrategy(
-        max_attempts=settings.gmail_job_retry_budget,
+        # Procrastinate conta anche il tentativo iniziale in ``job.attempts``.
+        # Il budget configura invece il numero di riesecuzioni consentite.
+        max_attempts=settings.gmail_job_retry_budget + 1,
         exponential_wait=2,
         retry_exceptions=(GmailJobTransientError,),
     ),

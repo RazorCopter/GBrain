@@ -235,6 +235,43 @@ def test_sanitize_error_text_removes_tokens_emails_and_query_strings() -> None:
     assert "?key=" not in sanitized
 
 
+def test_sanitize_error_text_removes_refresh_tokens_codes_cookies_and_callbacks() -> None:
+    raw = (
+        "Failed request to https://gbrain.local/api/v1/sources/gmail/oauth/callback?code=4/0Abc_XYZ&state=xyz123 "
+        "with refresh_token 1//04Abc_DefGHI and cookie: session=s_xyz123; admin=true"
+    )
+    sanitized = _sanitize_error_text(raw)
+    assert "https://gbrain.local/api/v1/sources/gmail/oauth/callback" not in sanitized
+    assert "[REDACTED_CALLBACK_URL]" in sanitized
+    assert "4/0Abc_XYZ" not in sanitized
+    assert "1//04Abc_DefGHI" not in sanitized
+    assert "s_xyz123" not in sanitized
+    assert "[REDACTED_REFRESH_TOKEN]" in sanitized
+
+
+def test_classify_error_refresh_error_wrapped_dns_is_transient() -> None:
+    import socket
+    from typing import Any, cast
+
+    import requests.exceptions
+    from google.auth.exceptions import TransportError
+    from urllib3.exceptions import MaxRetryError, NameResolutionError
+
+    gai = socket.gaierror(-3, "Temporary failure in name resolution")
+    dns_exc = NameResolutionError("oauth2.googleapis.com", cast(Any, None), gai)
+    retry_exc = MaxRetryError(
+        cast(Any, None), "https://oauth2.googleapis.com/token", reason=dns_exc
+    )
+    conn_exc = requests.exceptions.ConnectionError(retry_exc)
+    transport_exc = TransportError(conn_exc)  # type: ignore[no-untyped-call]
+    refresh_exc = RefreshError(transport_exc)  # type: ignore[no-untyped-call]
+
+    error = _classify_error(refresh_exc, "profile.get", history_operation=False)
+    assert error.category == ConnectorErrorCategory.TRANSIENT
+    assert error.retryable is True
+    assert "NameResolutionError" in error.safe_message or "RefreshError" in error.safe_message
+
+
 def test_classify_error_httplib2_server_not_found() -> None:
     exc = ServerNotFoundError("Unable to find the server at gmail.googleapis.com")
     error = _classify_error(exc, "profile.get", history_operation=False)

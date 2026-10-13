@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from gbrain.application.gmail_oauth import (
     GmailOAuthError,
+    GmailOAuthTransientError,
     decrypt_credentials,
     encrypt_credentials,
     refresh_credentials,
@@ -585,6 +586,18 @@ async def execute_gmail_job(
             error_code=f"gmail_{exc.category.value}",
             error_detail=exc.safe_message,
         )
+    except GmailOAuthTransientError as exc:
+        await _finish(
+            database,
+            parsed_job_id,
+            status=ImportJobStatus.FAILED,
+            checkpoint=checkpoint,
+            processed=processed,
+            error_code=exc.code,
+            error_detail=exc.safe_message,
+            is_partial=checkpoint.page_token is not None if checkpoint else False,
+        )
+        raise GmailJobTransientError(exc.safe_message) from exc
     except (GmailOAuthError, GmailServiceError, GmailJobPermanentError) as exc:
         code = getattr(exc, "code", "gmail_job_permanent")
         detail = getattr(exc, "safe_message", str(exc))

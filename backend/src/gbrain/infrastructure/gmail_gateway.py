@@ -18,6 +18,8 @@ from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from httplib2 import Http, HttpLib2Error
+from requests.exceptions import RequestException as RequestsError
+from urllib3.exceptions import HTTPError as Urllib3Error
 
 from gbrain.domain.connectors import (
     BudgetExhaustedError,
@@ -373,30 +375,157 @@ def _temporal_query(selection: GmailSelection) -> str:
 def _sanitize_error_text(text: str) -> str:
     if not text:
         return ""
-    # Maschera token Bearer
+    sanitized = text
+    # 1. URL di callback completi
     sanitized = re.sub(
-        r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", text, flags=re.IGNORECASE
+        r"https?://[^\s]*(?:oauth/callback|oauth2callback|/callback)[^\s]*",
+        "[REDACTED_CALLBACK_URL]",
+        sanitized,
+        flags=re.IGNORECASE,
     )
-    # Maschera access token tipici di Google (ya29.xxx)
-    sanitized = re.sub(r"ya29\.[A-Za-z0-9_\-]+", "[REDACTED_TOKEN]", sanitized)
-    # Maschera client secret / password / secret / key / client_id
+    # 2. Query string dagli altri URL (https://...?... -> https://...)
+    sanitized = re.sub(r"(https?://[^\s\?]+)\?[^\s]+", r"\1", sanitized)
+    # 3. Access token Bearer e Google ya29
     sanitized = re.sub(
-        r'(client_secret|secret|password|client_id)\s*[:=]\s*["\']?[^"\'\s&]+["\']?',
+        r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", sanitized, flags=re.IGNORECASE
+    )
+    sanitized = re.sub(r"ya29\.[A-Za-z0-9_\-]+", "[REDACTED_TOKEN]", sanitized)
+    sanitized = re.sub(
+        r'(?:access_token)\s*[:=]\s*["\']?[^"\'\s&]+["\']?',
+        "access_token=[REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    # 4. Refresh token (Google 1//... o 1%2F%2F... o parametro)
+    sanitized = re.sub(r"1//[A-Za-z0-9_\-]+", "[REDACTED_REFRESH_TOKEN]", sanitized)
+    sanitized = re.sub(r"1%2F%2F[A-Za-z0-9_\-]+", "[REDACTED_REFRESH_TOKEN]", sanitized)
+    sanitized = re.sub(
+        r'(?:refresh_token)\s*[:=]\s*["\']?[^"\'\s&]+["\']?',
+        "refresh_token=[REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    # 5. Authorization code (Google 4/... o 4%2F... o parametro code)
+    sanitized = re.sub(r"4/[A-Za-z0-9_\-]+", "[REDACTED_AUTH_CODE]", sanitized)
+    sanitized = re.sub(r"4%2F[A-Za-z0-9_\-]+", "[REDACTED_AUTH_CODE]", sanitized)
+    sanitized = re.sub(
+        r'(?:(?<=[?&\s])|(?<=^)|(?<=["\']))code\s*[:=]\s*["\']?[^"\'\s&]+["\']?',
+        "code=[REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    # 6. Client secret, password, client_id, secret, redirect_uri
+    sanitized = re.sub(
+        r'(client_secret|secret|password|client_id|redirect_uri)\s*[:=]\s*["\']?[^"\'\s&]+["\']?',
         r"\1=[REDACTED]",
         sanitized,
         flags=re.IGNORECASE,
     )
-    # Maschera indirizzi email
+    # 7. Cookie e header/token di sessione
+    sanitized = re.sub(
+        r'(cookie|set-cookie)\s*[:=]\s*["\']?[^"\'\r\n]+["\']?',
+        r"\1=[REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r'session\s*[:=]\s*["\']?[A-Za-z0-9_\-\.]+["\']?',
+        "session=[REDACTED]",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    # 8. Indirizzi email
     sanitized = re.sub(
         r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[REDACTED_EMAIL]", sanitized
     )
-    # Rimuovi query string dagli URL (https://...?... -> https://...)
-    sanitized = re.sub(r"(https?://[^\s\?]+)\?[^\s]+", r"\1", sanitized)
-    # Comprimi spazi multipli e ritorni a capo
+    # 9. Comprimi spazi multipli e ritorni a capo
     sanitized = " ".join(sanitized.split())
     if len(sanitized) > 300:
         sanitized = sanitized[:297] + "..."
     return sanitized
+
+
+sanitize_error_text = _sanitize_error_text
+
+
+def _iter_exception_chain(exc: BaseException | None) -> list[BaseException]:
+    chain: list[BaseException] = []
+    visited: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        chain.append(current)
+        for arg in getattr(current, "args", ()):
+            if isinstance(arg, BaseException) and id(arg) not in visited:
+                chain.extend(_iter_exception_chain(arg))
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException) and id(reason) not in visited:
+            chain.extend(_iter_exception_chain(reason))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+_TRANSIENT_EXCEPTION_CLASSES: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    socket.timeout,
+    socket.gaierror,
+    ConnectionError,
+    OSError,
+    HttpLib2Error,
+    TransportError,
+    Urllib3Error,
+    RequestsError,
+)
+
+_TRANSIENT_CLASS_KEYWORDS = (
+    "nameresolutionerror",
+    "maxretryerror",
+    "connectionerror",
+    "transporterror",
+    "timeouterror",
+    "connecttimeout",
+    "readtimeout",
+    "servernotfounderror",
+    "gaierror",
+    "sslerror",
+    "newconnectionerror",
+)
+
+_TRANSIENT_MESSAGE_PATTERNS = (
+    "nameresolutionerror",
+    "temporary failure in name resolution",
+    "failed to establish a new connection",
+    "getaddrinfo failed",
+    "name or service not known",
+    "nodename nor servname provided",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "network is unreachable",
+    "remote disconnected",
+    "timed out",
+    "timeout",
+    "servernotfounderror",
+    "unable to find the server at",
+    "certificate_verify_failed",
+    "ssl: ",
+    "certificate verify failed",
+)
+
+
+def is_transient_transport_error(exc: BaseException) -> bool:
+    """Riconosce se l'eccezione o la catena causale è un errore temporaneo di trasporto/DNS/TLS."""
+    chain = _iter_exception_chain(exc)
+    for err in chain:
+        if isinstance(err, _TRANSIENT_EXCEPTION_CLASSES):
+            return True
+        name = err.__class__.__name__.lower()
+        if any(keyword in name for keyword in _TRANSIENT_CLASS_KEYWORDS):
+            return True
+        msg = str(err).lower()
+        if any(pattern in msg for pattern in _TRANSIENT_MESSAGE_PATTERNS):
+            return True
+    return False
 
 
 def _classify_error(
@@ -451,12 +580,21 @@ def _classify_error(
             f"Errore permanente Gmail durante {operation} ({http_desc}{detail_suffix})",
             status_code=status,
         )
+    if is_transient_transport_error(exc):
+        sanitized = _sanitize_error_text(str(exc))
+        detail = f": {sanitized}" if sanitized else ""
+        return ConnectorError(
+            ConnectorErrorCategory.TRANSIENT,
+            f"Errore di trasporto transitorio durante {operation} ({exc.__class__.__name__}{detail})",
+            retryable=True,
+        )
     if isinstance(exc, RefreshError):
         sanitized = _sanitize_error_text(str(exc))
         detail = f": {sanitized}" if sanitized else ""
         return ConnectorError(
             ConnectorErrorCategory.AUTH,
             f"Refresh OAuth Gmail fallito o token revocato durante {operation} ({exc.__class__.__name__}{detail})",
+            retryable=False,
         )
     if isinstance(exc, (TimeoutError, socket.timeout)):
         return ConnectorError(

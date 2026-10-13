@@ -1,9 +1,9 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
 **Data checkpoint:** 13 ottobre 2026
-**Checkpoint:** Fase G — Risoluzione autoritativa modalità di sincronizzazione (full vs incremental), gestione robusta checkpoint e ripresa esatta
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con il Source Connection Wizard e con la **determinazione autoritativa backend-driven della modalità di sincronizzazione** (`resolve_sync_mode`), validazione rigorosa del completamento iniziale (`is_initial_complete`), fallback su `users.getProfile` per acquisizione `historyId` su caselle senza messaggi nel range, gestione affidabile della ripresa checkpoint parziale con token di paginazione, e suite di test deterministica estesa a **161 test superati** (166 totali raccolti, 5 skipped).
-**Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo e UI; pronto per il collaudo infrastrutturale Docker/Linux e configurazione con account reali; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
+**Checkpoint:** Fase H — Connettività Internet worker Gmail, isolamento reti Compose e classificazione transitoria errori trasporto/DNS OAuth
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata staticamente/localmente; Fase 2 Gmail `SENT` arricchita con connettività di rete del worker (`edge` + `backend`), preservando l'isolamento interno per PostgreSQL e Neo4j (`backend: internal: true`, nessuna porta worker); gestione e classificazione transitoria accurata della catena di errori DNS (`NameResolutionError`), timeout, TLS e trasporto in `refresh_credentials` e gateway con retry controllati via Procrastinate (`GmailOAuthTransientError` -> `GmailJobTransientError`) senza revoca account; distinzione dagli errori permanenti (`invalid_grant`, revoca) che restano non ritentati; sanitizzazione rinforzata per access token, refresh token, secret, auth code, cookie, email e callback URL completi; collaudo runtime reale su container worker con probe DNS e handshake TLS HTTPS verso `oauth2.googleapis.com` e `gmail.googleapis.com` superato con successo; suite test estesa a **172 test superati** (177 totali raccolti, 5 skipped).
+**Giudizio di prontezza:** codice Fase 1 e Fase 2 completo a livello applicativo, UI e infrastrutturale Compose; verificata connettività DNS/HTTPS dal worker; pronto per configurazione con account reali Google Cloud; non pronto per dichiarare MVP finale né integrazione con servizi personali già collaudata in produzione.
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
 ## Regola di lettura dello stato
@@ -77,16 +77,20 @@ Nel ciclo di implementazione del **Source Connection Wizard** sono stati consoli
 Tutti i controlli deterministici sono stati eseguiti localmente con esito positivo:
 
 - **Pytest:** `uv run pytest backend/tests -v`
-  - **161 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
-  - 0 fallimenti, 0 errori (166 raccolti).
-- **Ruff linter:** `uv run ruff check backend`
+  - **172 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
+  - 0 fallimenti, 0 errori (177 raccolti).
+- **Ruff linter:** `uv run ruff check backend scripts`
   - **Superato:** 0 errori, 0 avvisi.
-- **Ruff formatter:** `uv run ruff format --check backend`
-  - **Superato:** 56 file formattati in modo conforme.
-- **Mypy type check:** `uv run mypy backend/src backend/tests`
-  - **Superato:** Successo su tutti i 51 file sorgente, 0 errori di tipo.
+- **Ruff formatter:** `uv run ruff format --check backend scripts`
+  - **Superato:** 60 file formattati in modo conforme.
+- **Mypy type check:** `uv run mypy backend/src backend/tests scripts`
+  - **Superato:** Successo su tutti i 55 file sorgente, 0 errori di tipo.
 - **Frontend TypeScript & Build:** `npm --prefix frontend run build`
   - **Superato:** Type check `tsc -b` superato, bundle Vite completato senza errori.
+- **Docker Compose Validation:** `docker compose config` / `docker compose --profile compact config`
+  - **Superato:** 0 errori sintattici o strutturali; isolate reti `backend` (internal) ed `edge` per worker; zero porte worker/postgres/neo4j.
+- **Collaudo Connettività Worker:** [`scripts/verify_worker_connectivity.py`](scripts/verify_worker_connectivity.py)
+  - **Superato:** Dal container del servizio worker reale (`gbrain:0.1.0`): DNS `oauth2.googleapis.com` (`142.251.127.95`), DNS `gmail.googleapis.com` (`172.217.114.4`), TLS handshake 443 OK, probe HTTPS HEAD senza token OK (Status 404 remoto).
 
 ---
 
@@ -127,13 +131,22 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - [`backend/tests/test_gmail_sync_mode_and_checkpoints.py`](backend/tests/test_gmail_sync_mode_and_checkpoints.py:1) — Suite esaustiva (7 test) per determinazione autoritativa del sync mode, gestione range vuoto con fallback `historyId`, ripresa incrementale e ripresa da checkpoint parziale.
   - [`frontend/src/api.ts`](frontend/src/api.ts:1) — Tipizzazione estesa `SourceStatusResponse` con i flag di checkpoint e completamento iniziale.
   - [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx:1) — Selezione dinamica e automatica di `incremental` vs `full` nel trigger rapido di sincronizzazione basata sullo stato autoritativo del backend.
-  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con risoluzione autoritativa sync mode, robustezza checkpoint e suite test a 161 test superati.
+  - [`compose.yaml`](compose.yaml:1) — Servizio worker connesso sia a `backend` sia a `edge`, nessuna porta pubblicata; PostgreSQL e Neo4j confinati a `backend` (`internal: true`).
+  - [`backend/src/gbrain/worker.py`](backend/src/gbrain/worker.py:62) — Allineamento del budget retry al modello Procrastinate (`max_attempts=settings.gmail_job_retry_budget + 1`) per preservare il numero di riesecuzioni oltre al tentativo iniziale.
+  - [`backend/src/gbrain/infrastructure/gmail_gateway.py`](backend/src/gbrain/infrastructure/gmail_gateway.py:1) — Rilevamento errori transitori nella catena causale delle eccezioni (`is_transient_transport_error`), classificazione retryable su `RefreshError` di rete, e sanitizzazione avanzata di token, refresh token, code, cookie, email e callback URL.
+  - [`backend/src/gbrain/application/gmail_oauth.py`](backend/src/gbrain/application/gmail_oauth.py:1) — Definizione di `GmailOAuthTransientError`, classificazione transitoria vs permanente durante `refresh_credentials`, sanitizzazione messaggi.
+  - [`backend/src/gbrain/application/gmail_jobs.py`](backend/src/gbrain/application/gmail_jobs.py:1) — Cattura di `GmailOAuthTransientError` con propagazione a `GmailJobTransientError` per retry controllato dal worker senza revoca dell'account.
+  - [`backend/tests/test_gmail_gateway.py`](backend/tests/test_gmail_gateway.py:238) — Test mirati di sanitizzazione errori per refresh token, code, cookie, callback URL e classificazione transitoria errori DNS annidati.
+  - [`backend/tests/test_worker_lifecycle.py`](backend/tests/test_worker_lifecycle.py:195) — Test della strategia di retry Procrastinate con verifica del comportamento al tentativo iniziale e all'esaurimento budget.
+  - [`backend/tests/test_worker_network_and_transport.py`](backend/tests/test_worker_network_and_transport.py:1) — Suite (9 test) per invarianti di rete Compose, catena causale DNS (`NameResolutionError`), retry limitato, permanenza `invalid_grant` e sanitizzazione segreti.
+  - [`scripts/verify_worker_connectivity.py`](scripts/verify_worker_connectivity.py:1) — Script probe innocuo (DNS + TLS 443 + HTTP HEAD senza credenziali) per validazione live dal container worker.
+  - [`PROJECT_STATUS.md`](PROJECT_STATUS.md:1) — Checkpoint ufficiale aggiornato con connettività worker, classificazione errori trasporto e suite a 172 test superati.
 
 ---
 
 ## Rischi residui
 
-1. **Mancanza di demone Docker operativo locale:** Impedisce la validazione dei vincoli a runtime (migrazione PostgreSQL reale da zero, locking advisory Procrastinate nativo, healthcheck container e mapping volumi LXC non-root).
+1. **Stack multi-container completo e persistenza su ambiente Linux di destinazione:** Il container worker è stato collaudato con successo a runtime per la connettività di rete esterna (DNS/TLS), ma l'orchestrazione congiunta completa con PostgreSQL su volumi host e locking advisory Procrastinate reale a caldo rimane da validare sul nodo LXC/Linux di produzione.
 2. **Interazione di rete reale con Google API:** Le quote reali (250 quota units/sec utente), l'effettiva reattività alle revocazioni remote e la latenza dei refresh token rimangono verificabili soltanto con account Google Cloud reale.
 3. **Backup Neo4j/PostgreSQL non testato a caldo:** Neo4j resta una proiezione sincrona non ancora popolata dall'outbox worker.
 

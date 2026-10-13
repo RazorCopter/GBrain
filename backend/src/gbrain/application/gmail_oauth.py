@@ -30,6 +30,10 @@ from gbrain.domain.models import (
     GmailOAuthState,
     OwnerAccount,
 )
+from gbrain.infrastructure.gmail_gateway import (
+    _sanitize_error_text,
+    is_transient_transport_error,
+)
 
 _TOKEN_FORMAT_VERSION = 1
 _TOKEN_ASSOCIATED_DATA = b"gbrain:gmail-oauth-token:v1"
@@ -42,6 +46,10 @@ class GmailOAuthError(RuntimeError):
         super().__init__(safe_message)
         self.code = code
         self.safe_message = safe_message
+
+
+class GmailOAuthTransientError(GmailOAuthError):
+    """Errore temporaneo di trasporto, rete, DNS, timeout o TLS durante le operazioni OAuth."""
 
 
 class GmailOAuthNotConfiguredError(GmailOAuthError):
@@ -252,9 +260,15 @@ def refresh_credentials(credentials: Credentials, settings: Settings) -> Credent
     try:
         credentials.refresh(GoogleAuthRequest())  # type: ignore[no-untyped-call]
     except Exception as exc:
-        raise GmailOAuthError(
-            "refresh_failed", f"Rinnovo autorizzazione Gmail non riuscito: {exc}"
-        ) from exc
+        sanitized = _sanitize_error_text(str(exc))
+        detail = f": {sanitized}" if sanitized else ""
+        if is_transient_transport_error(exc):
+            raise GmailOAuthTransientError(
+                "oauth_transport_error",
+                f"Rinnovo autorizzazione Gmail temporaneamente non riuscito per errore di trasporto{detail}",
+            ) from exc
+        code = "invalid_grant" if "invalid_grant" in str(exc).lower() else "refresh_failed"
+        raise GmailOAuthError(code, f"Rinnovo autorizzazione Gmail non riuscito{detail}") from exc
     if credentials.expiry is not None and credentials.expiry.tzinfo is not None:
         credentials.expiry = credentials.expiry.astimezone(UTC).replace(tzinfo=None)
     refreshed_scopes = frozenset(credentials.scopes or credentials.granted_scopes or ())
