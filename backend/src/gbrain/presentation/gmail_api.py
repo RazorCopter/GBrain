@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -32,12 +32,16 @@ from gbrain.application.gmail_service import (
     policy_input,
     preview_history_selection,
     remove_alias,
-    request_job_cancellation,
     save_policy,
     search_imported_sources,
     update_sync_config,
 )
-from gbrain.domain.models import ImportJob, SourcePolicy
+from gbrain.application.import_job_runtime import (
+    build_import_job_runtime,
+    is_queue_identity_coherent,
+)
+from gbrain.domain.models import ConnectorAccount, ImportJob, ImportJobStatus, SourcePolicy
+from gbrain.infrastructure.procrastinate_jobs import fetch_procrastinate_job_snapshot
 from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
 from gbrain.presentation.dependencies import (
     AppSettings,
@@ -318,7 +322,7 @@ async def start_job_endpoint(
     session: DbSession,
     queue: ProcrastinateApp,
     principal: CsrfPrincipalDep,
-) -> ImportJob:
+) -> ImportJobResponse:
     try:
         account = await get_gmail_account(session, principal.owner.id)
         assert account is not None
@@ -352,7 +356,9 @@ async def start_job_endpoint(
                 lock="gmail-heavy-global",
             ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
 
-        return await create_and_enqueue_job(session, account, policy, payload.mode, enqueue)
+        job = await create_and_enqueue_job(session, account, policy, payload.mode, enqueue)
+        runtime = await build_import_job_runtime(session, job)
+        return ImportJobResponse.from_job_and_runtime(job, runtime)
     except GmailServiceError as exc:
         raise _http_error(exc) from exc
 
@@ -362,38 +368,139 @@ async def get_job_endpoint(
     job_id: uuid.UUID,
     session: DbSession,
     principal: PrincipalDep,
-) -> ImportJob:
+) -> ImportJobResponse:
     job = await session.scalar(
         select(ImportJob)
-        .join_from(ImportJob, SourcePolicy, ImportJob.source_policy_id == SourcePolicy.id)
+        .join(ConnectorAccount, ImportJob.connector_account_id == ConnectorAccount.id)
         .where(
             ImportJob.id == job_id,
-            SourcePolicy.connector_account.has(owner_id=principal.owner.id),
+            ConnectorAccount.owner_id == principal.owner.id,
         )
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Lavoro Gmail non trovato")
-    return job
+    runtime = await build_import_job_runtime(session, job)
+    return ImportJobResponse.from_job_and_runtime(job, runtime)
 
 
 @gmail_router.post("/jobs/{job_id}/cancel", response_model=ImportJobResponse)
 async def cancel_job_endpoint(
     job_id: uuid.UUID,
     session: DbSession,
+    queue: ProcrastinateApp,
     principal: CsrfPrincipalDep,
-) -> ImportJob:
-    account = await get_gmail_account(session, principal.owner.id)
-    if account is None:
-        raise HTTPException(status_code=404, detail="Account Gmail non trovato")
+) -> ImportJobResponse:
     job = await session.scalar(
-        select(ImportJob).where(
+        select(ImportJob)
+        .join(ConnectorAccount, ImportJob.connector_account_id == ConnectorAccount.id)
+        .where(
             ImportJob.id == job_id,
-            ImportJob.connector_account_id == account.id,
+            ConnectorAccount.owner_id == principal.owner.id,
         )
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Lavoro Gmail non trovato")
-    return await request_job_cancellation(session, job)
+
+    # 1. Se il job applicativo è già in stato terminale, restituisce subito la risposta (idempotente)
+    if job.status not in {ImportJobStatus.PENDING, ImportJobStatus.RUNNING}:
+        runtime = await build_import_job_runtime(session, job)
+        return ImportJobResponse.from_job_and_runtime(job, runtime)
+
+    # 2. Nessun queue_job_id associato: cancellazione applicativa diretta
+    if job.queue_job_id is None:
+        now = datetime.now(UTC)
+        if job.cancel_requested_at is None:
+            job.cancel_requested_at = now
+        job.status = ImportJobStatus.CANCELLED
+        job.finished_at = now
+        job.checkpoint = {**job.checkpoint, "phase": "cancelled_no_queue"}
+        await session.commit()
+        await session.refresh(job)
+        runtime = await build_import_job_runtime(session, job)
+        return ImportJobResponse.from_job_and_runtime(job, runtime)
+
+    # 3. Queue_job_id presente: fetch snapshot di Procrastinate PRIMA di qualsiasi mutazione
+    snapshot = await fetch_procrastinate_job_snapshot(session, job.queue_job_id)
+
+    # 3a. Record in coda assente (missing_queue): il job non è più nella tabella
+    if snapshot is None:
+        now = datetime.now(UTC)
+        if job.cancel_requested_at is None:
+            job.cancel_requested_at = now
+        job.status = ImportJobStatus.CANCELLED
+        job.finished_at = now
+        job.checkpoint = {**job.checkpoint, "phase": "cancelled_missing_queue"}
+        await session.commit()
+        await session.refresh(job)
+        runtime = await build_import_job_runtime(session, job)
+        return ImportJobResponse.from_job_and_runtime(job, runtime)
+
+    # 3b. Controllo rigoroso di identità del job in coda (queue_name, task_name, args.job_id)
+    if not is_queue_identity_coherent(job, snapshot):
+        # Mismatch: rifiuta categorized di toccare la coda aliena per sicurezza
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Incongruenza tra il lavoro applicativo e il record in coda di elaborazione",
+        )
+
+    # 3c. Se il record in coda è già terminale:
+    if snapshot.status in {"cancelled", "succeeded", "failed", "aborted"}:
+        if snapshot.status == "cancelled":
+            # Riconciliazione idempotente saga per failure parziali precedenti
+            job.status = ImportJobStatus.CANCELLED
+            if job.cancel_requested_at is None:
+                job.cancel_requested_at = datetime.now(UTC)
+            job.finished_at = datetime.now(UTC)
+            job.checkpoint = {**job.checkpoint, "phase": "cancelled_reconciled"}
+            await session.commit()
+            await session.refresh(job)
+        runtime = await build_import_job_runtime(session, job)
+        return ImportJobResponse.from_job_and_runtime(job, runtime)
+
+    # 3d. Job attivo in coda (todo o doing):
+    # Marker-first durevole applicativo (richiesta cooperativa, senza trattenere lock durante l'I/O queue)
+    if job.cancel_requested_at is None:
+        job.cancel_requested_at = datetime.now(UTC)
+        job.checkpoint = {**job.checkpoint, "phase": "cancellation_requested"}
+        await session.commit()
+        await session.refresh(job)
+
+    # Se in coda lo stato è "todo", esegui la cancellazione immediata mirata
+    if snapshot.status == "todo":
+        try:
+            cancelled_in_queue = await queue.job_manager.cancel_job_by_id_async(
+                job_id=job.queue_job_id,
+                abort=False,
+                delete_job=False,
+            )
+        except Exception:
+            cancelled_in_queue = False
+
+        if cancelled_in_queue:
+            job.status = ImportJobStatus.CANCELLED
+            job.finished_at = datetime.now(UTC)
+            job.checkpoint = {**job.checkpoint, "phase": "cancelled_in_queue"}
+            await session.commit()
+            await session.refresh(job)
+        else:
+            # Verifica se tra l'ispezione e la chiamata lo stato è convergente a 'cancelled'
+            try:
+                post_snapshot = await fetch_procrastinate_job_snapshot(session, job.queue_job_id)
+            except Exception:
+                post_snapshot = None
+            if post_snapshot is not None and post_snapshot.status == "cancelled":
+                job.status = ImportJobStatus.CANCELLED
+                job.finished_at = datetime.now(UTC)
+                job.checkpoint = {**job.checkpoint, "phase": "cancelled_reconciled"}
+                await session.commit()
+                await session.refresh(job)
+    elif snapshot.status == "doing":
+        # Se 'doing', la cancellazione è cooperativa: non usiamo abort aggressivo per evitare lock e kill
+        # Il worker o rate-limiter intercetta cancel_requested_at e porta il job a CANCELLED
+        pass
+
+    runtime = await build_import_job_runtime(session, job)
+    return ImportJobResponse.from_job_and_runtime(job, runtime)
 
 
 @gmail_router.get("/sources", response_model=GmailSourceListResponse)

@@ -1057,6 +1057,159 @@ button.danger {
     color: #334e68;
 }
 
+.job-banner-section.status-retry-scheduled {
+    border-color: #f59f00;
+    background: #fff9db;
+}
+
+.retry-scheduled-box {
+    display: flex;
+    align-items: flex-start;
+    gap: .75rem;
+    background: #fff;
+    border: 1px solid #ffd43b;
+    border-radius: .5rem;
+    padding: .85rem;
+    margin: .35rem 0;
+}
+
+.retry-icon {
+    font-size: 1.35rem;
+    line-height: 1;
+}
+
+.retry-details {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: .25rem;
+    font-size: .88rem;
+}
+
+.retry-title {
+    margin: 0;
+    color: #d9480f;
+}
+
+.retry-reason {
+    margin: 0;
+    color: #495057;
+}
+
+.retry-timestamps {
+    margin: 0;
+    color: #212529;
+}
+
+.countdown-pill {
+    color: #e67700;
+    font-weight: 600;
+}
+
+.countdown-pill.ready {
+    color: #2b8a3e;
+    font-weight: 600;
+}
+
+.runtime-warning-box {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    background: #fff5f5;
+    border: 1px solid #ffc9c9;
+    border-radius: .4rem;
+    padding: .6rem .85rem;
+    color: #c92a2a;
+    font-size: .85rem;
+}
+
+/* Status pills per stati runtime estesi */
+.status-pill.status-scheduled_retry {
+    background: #ffe066;
+    color: #744210;
+}
+
+.status-pill.status-scheduled_run {
+    background: #e7f5ff;
+    color: #1c7ed6;
+}
+
+.status-pill.status-queued {
+    background: #e3fafc;
+    color: #0c8599;
+}
+
+.status-pill.status-blocked {
+    background: #f1f3f5;
+    color: #495057;
+}
+
+.status-pill.status-cancelling {
+    background: #fff0f6;
+    color: #a61e4d;
+}
+
+.status-pill.status-terminal_mismatch,
+.status-pill.status-missing_queue,
+.status-pill.status-unknown {
+    background: #ffe3e3;
+    color: #c92a2a;
+}
+
+.runtime-diagnostic-box {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    margin-top: 0.75rem;
+    font-size: 0.9rem;
+}
+
+.runtime-diagnostic-box.error {
+    background: #fff5f5;
+    border: 1px solid #ffc9c9;
+    color: #c92a2a;
+}
+
+.runtime-retry-details-box {
+    background: #fff9db;
+    border: 1px solid #ffe066;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-top: 0.75rem;
+    font-size: 0.88rem;
+}
+
+.runtime-retry-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+    color: #744210;
+}
+
+.runtime-countdown-badge {
+    background: #ffd43b;
+    color: #5c3b00;
+    font-weight: 700;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+}
+
+.runtime-retry-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.runtime-reason-row {
+    margin-top: 0.25rem;
+    padding-top: 0.35rem;
+    border-top: 1px dashed #fcc419;
+}
+
 /* Catalogo Connettori Grid */
 .hub-catalog-grid {
     display: grid;

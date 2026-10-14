@@ -530,3 +530,115 @@ async def test_worker_handles_transient_error_exhausts_budget_marks_job_failed()
         assert mock_job.finished_at is not None
         mock_session.commit.assert_awaited_once()
         mock_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_handles_cancel_requested_at_in_transient_error_marks_cancelled() -> None:
+    """Verifica che quando la cancellazione cooperativa è registrata, un errore transitorio
+
+    non programmi alcun retry e finalizzi il job applicativo direttamente su CANCELLED.
+    """
+    from datetime import UTC, datetime
+
+    from gbrain.worker import gmail_sync
+
+    test_job_id = uuid.uuid4()
+    test_account_id = uuid.uuid4()
+
+    mock_job = MagicMock()
+    mock_job.retry_count = 1
+    mock_job.cancel_requested_at = datetime.now(UTC)
+    mock_job.checkpoint = {"phase": "running"}
+    mock_job.status = ImportJobStatus.RUNNING
+    mock_job.error_code = None
+
+    mock_session = MagicMock()
+    mock_session.get = AsyncMock(return_value=mock_job)
+    mock_session.commit = AsyncMock()
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> MagicMock:
+            return mock_session
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    mock_db = MagicMock()
+    mock_db.session_factory.return_value = FakeSessionContext()
+    mock_db.close = AsyncMock()
+
+    with (
+        patch("gbrain.worker.Database", return_value=mock_db),
+        patch(
+            "gbrain.worker.execute_gmail_job",
+            side_effect=GmailJobTransientError("temporary disconnect while cancelling"),
+        ),
+    ):
+        # Non deve sollevare GmailJobTransientError perché il job è stato cancellato!
+        await gmail_sync.func(
+            job_id=str(test_job_id),
+            account_id=str(test_account_id),
+            mode="full",
+        )
+
+    assert mock_job.status == ImportJobStatus.CANCELLED
+    assert mock_job.checkpoint.get("phase") == "cancelled_cooperative"
+    assert mock_job.finished_at is not None
+    mock_session.commit.assert_awaited_once()
+    mock_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_preserves_specific_error_code_when_exhausted() -> None:
+    """Verifica che un codice d'errore specifico (es. 'gmail_quota') non venga sovrascritto
+
+    da 'retry_budget_exhausted' al superamento del budget massimo di retry.
+    """
+    from gbrain.worker import gmail_sync
+
+    test_job_id = uuid.uuid4()
+    test_account_id = uuid.uuid4()
+    settings = get_settings()
+
+    mock_job = MagicMock()
+    mock_job.retry_count = settings.gmail_job_retry_budget
+    mock_job.checkpoint = {"phase": "running"}
+    mock_job.status = ImportJobStatus.RUNNING
+    mock_job.cancel_requested_at = None
+    mock_job.error_code = "gmail_quota"  # Codice specifico impostato da execute_gmail_job
+    mock_job.error_detail = "Quota superata"
+
+    mock_session = MagicMock()
+    mock_session.get = AsyncMock(return_value=mock_job)
+    mock_session.commit = AsyncMock()
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> MagicMock:
+            return mock_session
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    mock_db = MagicMock()
+    mock_db.session_factory.return_value = FakeSessionContext()
+    mock_db.close = AsyncMock()
+
+    with (
+        patch("gbrain.worker.Database", return_value=mock_db),
+        patch(
+            "gbrain.worker.execute_gmail_job",
+            side_effect=GmailJobTransientError("transient quota error"),
+        ),
+    ):
+        with pytest.raises(GmailJobTransientError):
+            await gmail_sync.func(
+                job_id=str(test_job_id),
+                account_id=str(test_account_id),
+                mode="full",
+            )
+
+    assert mock_job.retry_count == settings.gmail_job_retry_budget + 1
+    assert mock_job.status == ImportJobStatus.FAILED
+    # Il codice specifico deve essere preservato!
+    assert mock_job.error_code == "gmail_quota"
+    assert mock_job.checkpoint.get("exhausted_retry_budget") is True

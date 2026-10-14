@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy import desc as sa_desc
 
 from gbrain.application.crypto import encrypt_json
 from gbrain.application.gmail_oauth import (
@@ -38,6 +39,7 @@ from gbrain.application.gmail_service import (
     save_policy,
     update_sync_config,
 )
+from gbrain.application.import_job_runtime import build_import_job_runtime
 from gbrain.domain.connectors import (
     RequestBudget,
     SourceOperationalStatus,
@@ -327,6 +329,19 @@ async def get_source_status(
             if checkpoint_model and checkpoint_model.last_sync_at:
                 last_sync_at = checkpoint_model.last_sync_at
 
+        active_job_orm = None
+        active_job_resp = None
+        if account is not None:
+            active_job_orm = await session.scalar(
+                select(ImportJob)
+                .where(ImportJob.connector_account_id == account.id)
+                .order_by(sa_desc(ImportJob.created_at))
+                .limit(1)
+            )
+            if active_job_orm is not None:
+                runtime = await build_import_job_runtime(session, active_job_orm)
+                active_job_resp = ImportJobResponse.from_job_and_runtime(active_job_orm, runtime)
+
         return SourceStatusResponse(
             source_id=source_id,
             availability=descriptor.status.value,
@@ -352,6 +367,7 @@ async def get_source_status(
             missing_count=coverage_resp.missing_count if coverage_resp else 0,
             requires_import=requires_import,
             last_sync_at=last_sync_at,
+            active_job=active_job_resp,
         )
 
     # Per connettori coming_soon

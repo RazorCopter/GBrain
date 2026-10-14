@@ -10,6 +10,7 @@ from procrastinate.jobs import Job
 from gbrain.application.gmail_jobs import GmailJobTransientError
 from gbrain.config import Settings
 
+GMAIL_QUEUE_NAME = "gmail"
 GMAIL_TASK_NAME = "gbrain.gmail_sync"
 
 

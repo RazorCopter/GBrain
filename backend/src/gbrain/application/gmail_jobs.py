@@ -577,6 +577,15 @@ async def _run_reconciliation(
     cursor: GmailCursor | None = None
     scan_budget = RequestBudget(max_requests=budget.max_requests, max_items=selection.limit)
     while True:
+        if await _cancel_requested(database, job.id):
+            await _finish(
+                database,
+                job.id,
+                status=ImportJobStatus.CANCELLED,
+                checkpoint=current,
+                processed=processed,
+            )
+            raise asyncio.CancelledError
         page = await asyncio.to_thread(connector.enumerate_page, selection, cursor, scan_budget)
         observed_ids.update(locator.message_id for locator in page.items)
         cursor = page.next_cursor
@@ -769,8 +778,25 @@ async def execute_gmail_job(
                 job.id,
                 final_job.not_imported_items,
             )
-    except asyncio.CancelledError:
-        return
+    except (asyncio.CancelledError, TimeoutError):
+        if await _cancel_requested(database, parsed_job_id):
+            async with database.session_factory() as session:
+                job_to_cancel = await session.get(ImportJob, parsed_job_id)
+                if job_to_cancel is not None and job_to_cancel.status not in {
+                    ImportJobStatus.CANCELLED,
+                    ImportJobStatus.SUPERSEDED,
+                    ImportJobStatus.COMPLETED,
+                    ImportJobStatus.COMPLETED_WITH_WARNINGS,
+                }:
+                    job_to_cancel.status = ImportJobStatus.CANCELLED
+                    job_to_cancel.finished_at = datetime.now(UTC)
+                    job_to_cancel.checkpoint = {
+                        **(job_to_cancel.checkpoint or {}),
+                        "phase": "cancelled",
+                    }
+                    await session.commit()
+            return
+        raise
     except GmailJobStaleSnapshotError as exc:
         logger.warning(
             "Job Gmail %s invalidato durante l'esecuzione (superseded/stale snapshot): %s",

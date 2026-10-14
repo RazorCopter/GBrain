@@ -33,6 +33,67 @@ export interface StatusState {
     demo_mode: boolean
 }
 
+export interface RuntimeReason {
+    code: string
+    message: string
+}
+
+export interface RuntimeQueueInfo {
+    job_id: number | null
+    present: boolean | null
+    status: string | null
+    attempts: number | null
+    scheduled_at: string | null
+    database_now: string | null
+    blocked_by_lock: boolean | null
+    abort_requested: boolean | null
+}
+
+export interface RuntimeRetryInfo {
+    attempts: number
+    scheduled_at: string
+    database_now: string
+    remaining_seconds: number
+}
+
+export interface RuntimeCancelInfo {
+    allowed: boolean
+    state: 'available' | 'requested' | 'completed' | 'not_available' | string
+    strategy: 'immediate_if_queued_else_cooperative' | 'none' | string
+}
+
+export interface ImportJobRuntime {
+    status:
+    | 'scheduled_retry'
+    | 'scheduled_run'
+    | 'queued'
+    | 'blocked'
+    | 'running'
+    | 'cancelling'
+    | 'completed'
+    | 'completed_with_warnings'
+    | 'failed'
+    | 'cancelled'
+    | 'superseded'
+    | 'terminal_mismatch'
+    | 'missing_queue'
+    | 'unknown'
+    | string
+    active: boolean
+    reason: RuntimeReason | null
+    consistency:
+    | 'consistent'
+    | 'queue_not_expected'
+    | 'queue_missing'
+    | 'terminal_mismatch'
+    | 'external_abort_requested'
+    | 'observation_failed'
+    | string
+    queue: RuntimeQueueInfo
+    retry: RuntimeRetryInfo | null
+    cancel: RuntimeCancelInfo
+}
+
 export interface ImportJob {
     id: string
     source_kind: string
@@ -56,6 +117,7 @@ export interface ImportJob {
     updated_at: string
     started_at: string | null
     finished_at: string | null
+    runtime?: ImportJobRuntime | null
 }
 
 export interface ImportJobs {
@@ -234,6 +296,7 @@ export interface SourceStatusResponse {
     missing_count?: number
     requires_import?: boolean
     last_sync_at?: string | null
+    active_job?: ImportJob | null
 }
 
 export interface SourceSyncConfig {

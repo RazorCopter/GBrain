@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from gbrain.application.import_job_runtime import ImportJobRuntime
+    from gbrain.domain.models import ImportJob
 
 
 class BootstrapRequest(BaseModel):
@@ -137,6 +141,45 @@ class GmailImportConfirmRequest(BaseModel):
     confirm_import: Literal[True]
 
 
+class RuntimeReasonResponse(BaseModel):
+    code: str
+    message: str
+
+
+class RuntimeQueueInfoResponse(BaseModel):
+    job_id: int | None = None
+    present: bool | None = None
+    status: str | None = None
+    attempts: int | None = None
+    scheduled_at: datetime | None = None
+    database_now: datetime | None = None
+    blocked_by_lock: bool | None = None
+    abort_requested: bool | None = None
+
+
+class RuntimeRetryInfoResponse(BaseModel):
+    attempts: int
+    scheduled_at: datetime
+    database_now: datetime
+    remaining_seconds: float
+
+
+class RuntimeCancelInfoResponse(BaseModel):
+    allowed: bool
+    state: str
+    strategy: str
+
+
+class ImportJobRuntimeResponse(BaseModel):
+    status: str
+    active: bool
+    reason: RuntimeReasonResponse | None = None
+    consistency: str
+    queue: RuntimeQueueInfoResponse
+    retry: RuntimeRetryInfoResponse | None = None
+    cancel: RuntimeCancelInfoResponse
+
+
 class ImportJobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -174,6 +217,55 @@ class ImportJobResponse(BaseModel):
     updated_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    runtime: ImportJobRuntimeResponse | None = None
+
+    @classmethod
+    def from_job_and_runtime(
+        cls,
+        job: ImportJob,
+        runtime: ImportJobRuntime,
+    ) -> ImportJobResponse:
+        reason_resp = (
+            RuntimeReasonResponse(code=runtime.reason.code, message=runtime.reason.message)
+            if runtime.reason
+            else None
+        )
+        retry_resp = (
+            RuntimeRetryInfoResponse(
+                attempts=runtime.retry.attempts,
+                scheduled_at=runtime.retry.scheduled_at,
+                database_now=runtime.retry.database_now,
+                remaining_seconds=runtime.retry.remaining_seconds,
+            )
+            if runtime.retry
+            else None
+        )
+        queue_resp = RuntimeQueueInfoResponse(
+            job_id=runtime.queue.job_id,
+            present=runtime.queue.present,
+            status=runtime.queue.status,
+            attempts=runtime.queue.attempts,
+            scheduled_at=runtime.queue.scheduled_at,
+            database_now=runtime.queue.database_now,
+            blocked_by_lock=runtime.queue.blocked_by_lock,
+            abort_requested=runtime.queue.abort_requested,
+        )
+        cancel_resp = RuntimeCancelInfoResponse(
+            allowed=runtime.cancel.allowed,
+            state=runtime.cancel.state.value,
+            strategy=runtime.cancel.strategy.value,
+        )
+        runtime_resp = ImportJobRuntimeResponse(
+            status=runtime.status.value,
+            active=runtime.active,
+            reason=reason_resp,
+            consistency=runtime.consistency.value,
+            queue=queue_resp,
+            retry=retry_resp,
+            cancel=cancel_resp,
+        )
+        base = cls.model_validate(job)
+        return base.model_copy(update={"runtime": runtime_resp})
 
 
 class ImportJobListResponse(BaseModel):
@@ -392,6 +484,7 @@ class SourceStatusResponse(BaseModel):
     missing_count: int = 0
     requires_import: bool = False
     last_sync_at: datetime | None = None
+    active_job: ImportJobResponse | None = None
 
 
 class SourceCredentialsUploadRequest(BaseModel):

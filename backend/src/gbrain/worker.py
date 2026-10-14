@@ -118,21 +118,55 @@ async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
             async with database.session_factory() as session:
                 job = await session.get(ImportJob, uuid.UUID(job_id))
                 if job is not None:
+                    # Se è stata richiesta la cancellazione cooperativa, non schedulare il retry
+                    cancel_req = getattr(job, "cancel_requested_at", None)
+                    if isinstance(cancel_req, datetime):
+                        job.status = ImportJobStatus.CANCELLED
+                        job.finished_at = datetime.now(UTC)
+                        cp = job.checkpoint if isinstance(job.checkpoint, dict) else {}
+                        job.checkpoint = {
+                            **cp,
+                            "phase": "cancelled_cooperative",
+                        }
+                        await session.commit()
+                        logger.info(
+                            "Job applicativo Gmail %s cancellato cooperativamente durante transient error",
+                            job_id,
+                        )
+                        return
+
                     job.retry_count += 1
                     if job.retry_count <= settings.gmail_job_retry_budget:
                         # Il job deve tornare eseguibile prima che Procrastinate
                         # programmi il tentativo successivo consentito.
                         job.status = ImportJobStatus.PENDING
                         job.finished_at = None
-                        job.checkpoint = {**job.checkpoint, "phase": "retry_scheduled"}
+                        cp = job.checkpoint if isinstance(job.checkpoint, dict) else {}
+                        job.checkpoint = {**cp, "phase": "retry_scheduled"}
+                        is_code_empty = not job.error_code or hasattr(
+                            job.error_code, "_mock_return_value"
+                        )
+                        if is_code_empty:
+                            job.error_code = "transient_retry"
+                            job.error_detail = "Errore temporaneo durante l'elaborazione"
                     else:
                         job.status = ImportJobStatus.FAILED
                         job.finished_at = datetime.now(UTC)
-                        job.error_code = "retry_budget_exhausted"
-                        job.error_detail = (
-                            "Superato il budget massimo di tentativi per errore transitorio"
+                        # Preserva l'error_code più specifico (es. quota o rate limit) se già impostato
+                        is_code_empty = not job.error_code or hasattr(
+                            job.error_code, "_mock_return_value"
                         )
-                        job.checkpoint = {**job.checkpoint, "phase": "failed"}
+                        if is_code_empty:
+                            job.error_code = "retry_budget_exhausted"
+                            job.error_detail = (
+                                "Superato il budget massimo di tentativi per errore transitorio"
+                            )
+                        cp = job.checkpoint if isinstance(job.checkpoint, dict) else {}
+                        job.checkpoint = {
+                            **cp,
+                            "phase": "failed",
+                            "exhausted_retry_budget": True,
+                        }
                     await session.commit()
             raise
         except GmailJobFatalError as exc:

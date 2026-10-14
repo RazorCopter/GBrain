@@ -23,11 +23,68 @@ export interface SourcesPageProps {
     demoMode: boolean
 }
 
+function isJobActive(job: ImportJob | null): boolean {
+    if (!job) return false
+    const terminalStatuses = ['completed', 'completed_with_warnings', 'failed', 'cancelled', 'superseded']
+    if (job.runtime) {
+        return (
+            job.runtime.active ||
+            job.runtime.status === 'cancelling' ||
+            (job.cancel_requested_at !== null && !terminalStatuses.includes(job.status))
+        )
+    }
+    return !terminalStatuses.includes(job.status)
+}
+
+export function formatRomeDateTime(isoUtcString: string | null | undefined): string {
+    if (!isoUtcString) return '—'
+    try {
+        return new Intl.DateTimeFormat('it-IT', {
+            timeZone: 'Europe/Rome',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+        }).format(new Date(isoUtcString))
+    } catch {
+        return new Date(isoUtcString).toLocaleString('it-IT', { timeZone: 'Europe/Rome' })
+    }
+}
+
+const RUNTIME_STATUS_LABELS: Record<string, string> = {
+    scheduled_retry: 'Retry programmato',
+    scheduled_run: 'Esecuzione programmata',
+    queued: 'In coda',
+    blocked: 'In attesa del lock',
+    running: 'In esecuzione',
+    cancelling: 'Annullamento richiesto',
+    completed: 'Completato',
+    completed_with_warnings: 'Completato con avvisi',
+    failed: 'Fallito',
+    cancelled: 'Annullato',
+    superseded: 'Sostituito',
+    terminal_mismatch: 'Incongruenza di stato (diagnostica)',
+    missing_queue: 'Coda non trovata (diagnostica)',
+    unknown: 'Stato non determinabile',
+}
+
+export function getRuntimeStatusLabel(job: ImportJob): string {
+    const st = job.runtime?.status
+    if (st && RUNTIME_STATUS_LABELS[st]) {
+        return RUNTIME_STATUS_LABELS[st]
+    }
+    return job.status.toUpperCase()
+}
+
 export function SourcesPage({ demoMode }: SourcesPageProps) {
     const [catalog, setCatalog] = useState<SourceCatalogItem[]>([])
     const [gmailStatus, setGmailStatus] = useState<SourceStatusResponse | null>(null)
     const [gmailAccount, setGmailAccount] = useState<GmailAccount | null>(null)
     const [activeJob, setActiveJob] = useState<ImportJob | null>(null)
+    const [cancellingJob, setCancellingJob] = useState(false)
+    const [countdownSec, setCountdownSec] = useState<number | null>(null)
     const [sourcesData, setSourcesData] = useState<GmailSources | null>(null)
     const [searchQuery, setSearchQuery] = useState('')
     const [searching, setSearching] = useState(false)
@@ -86,7 +143,12 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
             ])
 
             if (catalogRes) setCatalog(catalogRes.items)
-            if (statusRes) setGmailStatus(statusRes)
+            if (statusRes) {
+                setGmailStatus(statusRes)
+                if (statusRes.active_job) {
+                    setActiveJob((prev) => (prev ? prev : statusRes.active_job ?? null))
+                }
+            }
             if (sourcesRes) setSourcesData(sourcesRes)
             if (gmailOldStatus?.account) setGmailAccount(gmailOldStatus.account)
             await loadDiagnostics(1)
@@ -115,14 +177,15 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         }
     }, [])
 
-    // Polling per il job attivo
+    // Polling per il job attivo finché attivo o in fase di annullamento/cancelling
     useEffect(() => {
-        if (!activeJob || !['pending', 'running'].includes(activeJob.status)) return
+        if (!isJobActive(activeJob) || !activeJob) return
+        const currentJobId = activeJob.id
         const timer = window.setInterval(async () => {
             try {
-                const refreshed = await api.gmailJob(activeJob.id)
+                const refreshed = await api.gmailJob(currentJobId)
                 setActiveJob(refreshed)
-                if (!['pending', 'running'].includes(refreshed.status)) {
+                if (!isJobActive(refreshed)) {
                     loadAllData()
                 }
             } catch {
@@ -130,7 +193,42 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
             }
         }, 2000)
         return () => window.clearInterval(timer)
-    }, [activeJob])
+    }, [
+        activeJob?.id,
+        activeJob?.status,
+        activeJob?.runtime?.status,
+        activeJob?.runtime?.active,
+        activeJob?.cancel_requested_at,
+    ])
+
+    // Countdown client-side derivato dal delta DB per scheduled_retry / scheduled_run
+    useEffect(() => {
+        const isScheduled =
+            activeJob?.runtime?.status === 'scheduled_retry' ||
+            activeJob?.runtime?.status === 'scheduled_run'
+        if (!isScheduled || !activeJob?.runtime?.retry) {
+            setCountdownSec(null)
+            return
+        }
+        const initialRem = Math.max(0, Math.ceil(activeJob.runtime.retry.remaining_seconds))
+        const receivedAt = performance.now()
+        setCountdownSec(initialRem)
+
+        const timer = window.setInterval(() => {
+            const elapsed = Math.floor((performance.now() - receivedAt) / 1000)
+            const next = Math.max(0, initialRem - elapsed)
+            setCountdownSec(next)
+            if (next <= 0) {
+                window.clearInterval(timer)
+            }
+        }, 1000)
+        return () => window.clearInterval(timer)
+    }, [
+        activeJob?.id,
+        activeJob?.runtime?.status,
+        activeJob?.runtime?.retry?.scheduled_at,
+        activeJob?.runtime?.retry?.remaining_seconds,
+    ])
 
     const isConnected = Boolean(gmailStatus?.account_connected || gmailStatus?.status === 'connected')
     const isConfigured = Boolean(gmailStatus?.configured || gmailStatus?.status === 'credentials_configured')
@@ -291,15 +389,20 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         }
     }
 
-    // Cancellazione cooperativa job
+    // Cancellazione sincronizzazione (immediata se in coda, altrimenti cooperativa)
     async function handleCancelJob() {
         if (!activeJob) return
+        setCancellingJob(true)
+        setGlobalError('')
+        setGlobalMessage('')
         try {
             const cancelled = await api.gmailCancelJob(activeJob.id)
             setActiveJob(cancelled)
-            setGlobalMessage('Richiesta di cancellazione inviata al worker.')
+            setGlobalMessage('Richiesta di annullamento sincronizzazione inviata.')
         } catch (err) {
-            setGlobalError(err instanceof ApiError ? err.message : 'Errore nella cancellazione del job.')
+            setGlobalError(err instanceof ApiError ? err.message : "Errore nell'annullamento della sincronizzazione.")
+        } finally {
+            setCancellingJob(false)
         }
     }
 
@@ -424,7 +527,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                     <button
                                         type="button"
                                         className="secondary compact"
-                                        disabled={quickSyncBusy || (activeJob !== null && ['pending', 'running'].includes(activeJob.status))}
+                                        disabled={quickSyncBusy || isJobActive(activeJob)}
                                         onClick={handleQuickSync}
                                         title={gmailStatus?.initial_import_completed ? 'Avvia sincronizzazione incrementale' : 'Avvia sincronizzazione iniziale completa'}
                                     >
@@ -618,7 +721,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                                 <button
                                                     type="button"
                                                     className="primary compact"
-                                                    disabled={historyImportLoading || (activeJob !== null && ['pending', 'running'].includes(activeJob.status))}
+                                                    disabled={historyImportLoading || isJobActive(activeJob)}
                                                     onClick={handleStartHistoryImport}
                                                     title="Avvia o riprende l'importazione mirata dell'intervallo storico"
                                                 >
@@ -667,7 +770,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                                 <button
                                                     type="button"
                                                     className="primary compact"
-                                                    disabled={quickSyncBusy || (activeJob !== null && ['pending', 'running'].includes(activeJob.status))}
+                                                    disabled={quickSyncBusy || isJobActive(activeJob)}
                                                     onClick={handleQuickSync}
                                                     title="Lancia l'aggiornamento incrementale continuo backend-authoritative"
                                                 >
@@ -776,32 +879,110 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                 <div className="job-banner-section">
                     <div className="job-banner-header">
                         <div>
-                            <strong>Job di Sincronizzazione in Esecuzione</strong>
-                            <span className={`status-pill status-${activeJob.status}`}>
-                                {activeJob.status.toUpperCase()}
+                            <strong>Sincronizzazione Gmail</strong>
+                            <span
+                                className={`status-pill status-${activeJob.runtime?.status ?? activeJob.status}`}
+                            >
+                                {getRuntimeStatusLabel(activeJob)}
                             </span>
                         </div>
-                        {['pending', 'running'].includes(activeJob.status) && (
+                        {isJobActive(activeJob) && (
                             <button
                                 type="button"
                                 className="danger compact"
+                                aria-label="Annulla sincronizzazione Gmail in corso"
+                                aria-busy={cancellingJob || activeJob.runtime?.status === 'cancelling'}
+                                disabled={
+                                    cancellingJob ||
+                                    activeJob.runtime?.cancel.allowed === false ||
+                                    activeJob.runtime?.status === 'cancelling' ||
+                                    activeJob.cancel_requested_at !== null
+                                }
                                 onClick={handleCancelJob}
                             >
-                                Annulla Job
+                                {cancellingJob ||
+                                    activeJob.runtime?.status === 'cancelling' ||
+                                    activeJob.cancel_requested_at !== null
+                                    ? 'Annullamento richiesto...'
+                                    : 'Annulla sincronizzazione'}
                             </button>
                         )}
                     </div>
+
+                    {/* Allerta diagnostica per stati di mismatch o assenza coda */}
+                    {(activeJob.runtime?.status === 'terminal_mismatch' ||
+                        activeJob.runtime?.status === 'missing_queue' ||
+                        activeJob.runtime?.status === 'unknown') && (
+                            <div className="runtime-diagnostic-box error">
+                                <span aria-hidden="true">⚠️</span>
+                                <div>
+                                    <strong>Stato diagnostico anomalo:</strong>{' '}
+                                    {activeJob.runtime?.status === 'terminal_mismatch'
+                                        ? 'Incongruenza tra lo stato applicativo e la coda Procrastinate.'
+                                        : activeJob.runtime?.status === 'missing_queue'
+                                            ? 'Record di coda non trovato per il lavoro in corso.'
+                                            : 'Stato di esecuzione della coda non determinabile.'}
+                                </div>
+                            </div>
+                        )}
+
+                    {/* Dettagli pianificazione / retry se programmato */}
+                    {(activeJob.runtime?.status === 'scheduled_retry' ||
+                        activeJob.runtime?.status === 'scheduled_run') && (
+                            <div className="runtime-retry-details-box">
+                                <div className="runtime-retry-header">
+                                    <strong>
+                                        {activeJob.runtime.status === 'scheduled_retry'
+                                            ? 'Prossimo tentativo di ripresa'
+                                            : 'Prossima esecuzione programmata'}
+                                    </strong>
+                                    {countdownSec !== null && (
+                                        <span className="runtime-countdown-badge">
+                                            tra {countdownSec}s
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="runtime-retry-grid">
+                                    <div>
+                                        <span className="muted">Orario programmato (Roma):</span>{' '}
+                                        <strong>
+                                            {formatRomeDateTime(
+                                                activeJob.runtime.retry?.scheduled_at ??
+                                                activeJob.runtime.queue.scheduled_at
+                                            )}
+                                        </strong>
+                                    </div>
+                                    <div>
+                                        <span className="muted">Tentativi:</span>{' '}
+                                        <strong>
+                                            {activeJob.runtime.queue.attempts ?? activeJob.retry_count}
+                                        </strong>
+                                    </div>
+                                    {activeJob.runtime.reason && (
+                                        <div className="runtime-reason-row">
+                                            <span className="muted">Motivo:</span>{' '}
+                                            <span>{activeJob.runtime.reason.message}</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
                     <p className="job-banner-desc">
-                        Modalità: <strong>{activeJob.mode ?? 'full'}</strong> · Messaggi elaborati: <strong>{activeJob.processed_items}</strong>
+                        Modalità: <strong>{activeJob.mode ?? 'full'}</strong> · Messaggi elaborati:{' '}
+                        <strong>{activeJob.processed_items}</strong>
                         {activeJob.total_items ? ` su ${activeJob.total_items}` : ''}
                         {' · '}
                         Importati: <strong>{activeJob.imported_items ?? 0}</strong>
                         {' · '}
                         Duplicati: <strong>{activeJob.duplicate_items ?? 0}</strong>
                         {' · '}
-                        Non importati: <strong className={activeJob.not_imported_items ? 'text-warning' : ''}>{activeJob.not_imported_items ?? 0}</strong>
+                        Non importati:{' '}
+                        <strong className={activeJob.not_imported_items ? 'text-warning' : ''}>
+                            {activeJob.not_imported_items ?? 0}
+                        </strong>
                     </p>
-                    {['pending', 'running'].includes(activeJob.status) && (
+                    {isJobActive(activeJob) && (
                         <div className="progress-bar-container">
                             <div className="progress-bar-indeterminate"></div>
                         </div>
