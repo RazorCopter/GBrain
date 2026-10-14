@@ -69,4 +69,19 @@ Il nucleo implementato comprende:
 - attribuzione certa soltanto quando il solo mittente coincide con un alias owner confermato; il solo `From` non registra nuovi alias;
 - contenuti marcati non fidati: URL e prompt injection restano dati citabili e non influenzano policy o strumenti.
 
-L'OAuth UX, la creazione/refresh/revoca reale delle credenziali e il collegamento al worker sono punti di integrazione successivi. Nessun token reale è presente o collaudato.
+### Gestione Quota Google, Pacing Condiviso e Fencing Transazionale
+
+Per garantire un'interazione resiliente e coordinata con le API di Google:
+1. **Pacing condiviso via PostgreSQL ([`backend/src/gbrain/infrastructure/gmail_rate_limiter.py`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:1)):**
+   - Implementazione [`PostgresGmailRateLimiter`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:158) che usa la tabella [`gmail_rate_limits`](backend/migrations/versions/20261015_0007_gmail_rate_limit.py:28) e l'orologio atomico `clock_timestamp()` del database per serializzare e distanziare uniformemente le chiamate API HTTP;
+   - La frequenza predefinita è impostata da [`Settings.gmail_rate_limit_per_second`](backend/src/gbrain/config.py:46) (`GBRAIN_GMAIL_RATE_LIMIT_PER_SECOND=4`, pari a uno slot ogni 250 ms senza burst accumulato);
+   - Supporta scope dedicati per singolo account registrato (FK su [`connector_accounts.id`](backend/src/gbrain/domain/models.py:130)) e uno scope globale pre-account ([`GMAIL_OAUTH_PRE_ACCOUNT_SCOPE`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:20) = `'global:oauth_pre_account'`) per distanziare le chiamate `get_profile` pre-salvataggio senza memorizzare alcuna informazione personale (PII).
+2. **Distinzione semantica errori Quota vs Auth ([`backend/src/gbrain/infrastructure/gmail_gateway.py`](backend/src/gbrain/infrastructure/gmail_gateway.py:686)):**
+   - Gli errori HTTP 403 con motivi `rateLimitExceeded`, `userRateLimitExceeded` o `quotaExceeded` (oltre a HTTP 429) sono classificati categoricamente come [`ConnectorErrorCategory.QUOTA`](backend/src/gbrain/domain/connectors.py:18) (`retryable=True`);
+   - Gli errori HTTP 403 privi di tali ragioni specifiche vengono invece classificati come [`ConnectorErrorCategory.AUTH`](backend/src/gbrain/domain/connectors.py:17) (`retryable=False`, non tentabili);
+   - Gli header `Retry-After` (sia in formato delta-seconds numerico sia in formato HTTP-Date RFC 2822) sono parsati e limitati a un tetto massimo di sicurezza (`MAX_RETRY_AFTER_SECONDS = 300.0s`).
+3. **Fencing transazionale e stato terminale `superseded` ([`backend/src/gbrain/domain/models.py`](backend/src/gbrain/domain/models.py:34)):**
+   - Qualora la configurazione di un account o lo snapshot semantico di sincronizzazione vengano alterati mentre un lavoro asincrono è in corso, il controllo di versione in [`AsyncPostgresGmailRepository`](backend/src/gbrain/infrastructure/gmail_repository.py:1) solleva [`GmailJobStaleSnapshotError`](backend/src/gbrain/infrastructure/gmail_repository.py:32);
+   - Il job non viene fallito erroneamente né riaccodato all'infinito, ma marcato nello stato terminale [`ImportJobStatus.SUPERSEDED`](backend/src/gbrain/domain/models.py:34) con fase `superseded_stale_revision`, impedendo sovrascritture distruttive concorrenti.
+4. **Matrice chiamate e deduplicazione ID:**
+   - La matrice delle operazioni censisce `list_messages`, `get_metadata`, `get_full`, `get_profile` e `list_history`, con deduplicazione preventiva degli ID messaggio su ciascun batch enumerato.

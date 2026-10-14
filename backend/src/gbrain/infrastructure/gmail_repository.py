@@ -31,6 +31,12 @@ from gbrain.domain.models import (
 )
 
 
+class GmailJobStaleSnapshotError(RuntimeError):
+    """Sollevata quando la configurazione semantica del job è obsoleta o modificata durante l'esecuzione."""
+
+    pass
+
+
 class AsyncPostgresGmailRepository:
     """Persistenza PostgreSQL transazionale per l'integrazione worker successiva."""
 
@@ -64,7 +70,7 @@ class AsyncPostgresGmailRepository:
                     or config.revision != checkpoint.config_revision
                     or config.query_fingerprint != checkpoint.query_fingerprint
                 ):
-                    raise RuntimeError("stale_gmail_job_snapshot")
+                    raise GmailJobStaleSnapshotError("stale_gmail_job_snapshot")
             for message in messages:
                 item = await self._session.scalar(
                     select(SourceItem)

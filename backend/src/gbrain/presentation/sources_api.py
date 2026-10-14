@@ -46,6 +46,7 @@ from gbrain.domain.connectors import (
 )
 from gbrain.domain.models import ConnectorAccountStatus, ImportJob
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
+from gbrain.infrastructure.gmail_rate_limiter import PostgresGmailRateLimiter
 from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
 from gbrain.infrastructure.source_credentials_repository import SourceCredentialsRepository
 from gbrain.presentation.dependencies import (
@@ -506,7 +507,15 @@ async def test_source_connection(
             await session.commit()
 
         initial_token = credentials.token
-        gateway = OfficialGmailGateway.from_credentials(credentials)
+        rate_limiter = PostgresGmailRateLimiter(
+            settings.database_url,
+            settings.gmail_rate_limit_per_second,
+        )
+        gateway = OfficialGmailGateway.from_credentials(
+            credentials,
+            account_id=account.id,
+            rate_limiter=rate_limiter,
+        )
         profile = await asyncio.to_thread(
             gateway.get_profile, RequestBudget(max_requests=1, max_items=1)
         )
@@ -583,7 +592,15 @@ async def preview_source_import(
             logger.warning("Refresh credenziali preview fallito: %s", exc)
 
     initial_token = credentials.token
-    gateway = OfficialGmailGateway.from_credentials(credentials)
+    rate_limiter = PostgresGmailRateLimiter(
+        settings.database_url,
+        settings.gmail_rate_limit_per_second,
+    )
+    gateway = OfficialGmailGateway.from_credentials(
+        credentials,
+        account_id=account.id,
+        rate_limiter=rate_limiter,
+    )
     after_epoch = int(after_dt.timestamp())
     before_epoch = int(before_dt.timestamp())
     query = f"label:SENT after:{after_epoch} before:{before_epoch}"

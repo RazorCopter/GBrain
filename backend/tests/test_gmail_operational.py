@@ -264,7 +264,7 @@ def test_job_task_is_globally_locked_and_bounded() -> None:
     )
     assert 'lock="gmail-heavy-global"' in worker_source
     assert 'queue="gmail"' in worker_source
-    assert "retry=procrastinate.RetryStrategy(" in worker_source
+    assert "retry=GmailJobRetryStrategy(" in worker_source
     assert "retry_exceptions=(GmailJobTransientError,)" in worker_source
 
 

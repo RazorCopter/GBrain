@@ -210,17 +210,20 @@ class GmailOwnerIdentity:
     aliases: frozenset[OwnerAlias]
     fetched_at: datetime
 
+
 @dataclass(frozen=True)
 class GmailMessageLocator:
     message_id: GmailMessageId
     thread_id: GmailThreadId
     history_id: GmailHistoryId
 
+
 @dataclass(frozen=True)
 class GmailMessagePage:
     locators: list[GmailMessageLocator]
     next_page_token: GmailPageToken
     result_size_estimate: int
+
 
 @dataclass(frozen=True)
 class GmailRawMessage:
@@ -234,9 +237,10 @@ class GmailRawMessage:
     header_to: str
     header_cc: str | None
     header_subject: str
-    raw_payload: bytes          # formato raw o payload JSON full
+    raw_payload: bytes  # formato raw o payload JSON full
     size_estimate: int
-    snippet: str                # trattato come dato non fidato
+    snippet: str  # trattato come dato non fidato
+
 
 @dataclass(frozen=True)
 class GmailNormalizedMessage:
@@ -245,41 +249,44 @@ class GmailNormalizedMessage:
     history_id: GmailHistoryId
     internal_date: InternalDate
     header_message_id: HeaderMessageId
-    sender: OwnerAlias          # verificato come alias owner
+    sender: OwnerAlias  # verificato come alias owner
     recipients_to: list[str]
     recipients_cc: list[str]
-    subject: str                # dato non fidato, sanitizzato
-    body_plain: str | None      # testo estratto, dato non fidato
+    subject: str  # dato non fidato, sanitizzato
+    body_plain: str | None  # testo estratto, dato non fidato
     body_html_stripped: str | None  # HTML→testo, dato non fidato
     attachments_metadata: list[AttachmentMeta]
     revision_hash: RevisionHash
     source_account: GmailAccountId
-    is_sent: bool               # invariante: sempre True
+    is_sent: bool  # invariante: sempre True
+
 
 @dataclass(frozen=True)
 class AttachmentMeta:
     filename: str | None
     mime_type: str
     size: int
-    attachment_id: str          # per fetch futuro opzionale
+    attachment_id: str  # per fetch futuro opzionale
+
 
 @dataclass(frozen=True)
 class SyncCheckpoint:
     account_id: GmailAccountId
     last_history_id: GmailHistoryId | None
     last_page_token: GmailPageToken
-    sync_phase: SyncPhase       # BOOTSTRAP | INCREMENTAL | RECONCILE | ERROR
+    sync_phase: SyncPhase  # BOOTSTRAP | INCREMENTAL | RECONCILE | ERROR
     last_success_at: datetime | None
     last_error: SyncError | None
     pages_completed: int
     items_fetched: int
     items_persisted: int
 
+
 class SyncPhase(str, Enum):
-    BOOTSTRAP = 'bootstrap'
-    INCREMENTAL = 'incremental'
-    RECONCILE = 'reconcile'
-    ERROR = 'error'
+    BOOTSTRAP = "bootstrap"
+    INCREMENTAL = "incremental"
+    RECONCILE = "reconcile"
+    ERROR = "error"
 ```
 
 ### Invarianti SENT
@@ -337,14 +344,14 @@ La full reconciliation enumera tutti i messaggi SENT e confronta con lo stato pe
 
 ```python
 class SyncErrorCategory(str, Enum):
-    TRANSIENT = 'transient'           # 429, 5xx, timeout, rete
-    PERMANENT = 'permanent'           # 404 messaggio, 400 parametri
-    AUTH = 'auth'                     # 401, 403, token revocato
-    HISTORY_EXPIRED = 'history_expired'  # historyId non valido
-    QUOTA_EXCEEDED = 'quota_exceeded'    # budget pagine/richieste
-    PARSE_ERROR = 'parse_error'       # MIME/charset/profondità
-    PERIMETER_VIOLATION = 'perimeter_violation'  # non-SENT, sender sconosciuto
-    CHECKPOINT_CONFLICT = 'checkpoint_conflict'  # lock concorrente
+    TRANSIENT = "transient"  # 429, 5xx, timeout, rete
+    PERMANENT = "permanent"  # 404 messaggio, 400 parametri
+    AUTH = "auth"  # 401, 403, token revocato
+    HISTORY_EXPIRED = "history_expired"  # historyId non valido
+    QUOTA_EXCEEDED = "quota_exceeded"  # budget pagine/richieste
+    PARSE_ERROR = "parse_error"  # MIME/charset/profondità
+    PERIMETER_VIOLATION = "perimeter_violation"  # non-SENT, sender sconosciuto
+    CHECKPOINT_CONFLICT = "checkpoint_conflict"  # lock concorrente
 ```
 
 - Errori transienti: retry con backoff esponenziale, max 5 tentativi, rispetto `Retry-After`.

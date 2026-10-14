@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     gmail_oauth_state_ttl_seconds: int = Field(default=600, ge=300, le=900)
     gmail_oauth_timeout_seconds: float = Field(default=20.0, ge=1.0, le=60.0)
     gmail_job_retry_budget: int = Field(default=3, ge=0, le=5)
+    gmail_rate_limit_per_second: float = Field(
+        default=4.0,
+        ge=0.1,
+        le=100.0,
+        description="Frequenza massima di richieste Gmail al secondo per account. Predefinito 4 (almeno 250 ms tra gli inizi delle chiamate, senza burst).",
+    )
 
     worker_concurrency: int = Field(default=1, ge=1, le=1)
 

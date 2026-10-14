@@ -35,6 +35,7 @@ class ConnectorError(RuntimeError):
         retryable: bool = False,
         status_code: int | None = None,
         reason_code: str | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(safe_message)
         self.category = category
@@ -42,6 +43,7 @@ class ConnectorError(RuntimeError):
         self.retryable = retryable
         self.status_code = status_code
         self.reason_code = reason_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GmailMimeError(ConnectorError):

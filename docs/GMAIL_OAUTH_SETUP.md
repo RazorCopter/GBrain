@@ -108,3 +108,15 @@ I token OAuth (access token e refresh token) sono scambiati unicamente server-si
 4. **Scambio Server-Side:** Lo scambio del code per i token di accesso e la chiamata a `users.getProfile` avvengono esclusivamente backend-to-backend;
 5. **Verifica Alias:** L'indirizzo email estratto dal profilo viene proposto all'utente come alias; nessun import o preview può essere avviato finché l'owner non conferma esplicitamente almeno un alias (`alias_required`);
 6. **Revoca e Disconnessione:** Il comando "Revoca e disconnetti" cancella permanentemente le credenziali e i token locali dal database PostgreSQL e tenta contestualmente la revoca remota presso gli endpoint Google.
+
+---
+
+## 6. Rate Limiting, Pacing Condiviso e Quota Google
+
+Per rispettare le soglie stabilite da Google (250 quota units/sec per utente) ed evitare errori `429 Too Many Requests` o `403 rateLimitExceeded`:
+1. **Configurazione ambiente:**
+   - `GBRAIN_GMAIL_RATE_LIMIT_PER_SECOND` (default: `4`, configurabile in [`example.env`](example.env:54)): definisce il numero massimo di richieste API Google al secondo per account. A valore 4, intercorre un intervallo minimo di 250 ms tra l'inizio di ciascuna chiamata, senza burst.
+2. **Pacing pre-account anonimo ([`backend/src/gbrain/infrastructure/gmail_rate_limiter.py`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:20)):**
+   - Durante la fase di callback OAuth e la chiamata `users.getProfile` (in cui l'account non è ancora salvato su DB), il sistema applica il rate limiting condividendo lo scope neutrale `global:oauth_pre_account`. Questo garantisce il distanziamento cross-worker senza esporre né persistere email o dati personali prima del completamento dell'autenticazione.
+3. **Gestione Retry-After e Backoff:**
+   - Qualora Google risponda con errore di quota (HTTP 429 o HTTP 403 quota), il gateway estrae il tempo di attesa da `Retry-After` (bounded a un massimo di 300 secondi) e sospende le successive richieste per quell'account tramite [`PostgresGmailRateLimiter.block_for()`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:137).

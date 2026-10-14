@@ -1,9 +1,18 @@
 # PROJECT STATUS — checkpoint ufficiale riprendibile
 
-**Data checkpoint:** 14 ottobre 2026
-**Checkpoint:** Fase II — Gestione robusta messaggi Gmail grandi, allegati metadata-only, diagnostica per-item e tracciamento lacune di copertura
-**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata; Fase 2 Gmail `SENT` implementata end-to-end con supporto robusto a messaggi Gmail grandi (rimosso il veto globale preventivo `sizeEstimate > 25 MiB`), allegati gestiti come metadata-only senza chiamate o download di blob remoti (`attachments.get` assente nel gateway); limiti bounded su corpo testuale cumulativo e singola parte (5 MiB), rappresentazione base64 controllata prima del decode, profondità MIME (10), numero parti/header/allegati e metadati/filename; isolamento per-elemento nei batch/pagine con avanzamento atomico di messaggi validi, record diagnostici (`gmail_item_gaps`), contatori job e checkpoint/page token; contatori semantici separati (`imported_items`, `duplicate_items`, `not_imported_items`, `processed_items`); copertura con tracking esplicito delle lacune (`has_gaps`, `missing_count`, stato `complete_with_gaps` vs `completed`); risoluzione automatica delle lacune al reprocessamento; stato job `completed_with_warnings` per lacune permanenti gestite e propagazione `GmailJobFatalError` nel worker per job `failed` senza retry spuri; API consultabile, paginata e non sensibile `GET /api/sources/gmail/diagnostics` (zero PII/body/headers/token); interfaccia React in [`frontend/src/SourcesPage.tsx`](frontend/src/SourcesPage.tsx) arricchita con contatori ed esploratore diagnostico lacune; migrazione additiva lineare `20261014_0006` con ciclo `0005→0006→0005→0006` collaudato con successo su PostgreSQL 16 effimero senza volumi; suite test: **202 superati, 5 skipped su 207 raccolti**.
-**Giudizio di prontezza:** controlli automatici locali superati (pytest, Ruff check/format, Mypy, build Vite) e migrazione PostgreSQL effimera verificata. Il working tree è tecnicamente pronto per revisione indipendente senza commit né push: i limiti runtime e l'integrazione con account Google reali restano vincolati all'autorizzazione con credenziali OAuth effettive (vedere Gate Gmail Reale).
+**Data checkpoint:** 15 ottobre 2026
+**Checkpoint:** Fase II — Coordinamento Quota Gmail, Pacing PostgreSQL condiviso e Fencing Transazionale Stale Snapshot (Migrazione 0007)
+**Fase corrente:** Fase 0 consolidata; Fondazione Fase 1 verificata; Fase 2 Gmail `SENT` completata e protetta da coordinamento quote e isolamento concorrenza:
+- Distinzione strutturata di errori HTTP 403 quota (`rateLimitExceeded`, `userRateLimitExceeded`, `quotaExceeded`) con [`ConnectorErrorCategory.QUOTA`](backend/src/gbrain/domain/connectors.py:18) (`retryable=True`) vs 403 auth con [`ConnectorErrorCategory.AUTH`](backend/src/gbrain/domain/connectors.py:17) (`retryable=False`);
+- Header `Retry-After` delta/date bounded (`MAX_RETRY_AFTER_SECONDS = 300.0s`), backoff con jitter e ownership dei retry delegata al runner Procrastinate;
+- Pacing condiviso tra worker tramite PostgreSQL con [`PostgresGmailRateLimiter`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:158) su tabella [`gmail_rate_limits`](backend/migrations/versions/20261015_0007_gmail_rate_limit.py:28), serializzazione atomica basata su `clock_timestamp()` senza burst (`GBRAIN_GMAIL_RATE_LIMIT_PER_SECOND=4`, min 250 ms) sia per account persistiti che per lo scope globale anonimo pre-account OAuth (`global:oauth_pre_account`);
+- Matrice chiamate API strutturata (`list_messages`, `get_metadata`, `get_full`, `get_profile`, `list_history`) e deduplicazione preventiva degli ID messaggio;
+- Snapshot semantico di sincronizzazione separato dai limiti operativi/budget richieste;
+- Stato terminale [`ImportJobStatus.SUPERSEDED`](backend/src/gbrain/domain/models.py:34) con fencing transazionale per invalidare job concorrenti obsoleti in caso di riconfigurazione senza fallimenti spuri;
+- Migrazione lineare `20261015_0007_gmail_rate_limit.py` con downgrade testato che riallinea i job `superseded` a `cancelled`;
+- Supporto a messaggi Gmail grandi (rimosso veto preventivo 25 MiB), allegati metadata-only, diagnostica per-item (`gmail_item_gaps`), contatori semantici separati e stato `completed_with_warnings`;
+- Suite test deterministica backend: **240 superati, 5 skipped su 245 raccolti**.
+**Giudizio di prontezza:** controlli automatici locali superati (pytest, Ruff check/format, Mypy, build Vite) e migrazione PostgreSQL effimera verificata. I limiti runtime e l'integrazione con account Google reali restano vincolati all'autorizzazione con credenziali OAuth effettive (vedere Gate Gmail Reale).
 **Non è una dichiarazione di MVP finale né di integrazione con servizi personali.**
 
 ## Regola di lettura dello stato
@@ -11,7 +20,7 @@
 Questo checkpoint distingue rigorosamente:
 
 - **codice predisposto:** file, schemi, API e UI esistono, sono stati revisionati trasversalmente e allineati;
-- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (161 test backend superati + typecheck/build frontend);
+- **test deterministico superato:** comandi locali eseguiti senza rete né servizi esterni hanno restituito exit 0 (240 test backend superati, 5 skipped su 245 raccolti + typecheck/build frontend);
 - **test integrazione pendente:** test marcati esplicitamente con `@pytest.mark.skip` (5 test) che richiedono demone Docker Linux, PostgreSQL reale con estensioni o credenziali Google Cloud autorizzate;
 - **integrazione reale non eseguita:** non eseguito collaudo runtime con account Google reale o container Docker su Linux host.
 
@@ -77,14 +86,14 @@ Nel ciclo di implementazione del **Source Connection Wizard** sono stati consoli
 Tutti i controlli deterministici sono stati eseguiti localmente con esito positivo:
 
 - **Pytest:** `uv run pytest`
-  - **185 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
-  - 0 fallimenti, 0 errori (**190 test raccolti**).
-- **Ruff linter:** `uv run ruff check backend scripts`
+  - **240 test superati**, **5 test marcati esplicitamente pendenti/skipped** (collaudo Docker/PostgreSQL reale, Procrastinate reale, Google Cloud reale).
+  - 0 fallimenti, 0 errori (**245 test raccolti**).
+- **Ruff linter:** `uv run ruff check .`
   - **Superato:** 0 errori, 0 avvisi.
-- **Ruff formatter:** `uv run ruff format --check backend scripts`
-  - **Superato:** 62 file formattati in modo conforme.
+- **Ruff formatter:** `uv run ruff format --check .`
+  - **Superato:** 90 file formattati in modo conforme.
 - **Mypy type check:** `uv run mypy backend/src backend/tests scripts`
-  - **Superato:** Successo su tutti i 56 file sorgente, 0 errori di tipo.
+  - **Superato:** Successo su tutti i 59 file sorgente, 0 errori di tipo.
 - **Frontend TypeScript & Build:** `npm --prefix frontend run typecheck && npm --prefix frontend run build`
   - **Superato:** Type check `tsc --noEmit` superato, `tsc -b` e bundle Vite di produzione (19 moduli) generato con successo.
 - **Collaudo Migrazione Alembic Effimera:** ciclo `0004 → 0005 → 0004 → 0005`
@@ -97,6 +106,25 @@ Tutti i controlli deterministici sono stati eseguiti localmente con esito positi
   - **Superato:** Dal container del servizio worker reale (`gbrain:0.1.0`): DNS `oauth2.googleapis.com` (`142.251.127.95`), DNS `gmail.googleapis.com` (`172.217.114.4`), TLS handshake 443 OK, probe HTTPS HEAD senza token OK (Status 404 remoto).
 
 ---
+
+## File modificati e creati nella feature Coordinamento Quota Gmail, Pacing PostgreSQL e Fencing Transazionale Stale Snapshot
+
+- **Creati:**
+  - [`backend/migrations/versions/20261015_0007_gmail_rate_limit.py`](backend/migrations/versions/20261015_0007_gmail_rate_limit.py:1) — Migrazione Alembic (head lineare `20261015_0007`) che introduce il valore enum `'superseded'` in `import_job_status`, la tabella di pacing `gmail_rate_limits` con indice `ix_gmail_rate_limits_connector_account_id` e procedura di downgrade con allineamento dei job superseded a `cancelled`.
+  - [`backend/src/gbrain/infrastructure/gmail_rate_limiter.py`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:1) — Interfaccia astratta [`GmailRateLimiter`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:41), implementazione in-memory [`InMemoryNextSlotRateLimiter`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:76) e implementazione distribuita PostgreSQL [`PostgresGmailRateLimiter`](backend/src/gbrain/infrastructure/gmail_rate_limiter.py:158) basata sull'orologio atomico `clock_timestamp()` e `next_slot_at`, con supporto per scope account persistiti e scope globale anonimo pre-account OAuth (`global:oauth_pre_account`).
+  - [`backend/tests/test_gmail_rate_limiter.py`](backend/tests/test_gmail_rate_limiter.py:1) — Suite esaustiva con test per pacing senza burst, cancellazione cooperativa, blocco Retry-After e gestione degli scope.
+- **Modificati:**
+  - [`backend/src/gbrain/config.py`](backend/src/gbrain/config.py:46) — Nuova variabile di configurazione `gmail_rate_limit_per_second` (default 4.0 req/s, corrispondente a un distanziamento minimo di 250 ms tra inizi chiamate successive).
+  - [`example.env`](example.env:54) e [`compose.yaml`](compose.yaml:69) — Definizione e propagazione della variabile `GBRAIN_GMAIL_RATE_LIMIT_PER_SECOND=4` ai servizi worker e backend.
+  - [`backend/src/gbrain/domain/models.py`](backend/src/gbrain/domain/models.py:34) — Aggiunta dello stato terminale `SUPERSEDED = "superseded"` nell'enum `ImportJobStatus`.
+  - [`backend/src/gbrain/domain/connectors.py`](backend/src/gbrain/domain/connectors.py:18) — Formalizzazione della categoria `ConnectorErrorCategory.QUOTA` per errori di quota distinguibili dall'autenticazione.
+  - [`backend/src/gbrain/infrastructure/gmail_gateway.py`](backend/src/gbrain/infrastructure/gmail_gateway.py:686) — Distinzione rigorosa tra errori HTTP 403 quota (`rateLimitExceeded`, `userRateLimitExceeded`, `quotaExceeded`) e 403 auth (`insufficientPermissions`, `invalid_grant`), parsing esteso di header `Retry-After` numerico e HTTP-date RFC 2822 limitato al cap di 300s, applicazione cooldown al rate limiter condiviso e deduplicazione ID messaggi.
+  - [`backend/src/gbrain/infrastructure/gmail_repository.py`](backend/src/gbrain/infrastructure/gmail_repository.py:32) — Sollevamento di `GmailJobStaleSnapshotError` al rilevamento di discrepanza revisione/snapshot e metodo per contrassegnare i job invalidati con lo stato `superseded`.
+  - [`backend/src/gbrain/application/gmail_jobs.py`](backend/src/gbrain/application/gmail_jobs.py:774) — Cattura di `GmailJobStaleSnapshotError` con fencing transazionale e marcatura del job a `superseded` (`phase: superseded_stale_revision`) senza generare fallimenti o retry spuri; integrazione del rate limiter condiviso Postgres nelle factory del gateway.
+  - [`backend/src/gbrain/application/gmail_oauth.py`](backend/src/gbrain/application/gmail_oauth.py:1) — Applicazione del rate limiter con scope anonimo `global:oauth_pre_account` durante l'interrogazione del profilo utente (`users.getProfile`).
+  - [`backend/src/gbrain/application/gmail_service.py`](backend/src/gbrain/application/gmail_service.py:1) — Fencing al momento dell'accodamento di nuovi job con invalidazione (`superseded`) dei lavori pendenti o in esecuzione sulla configurazione obsoleta.
+  - [`backend/src/gbrain/worker.py`](backend/src/gbrain/worker.py:1) — Gestione dello stato `superseded` nel runner Procrastinate, logging dedicato e delega del backoff/jitter al retry mechanism di Procrastinate.
+  - [`scripts/test_postgres_migration_recovery.py`](scripts/test_postgres_migration_recovery.py:1) — Aggiornamento del target di test migrazione da 0006 a 0007.
 
 ## File modificati e creati nella feature Gestione Robusta Messaggi Grandi e Diagnostica Per-Item
 
@@ -183,7 +211,7 @@ Le seguenti verifiche richiedono un account Google Cloud / mailbox Gmail live e 
 ## Rischi residui
 
 1. **Stack multi-container completo e persistenza su ambiente Linux di destinazione:** Il container worker è stato collaudato con successo a runtime per la connettività di rete esterna (DNS/TLS), ma l'orchestrazione congiunta completa con PostgreSQL su volumi host e locking advisory Procrastinate reale a caldo rimane da validare sul nodo LXC/Linux di produzione.
-2. **Interazione di rete reale con Google API:** Le quote reali (250 quota units/sec utente), l'effettiva reattività alle revocazioni remote e la latenza dei refresh token rimangono verificabili soltanto con account Google Cloud reale.
+2. **Interazione di rete reale con Google API e limiti quota:** L'architettura implementa rate limiting distribuito a 4 req/s, backoff/jitter e gestione bounded di `Retry-After`. Tuttavia, le quote totali lato Google Cloud (250 quota units/sec per utente e 1.000.000.000 quota units/giorno di progetto), eventuali blocchi da client/processi concorrenti esterni non coordinati o variazioni unilaterali delle policy del provider non possono essere garantiti in modo assoluto dal solo client locale; l'effettiva reattività alle revocazioni remote e la latenza dei refresh token rimangono verificabili soltanto con account Google Cloud reale.
 3. **Backup Neo4j/PostgreSQL non testato a caldo:** Neo4j resta una proiezione sincrona non ancora popolata dall'outbox worker.
 
 ---

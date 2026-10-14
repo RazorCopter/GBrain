@@ -6,6 +6,7 @@ import random
 import re
 import socket
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -39,6 +40,7 @@ from gbrain.domain.gmail import (
     GmailRawMessage,
     GmailSelection,
 )
+from gbrain.infrastructure.gmail_rate_limiter import GmailRateLimiter
 
 _T = TypeVar("_T")
 _SAFE_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
@@ -72,8 +74,15 @@ class GmailService(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class CallMetric:
+    method: str
+    status: str
+    category: str
+
+
+@dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    max_attempts: int = 5
+    max_attempts: int = 1
     initial_delay_seconds: float = 0.25
     maximum_delay_seconds: float = 8.0
     jitter_ratio: float = 0.2
@@ -99,22 +108,50 @@ class OfficialGmailGateway:
         self,
         service: GmailService,
         *,
+        account_id: uuid.UUID | str | None = None,
+        rate_limiter: GmailRateLimiter | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
         retry_policy: RetryPolicy | None = None,
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._service = service
+        self._account_id = account_id
+        self._rate_limiter = rate_limiter
+        self._is_cancelled = is_cancelled
         self._retry = retry_policy or RetryPolicy()
         self._sleep = sleep
         self._random = random_value
         self._monotonic = monotonic
+        self._metrics: list[CallMetric] = []
+
+    def get_metrics(self) -> tuple[CallMetric, ...]:
+        return tuple(self._metrics)
+
+    def get_call_count(
+        self,
+        *,
+        method: str | None = None,
+        status: str | None = None,
+        category: str | None = None,
+    ) -> int:
+        return sum(
+            1
+            for m in self._metrics
+            if (method is None or m.method == method)
+            and (status is None or m.status == status)
+            and (category is None or m.category == category)
+        )
 
     @classmethod
     def from_credentials(
         cls,
         credentials: Credentials,
         *,
+        account_id: uuid.UUID | str | None = None,
+        rate_limiter: GmailRateLimiter | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
         retry_policy: RetryPolicy | None = None,
     ) -> OfficialGmailGateway:
         scopes_value = getattr(credentials, "scopes", None)
@@ -139,7 +176,13 @@ class OfficialGmailGateway:
             cache_discovery=False,
             static_discovery=True,
         )
-        return cls(cast(GmailService, service), retry_policy=effective_retry)
+        return cls(
+            cast(GmailService, service),
+            account_id=account_id,
+            rate_limiter=rate_limiter,
+            is_cancelled=is_cancelled,
+            retry_policy=effective_retry,
+        )
 
     def get_profile(self, budget: RequestBudget) -> Mapping[str, Any]:
         response = self._execute(
@@ -191,6 +234,7 @@ class OfficialGmailGateway:
                 "Schema messages.list non valido",
             )
         locators: list[GmailLocator] = []
+        seen_ids: set[str] = set()
         for entry in raw_messages:
             entry_mapping = _mapping(entry, "messages.list item")
             message_id = str(entry_mapping.get("id") or "")
@@ -199,6 +243,9 @@ class OfficialGmailGateway:
                     ConnectorErrorCategory.PERMANENT,
                     "Elemento messages.list privo di id",
                 )
+            if message_id in seen_ids:
+                continue
+            seen_ids.add(message_id)
             locators.append(
                 GmailLocator(message_id, _optional(entry_mapping.get("threadId")), None)
             )
@@ -332,17 +379,39 @@ class OfficialGmailGateway:
         history_operation: bool = False,
     ) -> object:
         for attempt in range(self._retry.max_attempts):
+            if self._is_cancelled is not None and self._is_cancelled():
+                raise TimeoutError("Operazione Gmail interrotta per cancellazione richiesta")
             budget.consume_request()
+            if self._rate_limiter is not None and self._account_id is not None:
+                self._rate_limiter.acquire(self._account_id, is_cancelled=self._is_cancelled)
             started_at = self._monotonic()
             try:
                 response = request_factory().execute(num_retries=0)
                 if self._monotonic() - started_at > self._retry.timeout_seconds:
                     raise TimeoutError("deadline locale superata")
+                self._metrics.append(CallMetric(method=operation, status="success", category="ok"))
                 return response
-            except ConnectorError:
+            except ConnectorError as err:
+                self._metrics.append(
+                    CallMetric(method=operation, status="error", category=err.category.value)
+                )
                 raise
             except Exception as exc:
                 error = _classify_error(exc, operation, history_operation=history_operation)
+                if (
+                    self._rate_limiter is not None
+                    and self._account_id is not None
+                    and error.retry_after_seconds
+                ):
+                    if hasattr(self._rate_limiter, "block_for"):
+                        self._rate_limiter.block_for(self._account_id, error.retry_after_seconds)
+                    else:
+                        self._rate_limiter.apply_cooldown(
+                            self._account_id, error.retry_after_seconds
+                        )
+                self._metrics.append(
+                    CallMetric(method=operation, status="error", category=error.category.value)
+                )
                 logger.warning(
                     "Operazione Gmail '%s' fallita (tentativo %d/%d, %s): %s",
                     operation,
@@ -355,7 +424,7 @@ class OfficialGmailGateway:
                     raise error from exc
                 if budget.requests_remaining <= 0:
                     raise BudgetExhaustedError("richieste") from exc
-                delay = _retry_after_seconds(exc)
+                delay = error.retry_after_seconds
                 if delay is None:
                     base = min(
                         self._retry.maximum_delay_seconds,
@@ -366,8 +435,20 @@ class OfficialGmailGateway:
                         - self._retry.jitter_ratio
                         + (2 * self._retry.jitter_ratio * self._random())
                     )
-                self._sleep(min(delay, self._retry.maximum_delay_seconds))
-        raise AssertionError("ciclo retry irraggiungibile")
+                sleep_duration = min(delay, self._retry.maximum_delay_seconds)
+                if self._is_cancelled is None:
+                    self._sleep(sleep_duration)
+                else:
+                    remaining_sleep = sleep_duration
+                    while remaining_sleep > 0:
+                        if self._is_cancelled():
+                            raise TimeoutError(
+                                "Operazione Gmail interrotta per cancellazione richiesta"
+                            ) from exc
+                        step = min(0.05, remaining_sleep)
+                        self._sleep(step)
+                        remaining_sleep -= step
+        raise ConnectorError(ConnectorErrorCategory.TRANSIENT, "Tentativi esauriti")
 
 
 def _temporal_query(selection: GmailSelection) -> str:
@@ -532,17 +613,58 @@ def is_transient_transport_error(exc: BaseException) -> bool:
     return False
 
 
+MAX_RETRY_AFTER_SECONDS: float = 300.0
+_QUOTA_REASONS: frozenset[str] = frozenset(
+    {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}
+)
+
+
+def _extract_google_error_reasons(exc: HttpError) -> list[str]:
+    try:
+        content = getattr(exc, "content", None)
+        if not content:
+            return []
+        text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return []
+        error_dict = data.get("error")
+        if not isinstance(error_dict, dict):
+            return []
+        reasons: list[str] = []
+        errors = error_dict.get("errors")
+        if isinstance(errors, list):
+            for err in errors:
+                if isinstance(err, dict):
+                    reason = err.get("reason")
+                    if reason:
+                        reasons.append(str(reason))
+        details = error_dict.get("details")
+        if isinstance(details, list):
+            for detail in details:
+                if isinstance(detail, dict):
+                    reason = detail.get("reason")
+                    if reason:
+                        reasons.append(str(reason))
+        return reasons
+    except Exception:
+        return []
+
+
 def _classify_error(
     exc: BaseException,
     operation: str,
     *,
-    history_operation: bool,
+    history_operation: bool = False,
 ) -> ConnectorError:
     if isinstance(exc, HttpError):
         status = int(getattr(exc.resp, "status", 0) or 0)
         reason_phrase = str(getattr(exc.resp, "reason", "") or "").strip()
         raw_reason = getattr(exc, "reason", "") or ""
+        google_reasons = _extract_google_error_reasons(exc)
+        google_reason = google_reasons[0] if google_reasons else None
         sanitized_reason = _sanitize_error_text(str(raw_reason))
+        retry_after = _retry_after_seconds(exc)
         http_desc = (
             f"Google HTTP {status} {reason_phrase}".strip()
             if reason_phrase
@@ -558,19 +680,47 @@ def _classify_error(
                 ConnectorErrorCategory.HISTORY_EXPIRED,
                 f"Checkpoint Gmail history scaduto durante {operation} ({http_desc}); riconciliazione full necessaria",
                 status_code=status,
+                reason_code=google_reason,
+                retry_after_seconds=retry_after,
             )
-        if status in {401, 403}:
+        is_quota = bool(set(google_reasons) & _QUOTA_REASONS)
+        if status == 403:
+            if is_quota:
+                quota_reason = next(r for r in google_reasons if r in _QUOTA_REASONS)
+                return ConnectorError(
+                    ConnectorErrorCategory.QUOTA,
+                    f"Quota Gmail temporaneamente esaurita durante {operation} ({http_desc}{detail_suffix})",
+                    retryable=True,
+                    status_code=status,
+                    reason_code=quota_reason,
+                    retry_after_seconds=retry_after,
+                )
             return ConnectorError(
                 ConnectorErrorCategory.AUTH,
                 f"Autorizzazione Gmail non valida, revocata o insufficiente durante {operation} ({http_desc}{detail_suffix})",
                 status_code=status,
+                reason_code=google_reason or "forbidden",
+                retry_after_seconds=retry_after,
+            )
+        if status == 401:
+            return ConnectorError(
+                ConnectorErrorCategory.AUTH,
+                f"Autorizzazione Gmail non valida, revocata o insufficiente durante {operation} ({http_desc}{detail_suffix})",
+                status_code=status,
+                reason_code=google_reason or "unauthorized",
+                retry_after_seconds=retry_after,
             )
         if status == 429:
+            quota_reason = next(
+                (r for r in google_reasons if r in _QUOTA_REASONS), "rateLimitExceeded"
+            )
             return ConnectorError(
                 ConnectorErrorCategory.QUOTA,
                 f"Quota Gmail temporaneamente esaurita durante {operation} ({http_desc}{detail_suffix})",
                 retryable=True,
                 status_code=status,
+                reason_code=quota_reason,
+                retry_after_seconds=retry_after,
             )
         if status in _SAFE_TRANSIENT_STATUSES:
             return ConnectorError(
@@ -578,11 +728,15 @@ def _classify_error(
                 f"Errore transitorio Gmail durante {operation} ({http_desc}{detail_suffix})",
                 retryable=True,
                 status_code=status,
+                reason_code=google_reason,
+                retry_after_seconds=retry_after,
             )
         return ConnectorError(
             ConnectorErrorCategory.PERMANENT,
             f"Errore permanente Gmail durante {operation} ({http_desc}{detail_suffix})",
             status_code=status,
+            reason_code=google_reason,
+            retry_after_seconds=retry_after,
         )
     if is_transient_transport_error(exc):
         sanitized = _sanitize_error_text(str(exc))
@@ -636,23 +790,38 @@ def _classify_error(
     )
 
 
-def _retry_after_seconds(exc: BaseException) -> float | None:
+def _retry_after_seconds(
+    exc: BaseException,
+    *,
+    max_cap: float = MAX_RETRY_AFTER_SECONDS,
+) -> float | None:
     if not isinstance(exc, HttpError):
         return None
     headers = getattr(exc.resp, "headers", {})
-    value = headers.get("retry-after") if isinstance(headers, Mapping) else None
-    if value is None:
+    if not isinstance(headers, Mapping):
         return None
+    raw_val: object = None
+    for k, v in headers.items():
+        if k.lower() == "retry-after":
+            raw_val = v
+            break
+    if raw_val is None:
+        return None
+    val_str = str(raw_val).strip()
+    seconds: float | None = None
     try:
-        return max(0.0, float(value))
+        seconds = max(0.0, float(val_str))
     except (TypeError, ValueError):
         try:
-            retry_at = parsedate_to_datetime(str(value))
+            retry_at = parsedate_to_datetime(val_str)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            seconds = max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
         except (TypeError, ValueError, OverflowError):
             return None
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=UTC)
-        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+    if seconds is None:
+        return None
+    return min(seconds, max_cap)
 
 
 def _mapping(value: object, operation: str) -> Mapping[str, Any]:

@@ -40,6 +40,10 @@ from gbrain.domain.models import (
     SourceSyncConfig,
 )
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
+from gbrain.infrastructure.gmail_rate_limiter import (
+    GmailRateLimiter,
+    PostgresGmailRateLimiter,
+)
 from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
 
 JobMode = Literal["preview", "full", "incremental", "reconciliation"]
@@ -170,11 +174,26 @@ class QueueEnqueuer(Protocol):
     async def __call__(self, *, job_id: str, account_id: str, mode: str) -> int: ...
 
 
-GatewayFactory = Callable[[ConnectorAccount, Settings], OfficialGmailGateway]
+GatewayFactory = Callable[..., OfficialGmailGateway]
 
 
-def gateway_for_account(account: ConnectorAccount, settings: Settings) -> OfficialGmailGateway:
-    return OfficialGmailGateway.from_credentials(decrypt_credentials(account, settings))
+def gateway_for_account(
+    account: ConnectorAccount,
+    settings: Settings,
+    *,
+    rate_limiter: GmailRateLimiter | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> OfficialGmailGateway:
+    limiter = rate_limiter or PostgresGmailRateLimiter(
+        settings.database_url,
+        settings.gmail_rate_limit_per_second,
+    )
+    return OfficialGmailGateway.from_credentials(
+        decrypt_credentials(account, settings),
+        account_id=account.id,
+        rate_limiter=limiter,
+        is_cancelled=is_cancelled,
+    )
 
 
 async def get_gmail_account(
@@ -415,14 +434,15 @@ async def update_sync_config(
         new_rev = 1
         changed = True
     else:
+        semantic_changed = current.query_fingerprint != new_fp
         changed = (
-            current.query_fingerprint != new_fp
+            semantic_changed
             or current.item_limit != value.item_limit
             or current.request_budget != value.request_budget
             or current.batch_size != value.batch_size
             or current.update_policy != value.update_policy
         )
-        new_rev = (current.revision + 1) if changed else current.revision
+        new_rev = (current.revision + 1) if semantic_changed else current.revision
 
     data = GmailSyncConfigData(
         revision=new_rev,
@@ -788,14 +808,18 @@ async def enqueue_history_import_job(
     repo = AsyncPostgresGmailRepository(session)
     bf_state = await repo.load_backfill_state(account.id)
     resume_token = None
-    if bf_state and bf_state.query_fingerprint == fp and bf_state.status == "partial":
+    if (
+        bf_state
+        and bf_state.query_fingerprint == config.query_fingerprint
+        and bf_state.status == "partial"
+    ):
         resume_token = bf_state.page_token
 
     await repo.upsert_backfill_state(
         account.id,
         GmailBackfillStateData(
             config_revision=config.revision,
-            query_fingerprint=fp,
+            query_fingerprint=config.query_fingerprint,
             history_after=effective_after,
             history_before=effective_before,
             page_token=resume_token,
@@ -808,7 +832,9 @@ async def enqueue_history_import_job(
     snapshot = {
         "purpose": "history",
         "config_revision": config.revision,
-        "query_fingerprint": fp,
+        "query_fingerprint": config.query_fingerprint,
+        "config_query_fingerprint": config.query_fingerprint,
+        "effective_query_fingerprint": fp,
         "after": effective_after.astimezone(UTC).isoformat(),
         "before": effective_before.astimezone(UTC).isoformat(),
         "query_filter": config.query_filter,
@@ -825,13 +851,13 @@ async def enqueue_history_import_job(
         source_policy_id=policy.id,
         mode=GmailSyncMode.FULL.value,
         config_revision=config.revision,
-        query_fingerprint=fp,
+        query_fingerprint=config.query_fingerprint,
         policy_snapshot=snapshot,
         checkpoint={
             "phase": "created",
             "purpose": "history",
             "config_revision": config.revision,
-            "query_fingerprint": fp,
+            "query_fingerprint": config.query_fingerprint,
             "policy": snapshot,
             "resumption_token": resume_token,
             "persisted_messages": None,

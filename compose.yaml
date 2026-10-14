@@ -29,6 +29,7 @@ x-app-environment: &app-environment
   GBRAIN_NEO4J_PASSWORD_FILE: /run/secrets/neo4j_password
   GBRAIN_NEO4J_DATABASE: neo4j
   GBRAIN_WORKER_CONCURRENCY: "1"
+  GBRAIN_GMAIL_RATE_LIMIT_PER_SECOND: ${GBRAIN_GMAIL_RATE_LIMIT_PER_SECOND:-4}
 
 x-app-volumes: &app-volumes
   - type: bind

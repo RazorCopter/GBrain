@@ -43,14 +43,23 @@ from gbrain.domain.models import (
 )
 from gbrain.infrastructure.database import Database
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
-from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
+from gbrain.infrastructure.gmail_rate_limiter import (
+    GmailRateLimiter,
+    PostgresGmailRateLimiter,
+)
+from gbrain.infrastructure.gmail_repository import (
+    AsyncPostgresGmailRepository,
+    GmailJobStaleSnapshotError,
+)
 
-GatewayBuilder = Callable[[ConnectorAccount, Settings], OfficialGmailGateway]
+GatewayBuilder = Callable[..., OfficialGmailGateway]
 logger = logging.getLogger(__name__)
 
 
 class GmailJobTransientError(RuntimeError):
-    pass
+    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GmailJobPermanentError(RuntimeError):
@@ -61,8 +70,23 @@ class GmailJobFatalError(RuntimeError):
     pass
 
 
-def _gateway(account: ConnectorAccount, settings: Settings) -> OfficialGmailGateway:
-    return OfficialGmailGateway.from_credentials(decrypt_credentials(account, settings))
+def _gateway(
+    account: ConnectorAccount,
+    settings: Settings,
+    *,
+    rate_limiter: GmailRateLimiter | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> OfficialGmailGateway:
+    limiter = rate_limiter or PostgresGmailRateLimiter(
+        settings.database_url,
+        settings.gmail_rate_limit_per_second,
+    )
+    return OfficialGmailGateway.from_credentials(
+        decrypt_credentials(account, settings),
+        account_id=account.id,
+        rate_limiter=limiter,
+        is_cancelled=is_cancelled,
+    )
 
 
 def _selection(snapshot: dict[str, Any]) -> GmailSelection:
@@ -123,7 +147,13 @@ async def _load_job_context(
             job.checkpoint = {**job.checkpoint, "phase": "cancelled_before_start"}
             await session.commit()
             raise asyncio.CancelledError
-        if job.status in {ImportJobStatus.COMPLETED, ImportJobStatus.CANCELLED}:
+        if job.status in {
+            ImportJobStatus.COMPLETED,
+            ImportJobStatus.CANCELLED,
+            ImportJobStatus.SUPERSEDED,
+            ImportJobStatus.FAILED,
+            ImportJobStatus.COMPLETED_WITH_WARNINGS,
+        }:
             raise GmailJobPermanentError("Lavoro Gmail già concluso")
         if account.status != ConnectorAccountStatus.ACTIVE:
             raise GmailJobPermanentError("Account Gmail non attivo")
@@ -132,7 +162,9 @@ async def _load_job_context(
         repository = AsyncPostgresGmailRepository(session)
         config = await repository.load_sync_config(account.id, for_update=True)
         if job.config_revision is not None and (
-            config is None or config.revision != job.config_revision
+            config is None
+            or config.revision != job.config_revision
+            or (job.query_fingerprint and config.query_fingerprint != job.query_fingerprint)
         ):
             logger.warning(
                 "Job Gmail stale bloccato prima dell'avvio: job_id=%s account_id=%s "
@@ -142,11 +174,11 @@ async def _load_job_context(
                 job.config_revision,
                 config.revision if config else None,
             )
-            job.status = ImportJobStatus.CANCELLED
+            job.status = ImportJobStatus.SUPERSEDED
             job.finished_at = datetime.now(UTC)
             job.error_code = "stale_config_revision"
             job.error_detail = "Configurazione Gmail modificata dopo la creazione del lavoro"
-            job.checkpoint = {**job.checkpoint, "phase": "cancelled_stale_revision"}
+            job.checkpoint = {**job.checkpoint, "phase": "superseded_stale_revision"}
             await session.commit()
             raise asyncio.CancelledError
         checkpoint = await repository.load_checkpoint(account.id, job.source_policy_id)
@@ -308,7 +340,13 @@ async def _run_full(
         messages: list[object] = []
         page_gaps: list[GmailItemGapData] = []
         out_of_scope: set[str] = set()
-        for locator in page.items:
+        seen_ids: set[str] = set()
+        unique_locators = []
+        for loc in page.items:
+            if loc.message_id not in seen_ids:
+                seen_ids.add(loc.message_id)
+                unique_locators.append(loc)
+        for locator in unique_locators:
             try:
                 raw = await asyncio.to_thread(connector.fetch_item, locator, budget)
                 messages.append(connector.normalize_item(raw))
@@ -432,7 +470,13 @@ async def _run_incremental(
         messages: list[object] = []
         page_gaps: list[GmailItemGapData] = []
         out_of_scope: set[str] = set()
-        for locator in page.locators:
+        seen_history_ids: set[str] = set()
+        unique_history_locators = []
+        for loc in page.locators:
+            if loc.message_id not in seen_history_ids:
+                seen_history_ids.add(loc.message_id)
+                unique_history_locators.append(loc)
+        for locator in unique_history_locators:
             try:
                 raw = await asyncio.to_thread(connector.fetch_item, locator, budget)
                 messages.append(connector.normalize_item(raw))
@@ -600,12 +644,16 @@ async def execute_gmail_job(
     parsed_account_id = uuid.UUID(account_id)
     checkpoint: GmailCheckpointState | None = None
     processed = 0
+    cancel_monitor_task: asyncio.Task[None] | None = None
     try:
         job, account, checkpoint = await _load_job_context(
             database, parsed_job_id, parsed_account_id
         )
         processed = job.processed_items or 0
         credentials = decrypt_credentials(account, settings)
+        # Normalizza expiry prima di controllare validità
+        if credentials.expiry is not None and credentials.expiry.tzinfo is not None:
+            credentials.expiry = credentials.expiry.astimezone(UTC).replace(tzinfo=None)
         if not credentials.valid and credentials.refresh_token:
             await asyncio.to_thread(refresh_credentials, credentials, settings)
             account.oauth_token_ciphertext = encrypt_credentials(credentials, settings)
@@ -618,7 +666,35 @@ async def execute_gmail_job(
             raise GmailServiceError(
                 "alias_required", "Confermare almeno un alias prima di eseguire l'importazione"
             )
-        gateway = await asyncio.to_thread(gateway_builder, account, settings)
+
+        is_cancelled_flag = False
+
+        def check_cancelled() -> bool:
+            return is_cancelled_flag
+
+        async def poll_cancellation() -> None:
+            nonlocal is_cancelled_flag
+            while not is_cancelled_flag:
+                try:
+                    if await _cancel_requested(database, parsed_job_id):
+                        is_cancelled_flag = True
+                        break
+                except Exception as poll_err:
+                    logger.debug("Verifica cancellazione fallita nel monitor: %s", poll_err)
+                await asyncio.sleep(0.5)
+
+        cancel_monitor_task = asyncio.create_task(poll_cancellation())
+
+        try:
+            if gateway_builder is _gateway:
+                gateway = await asyncio.to_thread(
+                    _gateway, account, settings, is_cancelled=check_cancelled
+                )
+            else:
+                gateway = await asyncio.to_thread(gateway_builder, account, settings)
+        except Exception:
+            cancel_monitor_task.cancel()
+            raise
         connector = GmailSentConnector(gateway, account.confirmed_aliases)
         selection = _selection(job.policy_snapshot)
         budget = RequestBudget(
@@ -695,6 +771,27 @@ async def execute_gmail_job(
             )
     except asyncio.CancelledError:
         return
+    except GmailJobStaleSnapshotError as exc:
+        logger.warning(
+            "Job Gmail %s invalidato durante l'esecuzione (superseded/stale snapshot): %s",
+            parsed_job_id,
+            exc,
+        )
+        async with database.session_factory() as session:
+            current_job = await session.get(ImportJob, parsed_job_id)
+            if current_job is not None:
+                current_job.status = ImportJobStatus.SUPERSEDED
+                current_job.finished_at = datetime.now(UTC)
+                current_job.error_code = "stale_config_revision"
+                current_job.error_detail = (
+                    "Configurazione Gmail modificata durante l'esecuzione del lavoro"
+                )
+                current_job.checkpoint = {
+                    **(current_job.checkpoint or {}),
+                    "phase": "superseded_stale_revision",
+                }
+                await session.commit()
+        return
     except ConnectorError as exc:
         if exc.category == ConnectorErrorCategory.HISTORY_EXPIRED and checkpoint is not None:
             required = checkpoint.require_full_reconciliation("gmail_history_expired")
@@ -724,7 +821,10 @@ async def execute_gmail_job(
                 error_code=f"gmail_{exc.category.value}",
                 error_detail=exc.safe_message,
             )
-            raise GmailJobTransientError(exc.safe_message) from exc
+            raise GmailJobTransientError(
+                exc.safe_message,
+                retry_after_seconds=exc.retry_after_seconds,
+            ) from exc
         await _finish(
             database,
             parsed_job_id,
@@ -759,3 +859,29 @@ async def execute_gmail_job(
             error_detail=str(detail)[:500],
             is_partial=checkpoint.page_token is not None if checkpoint else False,
         )
+    except RuntimeError as exc:
+        if "stale_gmail_job_snapshot" in str(exc):
+            logger.warning(
+                "Job Gmail %s invalidato durante l'esecuzione (superseded/stale snapshot): %s",
+                parsed_job_id,
+                exc,
+            )
+            async with database.session_factory() as session:
+                current_job = await session.get(ImportJob, parsed_job_id)
+                if current_job is not None:
+                    current_job.status = ImportJobStatus.SUPERSEDED
+                    current_job.finished_at = datetime.now(UTC)
+                    current_job.error_code = "stale_config_revision"
+                    current_job.error_detail = (
+                        "Configurazione Gmail modificata durante l'esecuzione del lavoro"
+                    )
+                    current_job.checkpoint = {
+                        **(current_job.checkpoint or {}),
+                        "phase": "superseded_stale_revision",
+                    }
+                    await session.commit()
+            return
+        raise
+    finally:
+        if cancel_monitor_task is not None:
+            cancel_monitor_task.cancel()

@@ -328,9 +328,9 @@ async def test_stale_job_fencing_cancels_before_execution() -> None:
     with pytest.raises(asyncio.CancelledError):
         await _load_job_context(cast(Any, database), job_id, account_id)
 
-    assert job.status == ImportJobStatus.CANCELLED
+    assert job.status == ImportJobStatus.SUPERSEDED
     assert job.error_code == "stale_config_revision"
-    assert job.checkpoint["phase"] == "cancelled_stale_revision"
+    assert job.checkpoint["phase"] == "superseded_stale_revision"
 
 
 def test_query_filter_validation_and_rejection() -> None:

@@ -50,6 +50,7 @@ class ImportJobStatus(enum.StrEnum):
     COMPLETED_WITH_WARNINGS = "completed_with_warnings"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
 
 
 class OutboxStatus(enum.StrEnum):
@@ -658,3 +659,20 @@ class SourceClientCredential(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     owner: Mapped[OwnerAccount] = relationship(back_populates="source_client_credentials")
+
+
+class GmailRateLimit(Base):
+    __tablename__ = "gmail_rate_limits"
+
+    scope_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    connector_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connector_accounts.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    next_slot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

@@ -5,7 +5,6 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-import procrastinate
 from sqlalchemy import select
 
 from gbrain.application.auth import purge_expired_sessions
@@ -17,7 +16,11 @@ from gbrain.application.gmail_jobs import (
 from gbrain.config import get_settings
 from gbrain.domain.models import ImportJob, ImportJobStatus, OutboxEvent, OutboxStatus
 from gbrain.infrastructure.database import Database
-from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME, create_procrastinate_app
+from gbrain.infrastructure.task_queue import (
+    GMAIL_TASK_NAME,
+    GmailJobRetryStrategy,
+    create_procrastinate_app,
+)
 from gbrain.logging import configure_logging
 
 settings = get_settings()
@@ -65,10 +68,8 @@ async def consume_outbox_placeholder(event_id: str) -> None:
     name=GMAIL_TASK_NAME,
     queue="gmail",
     lock="gmail-heavy-global",
-    retry=procrastinate.RetryStrategy(
-        # Procrastinate conta anche il tentativo iniziale in ``job.attempts``.
-        # Il budget configura invece il numero di riesecuzioni consentite.
-        max_attempts=settings.gmail_job_retry_budget + 1,
+    retry=GmailJobRetryStrategy(
+        max_attempts=settings.gmail_job_retry_budget,
         exponential_wait=2,
         retry_exceptions=(GmailJobTransientError,),
     ),
@@ -98,6 +99,15 @@ async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
                         raise GmailJobFatalError(
                             f"Job applicativo Gmail {job_id} fallito: {final_job.error_code} - {final_job.error_detail}"
                         )
+                    if final_job.status in (ImportJobStatus.CANCELLED, ImportJobStatus.SUPERSEDED):
+                        logger.warning(
+                            "Job applicativo Gmail %s concluso nello stato %s: %s - %s",
+                            job_id,
+                            final_job.status,
+                            final_job.error_code,
+                            final_job.error_detail,
+                        )
+                        return
                     if final_job.status == ImportJobStatus.COMPLETED_WITH_WARNINGS:
                         logger.warning(
                             "Job applicativo Gmail %s completato con lacune permanenti: non_importati=%d",
@@ -115,6 +125,14 @@ async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
                         job.status = ImportJobStatus.PENDING
                         job.finished_at = None
                         job.checkpoint = {**job.checkpoint, "phase": "retry_scheduled"}
+                    else:
+                        job.status = ImportJobStatus.FAILED
+                        job.finished_at = datetime.now(UTC)
+                        job.error_code = "retry_budget_exhausted"
+                        job.error_detail = (
+                            "Superato il budget massimo di tentativi per errore transitorio"
+                        )
+                        job.checkpoint = {**job.checkpoint, "phase": "failed"}
                     await session.commit()
             raise
         except GmailJobFatalError as exc:

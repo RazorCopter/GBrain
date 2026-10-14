@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
+import uuid
 from collections.abc import Generator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -194,15 +195,19 @@ def test_gmail_job_and_worker_tasks_registered_on_procrastinate_app() -> None:
     assert gmail_task.queue == "gmail"
     assert gmail_task.queue in WORKER_QUEUES
     assert gmail_task.lock == "gmail-heavy-global"
-    assert isinstance(gmail_task.retry_strategy, procrastinate.RetryStrategy)
+    from gbrain.infrastructure.task_queue import GmailJobRetryStrategy
+
+    assert isinstance(
+        gmail_task.retry_strategy, (procrastinate.RetryStrategy, GmailJobRetryStrategy)
+    )
 
     strategy = gmail_task.retry_strategy
-    assert strategy.max_attempts == settings.gmail_job_retry_budget + 1
+    assert strategy.max_attempts == settings.gmail_job_retry_budget
     transient = GmailJobTransientError("errore transitorio sintetico")
-    for attempt in range(1, settings.gmail_job_retry_budget + 1):
+    for attempt in range(0, settings.gmail_job_retry_budget):
         job = MagicMock(attempts=attempt)
         assert strategy.get_retry_decision(exception=transient, job=job) is not None
-    exhausted_job = MagicMock(attempts=settings.gmail_job_retry_budget + 1)
+    exhausted_job = MagicMock(attempts=settings.gmail_job_retry_budget)
     assert strategy.get_retry_decision(exception=transient, job=exhausted_job) is None
     assert (
         strategy.get_retry_decision(exception=RuntimeError("permanente"), job=MagicMock(attempts=1))
@@ -468,5 +473,60 @@ async def test_worker_gmail_sync_task_handles_transient_error_retry() -> None:
         assert mock_job.status == ImportJobStatus.PENDING
         assert mock_job.checkpoint.get("phase") == "retry_scheduled"
         mock_session.get.assert_awaited_once_with(ImportJob, test_job_id)
+        mock_session.commit.assert_awaited_once()
+        mock_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_handles_transient_error_exhausts_budget_marks_job_failed() -> None:
+    """Verifica che quando i retry superano il budget consentito, il worker imposti
+
+    il job applicativo nello stato terminale FAILED con error_code appropriato.
+    """
+    from gbrain.worker import gmail_sync
+
+    test_job_id = uuid.uuid4()
+    test_account_id = uuid.uuid4()
+    settings = get_settings()
+
+    mock_job = MagicMock()
+    mock_job.retry_count = settings.gmail_job_retry_budget
+    mock_job.checkpoint = {"phase": "running"}
+    mock_job.status = ImportJobStatus.RUNNING
+
+    mock_session = MagicMock()
+    mock_session.get = AsyncMock(return_value=mock_job)
+    mock_session.commit = AsyncMock()
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> MagicMock:
+            return mock_session
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    mock_db = MagicMock()
+    mock_db.session_factory.return_value = FakeSessionContext()
+    mock_db.close = AsyncMock()
+
+    with (
+        patch("gbrain.worker.Database", return_value=mock_db),
+        patch(
+            "gbrain.worker.execute_gmail_job",
+            side_effect=GmailJobTransientError("transient failure at budget limit"),
+        ),
+    ):
+        with pytest.raises(GmailJobTransientError, match="transient failure at budget limit"):
+            await gmail_sync.func(
+                job_id=str(test_job_id),
+                account_id=str(test_account_id),
+                mode="full",
+            )
+
+        assert mock_job.retry_count == settings.gmail_job_retry_budget + 1
+        assert mock_job.status == ImportJobStatus.FAILED
+        assert mock_job.error_code == "retry_budget_exhausted"
+        assert mock_job.checkpoint.get("phase") == "failed"
+        assert mock_job.finished_at is not None
         mock_session.commit.assert_awaited_once()
         mock_db.close.assert_awaited_once()

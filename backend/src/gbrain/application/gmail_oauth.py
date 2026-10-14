@@ -34,6 +34,11 @@ from gbrain.infrastructure.gmail_gateway import (
     _sanitize_error_text,
     is_transient_transport_error,
 )
+from gbrain.infrastructure.gmail_rate_limiter import (
+    GMAIL_OAUTH_PRE_ACCOUNT_SCOPE,
+    GmailRateLimiter,
+    PostgresGmailRateLimiter,
+)
 
 _TOKEN_FORMAT_VERSION = 1
 _TOKEN_ASSOCIATED_DATA = b"gbrain:gmail-oauth-token:v1"
@@ -105,7 +110,7 @@ class OAuthFlowLike(Protocol):
 
 
 FlowFactory = Callable[[str], OAuthFlowLike]
-IdentityResolver = Callable[[Credentials], OAuthIdentity]
+IdentityResolver = Callable[..., OAuthIdentity]
 Revoker = Callable[[str], bool]
 
 
@@ -430,14 +435,31 @@ def _default_flow_factory(settings: Settings, code_verifier: str) -> OAuthFlowLi
     return cast(OAuthFlowLike, flow)
 
 
-def _identity_from_credentials(credentials: Credentials) -> OAuthIdentity:
+def _identity_from_credentials(
+    credentials: Credentials,
+    *,
+    account_id: uuid.UUID | str | None = None,
+    rate_limiter: GmailRateLimiter | None = None,
+) -> OAuthIdentity:
     # L'identità arriva da users.getProfile, non dal campo From dei messaggi.
+    from gbrain.config import get_settings
     from gbrain.domain.connectors import RequestBudget
     from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
 
-    profile = OfficialGmailGateway.from_credentials(credentials).get_profile(
-        RequestBudget(max_requests=1, max_items=1)
+    settings = get_settings()
+    effective_limiter = rate_limiter or PostgresGmailRateLimiter(
+        settings.database_url,
+        settings.gmail_rate_limit_per_second,
     )
+    effective_account_id: uuid.UUID | str = (
+        account_id if account_id is not None else GMAIL_OAUTH_PRE_ACCOUNT_SCOPE
+    )
+
+    profile = OfficialGmailGateway.from_credentials(
+        credentials,
+        account_id=effective_account_id,
+        rate_limiter=effective_limiter,
+    ).get_profile(RequestBudget(max_requests=1, max_items=1))
     if not isinstance(profile, Mapping):
         raise GmailOAuthError("profile_invalid", "Profilo Gmail non valido")
     raw_email = str(profile.get("emailAddress") or "")
@@ -574,7 +596,36 @@ async def complete_oauth(
     except Exception as exc:
         raise GmailOAuthError("token_exchange_failed", "Scambio OAuth Gmail non riuscito") from exc
     credentials = flow.credentials
-    identity = await asyncio.to_thread(identity_resolver, credentials)
+    # Ricerca di eventuale account Gmail già persistito per questo owner
+    existing_account = await session.scalar(
+        select(ConnectorAccount).where(
+            ConnectorAccount.owner_id == owner.id,
+            ConnectorAccount.connector_kind == "gmail",
+        )
+    )
+    profile_limiter: GmailRateLimiter = PostgresGmailRateLimiter(
+        settings.database_url,
+        settings.gmail_rate_limit_per_second,
+    )
+    if existing_account is not None:
+        # Account esistente: preserva UUID account e limiter PostgreSQL per-account
+        profile_account_id: uuid.UUID | str = existing_account.id
+    else:
+        # Pre-account (prima associazione): per evitare violazioni della FK su
+        # gmail_rate_limits.connector_account_id e senza introdurre alcuna PII,
+        # coordiniamo il pacing con lo scope globale stabile pre-account e il limiter PostgreSQL.
+        profile_account_id = GMAIL_OAUTH_PRE_ACCOUNT_SCOPE
+
+    try:
+        identity = await asyncio.to_thread(
+            identity_resolver,
+            credentials,
+            account_id=profile_account_id,
+            rate_limiter=profile_limiter,
+        )
+    except TypeError:
+        # Retrocompatibilità con resolver custom/legacy privi di keyword arguments
+        identity = await asyncio.to_thread(identity_resolver, credentials)
     encrypted_token = encrypt_credentials(credentials, settings)
     account = await session.scalar(
         select(ConnectorAccount).where(

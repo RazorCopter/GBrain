@@ -312,7 +312,7 @@ async def test_execute_gmail_job_dns_failure_propagates_transient_error_without_
             pass
 
     mock_db = MagicMock()
-    mock_db.session_factory.return_value = FakeSessionContext()
+    mock_db.session_factory = lambda: FakeSessionContext()
 
     dns_exc = GmailOAuthTransientError(
         "oauth_transport_error",
@@ -399,7 +399,7 @@ async def test_execute_gmail_job_invalid_grant_fails_permanently_no_transient_ra
             pass
 
     mock_db = MagicMock()
-    mock_db.session_factory.return_value = FakeSessionContext()
+    mock_db.session_factory = lambda: FakeSessionContext()
 
     permanent_exc = GmailOAuthError(
         "invalid_grant",
