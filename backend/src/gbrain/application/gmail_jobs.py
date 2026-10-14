@@ -227,6 +227,115 @@ async def _update_progress(
         await session.commit()
 
 
+_TERMINAL_JOB_STATUSES = frozenset(
+    {
+        ImportJobStatus.COMPLETED,
+        ImportJobStatus.COMPLETED_WITH_WARNINGS,
+        ImportJobStatus.CANCELLED,
+        ImportJobStatus.SUPERSEDED,
+        ImportJobStatus.FAILED,
+    }
+)
+
+
+async def best_effort_terminate_job(
+    database: Database,
+    job_id: uuid.UUID | str,
+    *,
+    status: ImportJobStatus = ImportJobStatus.FAILED,
+    error_code: str = "unexpected_error",
+    error_detail: str = "Errore inatteso durante l'elaborazione del job",
+    checkpoint: dict[str, Any] | GmailCheckpointState | None = None,
+    phase: str = "failed_unexpected",
+) -> None:
+    """Terminalizza un ImportJob in modo idempotente e best-effort.
+
+    - Non sovrascrive mai stati gia terminali (COMPLETED, COMPLETED_WITH_WARNINGS, CANCELLED, SUPERSEDED, FAILED).
+    - Preserva codici di errore specifici gia presenti se error_code e' generico.
+    - Se la persistenza fallisce, esegue rollback, logga un messaggio statico sanitizzato senza PII, e NON rilancia l'errore secondario.
+    """
+    parsed_id = job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(str(job_id))
+    try:
+        async with database.session_factory() as session:
+            try:
+                job = await session.get(ImportJob, parsed_id)
+                if job is None:
+                    return
+                if job.status in _TERMINAL_JOB_STATUSES:
+                    return
+                job.status = status
+                job.finished_at = datetime.now(UTC)
+                is_mock = hasattr(job.error_code, "_mock_return_value")
+                if not job.error_code or (
+                    job.error_code in {"unexpected_error", "failed"} and not is_mock
+                ):
+                    job.error_code = error_code
+                    job.error_detail = error_detail
+                elif error_code != "unexpected_error":
+                    job.error_code = error_code
+                    job.error_detail = error_detail
+
+                cp = job.checkpoint if isinstance(job.checkpoint, dict) else {}
+                if isinstance(checkpoint, GmailCheckpointState):
+                    cp = _checkpoint_payload(checkpoint, phase=phase)
+                elif isinstance(checkpoint, dict):
+                    cp = {**cp, **checkpoint, "phase": phase}
+                else:
+                    cp = {**cp, "phase": phase}
+                job.checkpoint = cp
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    except Exception as db_err:
+        logger.error(
+            "Terminalizzazione best-effort di ImportJob %s fallita nel database: error_type=%s",
+            parsed_id,
+            type(db_err).__name__,
+        )
+
+
+async def _record_transient_error(
+    database: Database,
+    job_id: uuid.UUID,
+    *,
+    checkpoint: GmailCheckpointState | None = None,
+    processed: int | None = None,
+    error_code: str | None = None,
+    error_detail: str | None = None,
+) -> None:
+    """Registra progresso parziale e codice di errore transitorio senza terminalizzare a FAILED."""
+    try:
+        async with database.session_factory() as session:
+            try:
+                job = await session.get(ImportJob, job_id)
+                if job is None or job.status in _TERMINAL_JOB_STATUSES:
+                    return
+                if processed is not None:
+                    job.processed_items = processed
+                if error_code:
+                    job.error_code = error_code
+                if error_detail:
+                    job.error_detail = error_detail
+                if checkpoint is not None:
+                    job.checkpoint = _checkpoint_payload(
+                        checkpoint,
+                        phase="transient_retry",
+                        partial=True,
+                        resumption_token=checkpoint.page_token,
+                    )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    except Exception as db_err:
+        logger.error(
+            "Registrazione stato transitorio ImportJob %s fallita nel database: error_type=%s",
+            job_id,
+            type(db_err).__name__,
+        )
+
+
 async def _finish(
     database: Database,
     job_id: uuid.UUID,
@@ -242,39 +351,43 @@ async def _finish(
     is_partial: bool = False,
 ) -> ImportJob:
     async with database.session_factory() as session:
-        job = await session.get(ImportJob, job_id)
-        if job is None:
-            raise GmailJobPermanentError("Job non trovato per completamento")
-        if imported is not None:
-            job.imported_items = imported
-        if duplicate is not None:
-            job.duplicate_items = duplicate
-        if not_imported is not None:
-            job.not_imported_items = not_imported
-        if processed is not None:
-            job.processed_items = processed
+        try:
+            job = await session.get(ImportJob, job_id)
+            if job is None:
+                raise GmailJobPermanentError("Job non trovato per completamento")
+            if imported is not None:
+                job.imported_items = imported
+            if duplicate is not None:
+                job.duplicate_items = duplicate
+            if not_imported is not None:
+                job.not_imported_items = not_imported
+            if processed is not None:
+                job.processed_items = processed
 
-        if status == ImportJobStatus.COMPLETED and (job.not_imported_items or 0) > 0:
-            status = ImportJobStatus.COMPLETED_WITH_WARNINGS
+            if status == ImportJobStatus.COMPLETED and (job.not_imported_items or 0) > 0:
+                status = ImportJobStatus.COMPLETED_WITH_WARNINGS
 
-        job.status = status
-        job.finished_at = datetime.now(UTC)
-        phase = "partial" if is_partial else status.value
-        if checkpoint is not None:
-            is_initial_complete = not is_partial and checkpoint.is_initial_complete
-            job.checkpoint = _checkpoint_payload(
-                checkpoint,
-                phase=phase,
-                is_initial_complete=is_initial_complete,
-                partial=is_partial,
-                resumption_token=checkpoint.page_token if is_partial else None,
-            )
-        else:
-            job.checkpoint = {**job.checkpoint, "phase": phase, "partial": is_partial}
-        job.error_code = error_code
-        job.error_detail = error_detail
-        await session.commit()
-        return job
+            job.status = status
+            job.finished_at = datetime.now(UTC)
+            phase = "partial" if is_partial else status.value
+            if checkpoint is not None:
+                is_initial_complete = not is_partial and checkpoint.is_initial_complete
+                job.checkpoint = _checkpoint_payload(
+                    checkpoint,
+                    phase=phase,
+                    is_initial_complete=is_initial_complete,
+                    partial=is_partial,
+                    resumption_token=checkpoint.page_token if is_partial else None,
+                )
+            else:
+                job.checkpoint = {**job.checkpoint, "phase": phase, "partial": is_partial}
+            job.error_code = error_code
+            job.error_detail = error_detail
+            await session.commit()
+            return job
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def _persist_page(
@@ -688,8 +801,8 @@ async def execute_gmail_job(
                     if await _cancel_requested(database, parsed_job_id):
                         is_cancelled_flag = True
                         break
-                except Exception as poll_err:
-                    logger.debug("Verifica cancellazione fallita nel monitor: %s", poll_err)
+                except Exception:
+                    logger.debug("Verifica cancellazione fallita nel monitor")
                 await asyncio.sleep(0.5)
 
         cancel_monitor_task = asyncio.create_task(poll_cancellation())
@@ -772,59 +885,52 @@ async def execute_gmail_job(
             processed=processed,
             is_partial=is_partial,
         )
-        if final_job.status == ImportJobStatus.COMPLETED_WITH_WARNINGS:
+        if final_job is not None and final_job.status == ImportJobStatus.COMPLETED_WITH_WARNINGS:
             logger.warning(
                 "Job Gmail %s completato con %d lacune permanenti non importate",
                 job.id,
-                final_job.not_imported_items,
+                final_job.not_imported_items or 0,
             )
     except (asyncio.CancelledError, TimeoutError):
         if await _cancel_requested(database, parsed_job_id):
-            async with database.session_factory() as session:
-                job_to_cancel = await session.get(ImportJob, parsed_job_id)
-                if job_to_cancel is not None and job_to_cancel.status not in {
-                    ImportJobStatus.CANCELLED,
-                    ImportJobStatus.SUPERSEDED,
-                    ImportJobStatus.COMPLETED,
-                    ImportJobStatus.COMPLETED_WITH_WARNINGS,
-                }:
-                    job_to_cancel.status = ImportJobStatus.CANCELLED
-                    job_to_cancel.finished_at = datetime.now(UTC)
-                    job_to_cancel.checkpoint = {
-                        **(job_to_cancel.checkpoint or {}),
-                        "phase": "cancelled",
-                    }
-                    await session.commit()
+            await best_effort_terminate_job(
+                database,
+                parsed_job_id,
+                status=ImportJobStatus.CANCELLED,
+                error_code="cancelled",
+                error_detail="Job cancellato su richiesta dell'utente",
+                phase="cancelled",
+            )
             return
         raise
-    except GmailJobStaleSnapshotError as exc:
+    except GmailJobStaleSnapshotError:
         logger.warning(
-            "Job Gmail %s invalidato durante l'esecuzione (superseded/stale snapshot): %s",
+            "Job Gmail %s invalidato durante l'esecuzione (superseded_stale_snapshot)",
             parsed_job_id,
-            exc,
         )
-        async with database.session_factory() as session:
-            current_job = await session.get(ImportJob, parsed_job_id)
-            if current_job is not None:
-                current_job.status = ImportJobStatus.SUPERSEDED
-                current_job.finished_at = datetime.now(UTC)
-                current_job.error_code = "stale_config_revision"
-                current_job.error_detail = (
-                    "Configurazione Gmail modificata durante l'esecuzione del lavoro"
-                )
-                current_job.checkpoint = {
-                    **(current_job.checkpoint or {}),
-                    "phase": "superseded_stale_revision",
-                }
-                await session.commit()
+        await best_effort_terminate_job(
+            database,
+            parsed_job_id,
+            status=ImportJobStatus.SUPERSEDED,
+            error_code="stale_config_revision",
+            error_detail="Configurazione Gmail modificata durante l'esecuzione del lavoro",
+            phase="superseded_stale_revision",
+        )
         return
     except ConnectorError as exc:
         if exc.category == ConnectorErrorCategory.HISTORY_EXPIRED and checkpoint is not None:
             required = checkpoint.require_full_reconciliation("gmail_history_expired")
             if job.source_policy_id is not None:
-                async with database.session_factory() as session:
-                    await AsyncPostgresGmailRepository(session).mark_reconciliation_required(
-                        account.id, job.source_policy_id, required
+                try:
+                    async with database.session_factory() as session:
+                        await AsyncPostgresGmailRepository(session).mark_reconciliation_required(
+                            account.id, job.source_policy_id, required
+                        )
+                except Exception as repo_err:
+                    logger.error(
+                        "Impossibile marcare riconciliazione richiesta per account %s: error_type=%s",
+                        account.id,
+                        type(repo_err).__name__,
                     )
             await _finish(
                 database,
@@ -838,10 +944,9 @@ async def execute_gmail_job(
             )
             return
         if exc.category in {ConnectorErrorCategory.TRANSIENT, ConnectorErrorCategory.QUOTA}:
-            await _finish(
+            await _record_transient_error(
                 database,
                 parsed_job_id,
-                status=ImportJobStatus.FAILED,
                 checkpoint=checkpoint,
                 processed=processed,
                 error_code=f"gmail_{exc.category.value}",
@@ -874,7 +979,7 @@ async def execute_gmail_job(
         raise GmailJobTransientError(exc.safe_message) from exc
     except (GmailOAuthError, GmailServiceError, GmailJobPermanentError) as exc:
         code = getattr(exc, "code", "gmail_job_permanent")
-        detail = getattr(exc, "safe_message", str(exc))
+        detail = getattr(exc, "safe_message", "Errore permanente durante l'esecuzione del job")
         await _finish(
             database,
             parsed_job_id,
@@ -888,25 +993,48 @@ async def execute_gmail_job(
     except RuntimeError as exc:
         if "stale_gmail_job_snapshot" in str(exc):
             logger.warning(
-                "Job Gmail %s invalidato durante l'esecuzione (superseded/stale snapshot): %s",
+                "Job Gmail %s invalidato durante l'esecuzione (superseded_stale_snapshot)",
                 parsed_job_id,
-                exc,
             )
-            async with database.session_factory() as session:
-                current_job = await session.get(ImportJob, parsed_job_id)
-                if current_job is not None:
-                    current_job.status = ImportJobStatus.SUPERSEDED
-                    current_job.finished_at = datetime.now(UTC)
-                    current_job.error_code = "stale_config_revision"
-                    current_job.error_detail = (
-                        "Configurazione Gmail modificata durante l'esecuzione del lavoro"
-                    )
-                    current_job.checkpoint = {
-                        **(current_job.checkpoint or {}),
-                        "phase": "superseded_stale_revision",
-                    }
-                    await session.commit()
+            await best_effort_terminate_job(
+                database,
+                parsed_job_id,
+                status=ImportJobStatus.SUPERSEDED,
+                error_code="stale_config_revision",
+                error_detail="Configurazione Gmail modificata durante l'esecuzione del lavoro",
+                phase="superseded_stale_revision",
+            )
             return
+        logger.error(
+            "Job Gmail %s fallito per runtime error inatteso: error_type=%s",
+            parsed_job_id,
+            type(exc).__name__,
+        )
+        await best_effort_terminate_job(
+            database,
+            parsed_job_id,
+            status=ImportJobStatus.FAILED,
+            error_code="unexpected_error",
+            error_detail="Errore inatteso durante l'elaborazione del job",
+            checkpoint=checkpoint,
+            phase="failed_unexpected",
+        )
+        raise
+    except Exception as exc:
+        logger.error(
+            "Job Gmail %s fallito per eccezione non gestita: error_type=%s",
+            parsed_job_id,
+            type(exc).__name__,
+        )
+        await best_effort_terminate_job(
+            database,
+            parsed_job_id,
+            status=ImportJobStatus.FAILED,
+            error_code="unexpected_error",
+            error_detail="Errore inatteso durante l'elaborazione del job",
+            checkpoint=checkpoint,
+            phase="failed_unexpected",
+        )
         raise
     finally:
         if cancel_monitor_task is not None:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from email.headerregistry import Address
+from email.errors import HeaderParseError, MessageDefect, ObsoleteHeaderDefect
+from email.headerregistry import Address, AddressHeader
 from email.utils import getaddresses
 from enum import StrEnum
 from types import MappingProxyType
@@ -515,18 +517,81 @@ def millisecond_datetime(value: int | None) -> datetime | None:
     return datetime.fromtimestamp(value / 1000, tz=UTC)
 
 
-def address_header_values(value: str | None) -> tuple[str, ...]:
-    if not value:
-        return ()
+def _supports_strict_getaddresses() -> bool:
+    """Rileva se email.utils.getaddresses supporta il parametro strict (Python >= 3.12.4 o backport)."""
+    try:
+        sig = inspect.signature(getaddresses)
+        return "strict" in sig.parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _getaddresses_compat(fieldvalues: Sequence[str]) -> list[tuple[str, str]]:
+    """Chiama email.utils.getaddresses preservando la compatibilita su tutti i runtime Python 3.12.
+
+    Usa capability detection affidabile basata sulla firma di getaddresses per scegliere una sola volta
+    tra l'invocazione tollerante con strict=False (runtime con supporto strict) e l'invocazione
+    posizionale standard (runtime legacy senza parametro strict).
+    Se la variante scelta solleva TypeError, l'eccezione viene propagata direttamente senza
+    tentare seconde chiamate né esaminare il messaggio d'errore.
+    """
+    if _supports_strict_getaddresses():
+        return getaddresses(fieldvalues, strict=False)
+    return getaddresses(fieldvalues)
+
+
+def parse_address_header(value: str | None) -> tuple[tuple[str, ...], bool]:
+    """Estrae indirizzi email validi e segnala se si sono verificate malformazioni parziali."""
+    if not value or not value.strip():
+        return (), False
     result: list[str] = []
-    for _, raw_address in getaddresses([value]):
+    had_malformed = False
+
+    # 1. Rilevazione deterministica dei defect tramite il parser strutturato RFC 5322 di email.headerregistry
+    try:
+        parsed_tree = AddressHeader.value_parser(value)
+        if any(not isinstance(d, ObsoleteHeaderDefect) for d in parsed_tree.all_defects):
+            had_malformed = True
+    except (HeaderParseError, MessageDefect, TypeError, ValueError):
+        had_malformed = True
+
+    # 2. Estrazione tollerante degli indirizzi tramite getaddresses compatibile
+    try:
+        raw_pairs = _getaddresses_compat([value])
+    except (HeaderParseError, MessageDefect, TypeError, ValueError):
+        return (), True
+
+    for name, raw_address in raw_pairs:
+        clean_raw = raw_address.strip() if raw_address else ""
+        if not clean_raw:
+            # Se e' presente un display name ma l'indirizzo e' assente (es. 'malformed <'), e' un token corrotto
+            if name.strip():
+                had_malformed = True
+            continue
         try:
-            normalized = str(Address(addr_spec=raw_address)).casefold()
-        except (TypeError, ValueError):
+            normalized = str(Address(addr_spec=clean_raw)).casefold()
+        except (HeaderParseError, MessageDefect, TypeError, ValueError):
+            had_malformed = True
             continue
         if _EMAIL_RE.fullmatch(normalized):
             result.append(normalized)
-    return tuple(dict.fromkeys(result))
+        else:
+            had_malformed = True
+
+    unique = tuple(dict.fromkeys(result))
+    if not unique and not had_malformed:
+        stripped = value.strip()
+        is_empty_group = stripped.endswith(";") and ":" in stripped
+        has_non_separators = bool(stripped.replace(",", "").strip())
+        if not is_empty_group and has_non_separators:
+            had_malformed = True
+
+    return unique, had_malformed
+
+
+def address_header_values(value: str | None) -> tuple[str, ...]:
+    addresses, _ = parse_address_header(value)
+    return addresses
 
 
 def _optional_string(value: object) -> str | None:

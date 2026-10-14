@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.errors import HeaderParseError, MessageDefect
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -24,10 +25,10 @@ from gbrain.domain.gmail import (
     GmailHeader,
     GmailRawMessage,
     NormalizedGmailMessage,
-    address_header_values,
     build_gmail_link,
     confirmed_aliases,
     millisecond_datetime,
+    parse_address_header,
     stable_revision_hash,
 )
 
@@ -187,11 +188,14 @@ def normalize_gmail_message(
     monotonic: Any = time.monotonic,
 ) -> NormalizedGmailMessage:
     effective_limits = limits or MimeLimits()
-    parsed = _parse_payload(raw.payload, effective_limits, monotonic)
+    try:
+        parsed = _parse_payload(raw.payload, effective_limits, monotonic)
+    except (HeaderParseError, MessageDefect) as exc:
+        raise _parse_error("HEADER_PARSE_ERROR") from exc
     header_map = {header.name.casefold(): header.value for header in parsed.headers}
-    from_addresses = address_header_values(header_map.get("from"))
-    to_addresses = address_header_values(header_map.get("to"))
-    cc_addresses = address_header_values(header_map.get("cc"))
+    from_addresses, from_malformed = parse_address_header(header_map.get("from"))
+    to_addresses, to_malformed = parse_address_header(header_map.get("to"))
+    cc_addresses, cc_malformed = parse_address_header(header_map.get("cc"))
     aliases = confirmed_aliases(list(owner_aliases))
     matched_aliases = tuple(address for address in from_addresses if address in aliases)
     if len(from_addresses) == 1 and len(matched_aliases) == 1:
@@ -221,10 +225,17 @@ def normalize_gmail_message(
     )
     source_parts = parsed.plain_parts if plain_original else parsed.html_parts
     evidence_text = plain_original or html_text or ""
+    truncation_codes: list[str] = []
+    if to_malformed or cc_malformed:
+        truncation_codes.append("recipient_header_parse_warning")
+    if from_malformed:
+        truncation_codes.append("from_header_parse_warning")
+
     evidence = BodyEvidence(
         representation="text/plain" if plain_original else "text/html-derived",
         source_part_ids=tuple(part.part_id for part in source_parts),
         content_hash=hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
+        truncation_codes=tuple(truncation_codes),
     )
     normalized_for_hash: dict[str, Any] = {
         "external_id": raw.message_id,
@@ -509,7 +520,7 @@ def _original_date(
     if header_value:
         try:
             parsed = parsedate_to_datetime(header_value)
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError, HeaderParseError, MessageDefect):
             parsed = None
         if parsed is not None:
             if parsed.tzinfo is None:

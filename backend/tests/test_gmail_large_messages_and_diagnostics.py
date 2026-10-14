@@ -631,3 +631,201 @@ def test_headers_and_encoded_body_are_rejected_before_large_decode() -> None:
 
 def test_filename_sanitization_drops_paths_controls_and_nulls() -> None:
     assert sanitize_attachment_filename("..\\private/path\r\nname\x00.txt") == "pathname.txt"
+
+
+# ==============================================================================
+# SCENARIO G: Incremental sync isola PARSE permanente, persiste gap + item valido +
+#             checkpoint in modo atomico, non duplica al resume e propaga errori infrastrutturali
+# ==============================================================================
+
+
+def test_incremental_sync_isolates_parse_failure_advances_checkpoint_and_resume_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_item = {
+        "id": "msg-inc-parse-fail",
+        "threadId": "t-1",
+        "historyId": "1001",
+        "labelIds": ["SENT"],
+        "internalDate": str(int(_MSG_DATE.timestamp() * 1000)),
+        "snippet": "Parse fail message",
+        "payload": _make_raw_message("msg-inc-parse-fail", body_text="X" * 300).payload,
+    }
+    valid_item = {
+        "id": "msg-inc-valid",
+        "threadId": "t-2",
+        "historyId": "1002",
+        "labelIds": ["SENT"],
+        "internalDate": str(int(_MSG_DATE.timestamp() * 1000)),
+        "snippet": "Valid message",
+        "payload": _make_raw_message("msg-inc-valid", body_text="Valid body text").payload,
+    }
+    fixture = {
+        "profile": {"emailAddress": "owner@example.test", "historyId": "1002"},
+        "messages": [bad_item, valid_item],
+    }
+    gateway = FakeGmailGateway(fixture, page_size=10)
+    # Pagina incrementale con item parse-failed seguito da item valido
+    gateway.history_pages = [
+        {"history_id": "1002", "changed": ["msg-inc-parse-fail", "msg-inc-valid"]}
+    ]
+    connector = GmailSentConnector(
+        gateway,
+        ("owner@example.test",),
+        limits=MimeLimits(max_body_bytes=100, max_part_body_bytes=100),
+    )
+    uow = InMemoryGmailUnitOfWork()
+    engine = GmailSyncEngine(connector, uow, batch_size=10)
+
+    # Checkpoint iniziale a history_id="1000"
+    init_chk = _checkpoint()
+
+    # 1. Esecuzione incrementale: l'errore PARSE su msg-inc-parse-fail deve essere isolato,
+    # registrato come gap aperto, e l'item successivo msg-inc-valid deve essere importato con successo.
+    result = engine.incremental_sync(init_chk, RequestBudget(10, 10))
+
+    assert result.persisted_items == 1
+    assert result.not_imported_items == 1
+    assert len(result.gaps) == 1
+
+    gap = result.gaps[0]
+    assert gap.gmail_message_id == "msg-inc-parse-fail"
+    assert gap.reason_code == "BODY_TOO_LARGE"
+    assert gap.phase == "mime_parse"
+    assert gap.status == "open"
+
+    # Persistenza atomica: item valido, gap e checkpoint avanzato al latest_history_id
+    assert ("acc-1", "msg-inc-parse-fail") not in uow.messages
+    assert ("acc-1", "msg-inc-valid") in uow.messages
+    assert ("acc-1", "msg-inc-parse-fail") in uow.gaps
+    assert uow.gaps[("acc-1", "msg-inc-parse-fail")].reason_code == "BODY_TOO_LARGE"
+    assert uow.checkpoints["acc-1"].history_id == "1002"
+    assert uow.commit_count == 1
+
+    # 2. Ripresa (resume): sincronizzazione successiva a partire dal checkpoint avanzato (1002)
+    # Non essendoci ulteriori record di history, non deve inserire nulla né duplicare.
+    resume_result = engine.incremental_sync(result.checkpoint, RequestBudget(10, 10))
+    assert resume_result.persisted_items == 0
+    assert len(uow.messages) == 1
+
+    # 3. Idempotenza in caso di riesecuzione della medesima pagina di history (replay)
+    replay_result = engine.incremental_sync(init_chk, RequestBudget(10, 10))
+    assert replay_result.persisted_items == 0
+    assert replay_result.unchanged_items == 1
+    assert replay_result.not_imported_items == 1
+    assert len(uow.messages) == 1
+    assert len(uow.gaps) == 1
+
+    # 4. Propagazione categorica degli errori: errori infrastrutturali, quota, auth, timeout e inattesi
+    # non devono essere confinati e devono propagare senza avanzare il checkpoint.
+    gateway.queue_failure(
+        "messages.get",
+        ConnectorError(
+            ConnectorErrorCategory.TRANSIENT, "503 Service Unavailable / Timeout", retryable=True
+        ),
+    )
+    with pytest.raises(ConnectorError) as exc_transient:
+        engine.incremental_sync(init_chk, RequestBudget(10, 10))
+    assert exc_transient.value.category == ConnectorErrorCategory.TRANSIENT
+
+    gateway.queue_failure(
+        "messages.get",
+        ConnectorError(ConnectorErrorCategory.QUOTA, "429 Quota Exceeded"),
+    )
+    with pytest.raises(ConnectorError) as exc_quota:
+        engine.incremental_sync(init_chk, RequestBudget(10, 10))
+    assert exc_quota.value.category == ConnectorErrorCategory.QUOTA
+
+    gateway.queue_failure(
+        "messages.get",
+        ConnectorError(ConnectorErrorCategory.AUTH, "401 Unauthorized"),
+    )
+    with pytest.raises(ConnectorError) as exc_auth:
+        engine.incremental_sync(init_chk, RequestBudget(10, 10))
+    assert exc_auth.value.category == ConnectorErrorCategory.AUTH
+
+    def bug_normalize(raw: Any) -> Any:
+        raise RuntimeError("unexpected runtime exception")
+
+    monkeypatch.setattr(connector, "normalize_item", bug_normalize)
+    with pytest.raises(RuntimeError, match="unexpected runtime exception"):
+        engine.incremental_sync(init_chk, RequestBudget(10, 10))
+
+
+def test_incremental_sync_atomic_commit_boundary_and_resume() -> None:
+    bad_item = {
+        "id": "msg-inc-atomic-fail",
+        "threadId": "t-1",
+        "historyId": "2001",
+        "labelIds": ["SENT"],
+        "internalDate": str(int(_MSG_DATE.timestamp() * 1000)),
+        "snippet": "Parse fail",
+        "payload": _make_raw_message("msg-inc-atomic-fail", body_text="Z" * 300).payload,
+    }
+    valid_item = {
+        "id": "msg-inc-atomic-valid",
+        "threadId": "t-2",
+        "historyId": "2002",
+        "labelIds": ["SENT"],
+        "internalDate": str(int(_MSG_DATE.timestamp() * 1000)),
+        "snippet": "Valid",
+        "payload": _make_raw_message("msg-inc-atomic-valid", body_text="Valid body").payload,
+    }
+    fixture = {
+        "profile": {"emailAddress": "owner@example.test", "historyId": "2002"},
+        "messages": [bad_item, valid_item],
+    }
+    gateway = FakeGmailGateway(fixture, page_size=10)
+    gateway.history_pages = [
+        {"history_id": "2002", "changed": ["msg-inc-atomic-fail", "msg-inc-atomic-valid"]}
+    ]
+    connector = GmailSentConnector(
+        gateway,
+        ("owner@example.test",),
+        limits=MimeLimits(max_body_bytes=100, max_part_body_bytes=100),
+    )
+
+    class FailingOnceUoW(InMemoryGmailUnitOfWork):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_once = False
+
+        def persist_batch(self, account_id: str, *args: Any, **kwargs: Any) -> Any:
+            if not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("Database connection lost during commit")
+            return super().persist_batch(account_id, *args, **kwargs)
+
+    uow = FailingOnceUoW()
+    engine = GmailSyncEngine(connector, uow, batch_size=10)
+    init_chk = GmailCheckpointState(
+        account_id="acc-1",
+        policy_id="pol-1",
+        history_id="2000",
+        page_token=None,
+        coverage_after=_SELECTION.after,
+        coverage_before=_SELECTION.before,
+        last_synced_at=_NOW,
+        reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
+    )
+
+    # 1. Primo tentativo fallisce prima del commit: nulla deve essere stato salvato
+    with pytest.raises(RuntimeError, match="Database connection lost"):
+        engine.incremental_sync(init_chk, RequestBudget(10, 10))
+
+    assert ("acc-1", "msg-inc-atomic-valid") not in uow.messages
+    assert ("acc-1", "msg-inc-atomic-fail") not in uow.gaps
+    assert "acc-1" not in uow.checkpoints
+
+    # 2. Ripresa: ora il commit atomico ha successo
+    resumed_result = engine.incremental_sync(init_chk, RequestBudget(10, 10))
+    assert resumed_result.persisted_items == 1
+    assert resumed_result.not_imported_items == 1
+    assert ("acc-1", "msg-inc-atomic-valid") in uow.messages
+    assert ("acc-1", "msg-inc-atomic-fail") in uow.gaps
+    assert uow.checkpoints["acc-1"].history_id == "2002"
+
+    # 3. Ulteriore invocazione non duplica
+    followup_result = engine.incremental_sync(resumed_result.checkpoint, RequestBudget(10, 10))
+    assert followup_result.persisted_items == 0
+    assert len(uow.messages) == 1

@@ -425,6 +425,7 @@ class GmailSyncEngine:
                 counters.pages += 1
                 batch: list[NormalizedGmailMessage] = []
                 out_of_scope_ids: set[str] = set()
+                page_gaps: list[GmailItemGapData] = []
                 for locator in page.locators:
                     try:
                         # Ogni evento history viene rifetchato e riverificato SENT dal gateway.
@@ -439,6 +440,19 @@ class GmailSyncEngine:
                             exc.category == ConnectorErrorCategory.PERMANENT
                             and exc.status_code == 404
                         ):
+                            continue
+                        if exc.category == ConnectorErrorCategory.PARSE:
+                            counters.not_imported += 1
+                            reason = getattr(exc, "reason_code", None) or "MIME_PARSE_ERROR"
+                            gap = GmailItemGapData(
+                                gmail_message_id=locator.message_id,
+                                phase="mime_parse",
+                                reason_code=reason,
+                                details={"error_code": reason, "safe_message": exc.safe_message},
+                                occurred_at=self._connector._now(),
+                            )
+                            page_gaps.append(gap)
+                            counters.gaps.append(gap)
                             continue
                         raise
                 next_checkpoint = GmailCheckpointState(
@@ -468,6 +482,7 @@ class GmailSyncEngine:
                         out_of_scope_external_ids=(
                             frozenset(out_of_scope_ids) if is_final_chunk else frozenset()
                         ),
+                        gaps=tuple(page_gaps) if is_final_chunk else (),
                     )
                 if not batch:
                     self._commit_batch(
@@ -476,6 +491,7 @@ class GmailSyncEngine:
                         counters,
                         removed_external_ids=frozenset(page.deleted_message_ids),
                         out_of_scope_external_ids=frozenset(out_of_scope_ids),
+                        gaps=tuple(page_gaps),
                     )
                 counters.removed += len(page.deleted_message_ids)
                 current_checkpoint = next_checkpoint
