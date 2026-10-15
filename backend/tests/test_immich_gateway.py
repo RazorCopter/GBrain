@@ -91,8 +91,12 @@ async def test_immich_gateway_discovery_and_auth_success() -> None:
         assert request.headers.get("x-api-key") == "test-immich-api-key"
         path = request.url.path
 
-        if path == "/api/server-info/version":
+        if path == "/api/server/version":
             return httpx.Response(200, json={"major": 1, "minor": 106, "patch": 4})
+        if path == "/api/server-info/version":
+            pytest.fail(
+                "Il fallback legacy non deve essere chiamato se l'endpoint attuale risponde"
+            )
         if path == "/api/users/me":
             return httpx.Response(
                 200,
@@ -137,6 +141,79 @@ async def test_immich_gateway_discovery_and_auth_success() -> None:
         assert caps.server_version == "1.106.4"
         assert caps.supports_albums is True
         assert caps.supports_people is True
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_version_uses_legacy_fallback_only_after_404() -> None:
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/api/server/version":
+            return httpx.Response(404)
+        if request.url.path == "/api/server-info/version":
+            return httpx.Response(200, json={"major": 1, "minor": 106, "patch": 4})
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gateway = ImmichGateway("https://immich.test", "test-api-key", client=client)
+        assert await gateway.get_server_version() == "1.106.4"
+
+    assert requested_paths == ["/api/server/version", "/api/server-info/version"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_category", "expected_reason"),
+    [
+        (httpx.Response(401), ImmichErrorCategory.AUTH, "invalid_api_key"),
+        (
+            httpx.Response(200, json={"major": 1, "minor": "106", "patch": 4}),
+            ImmichErrorCategory.PARSE,
+            "server_version_malformed",
+        ),
+    ],
+)
+async def test_immich_gateway_version_does_not_mask_non_404_errors(
+    response: httpx.Response,
+    expected_category: ImmichErrorCategory,
+    expected_reason: str,
+) -> None:
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        return response
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gateway = ImmichGateway("https://immich.test", "test-api-key", client=client)
+        with pytest.raises(ImmichGatewayError) as exc_info:
+            await gateway.get_server_version()
+
+    assert exc_info.value.category == expected_category
+    assert exc_info.value.reason_code == expected_reason
+    assert requested_paths == ["/api/server/version"]
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_rejects_unsupported_version() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/server/version"
+        return httpx.Response(200, json={"major": 2, "minor": 0, "patch": 0})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gateway = ImmichGateway("https://immich.test", "test-api-key", client=client)
+        with pytest.raises(ImmichGatewayError) as exc_info:
+            await gateway.get_server_version()
+
+    assert exc_info.value.category == ImmichErrorCategory.UNSUPPORTED_VERSION
+    assert exc_info.value.reason_code == "unsupported_server_version"
 
 
 @pytest.mark.asyncio

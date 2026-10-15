@@ -21,8 +21,9 @@ from gbrain.domain.immich import (
 
 logger = logging.getLogger(__name__)
 
-# Contratto API verificato per la famiglia v1 che espone /api/server-info/version,
+# Contratto API verificato per la famiglia v1 che espone /api/server/version,
 # /api/users/me, /api/albums, /api/search/metadata e /api/people.
+# /api/server-info/version è mantenuto esclusivamente come fallback legacy su 404.
 SUPPORTED_MIN_VERSION = (1, 106, 0)
 SUPPORTED_MAX_TESTED_VERSION = (1, 140, 0)
 
@@ -205,19 +206,40 @@ class ImmichGateway:
                 await client.aclose()
 
     async def get_server_version(self) -> str:
-        """Legge la versione tramite il contratto ufficiale della famiglia API supportata."""
-        data = await self._handle_request("GET", "/api/server-info/version")
-        if isinstance(data, dict):
-            major = data.get("major")
-            minor = data.get("minor")
-            patch = data.get("patch")
-            if isinstance(major, int) and isinstance(minor, int):
-                return f"{major}.{minor}.{patch if isinstance(patch, int) else 0}"
-        raise ImmichGatewayError(
-            ImmichErrorCategory.PARSE,
-            "server_version_malformed",
-            "Risposta versione Immich non conforme al contratto atteso",
-        )
+        """Legge e valida la versione tramite il contratto API Immich supportato."""
+        try:
+            data = await self._handle_request("GET", "/api/server/version")
+        except ImmichGatewayError as exc:
+            if exc.status_code != 404:
+                raise
+            # Compatibilità circoscritta alle versioni legacy nell'intervallo supportato.
+            # Il fallback non viene mai tentato per auth, rete, timeout o payload errati.
+            data = await self._handle_request("GET", "/api/server-info/version")
+
+        if not isinstance(data, dict):
+            raise ImmichGatewayError(
+                ImmichErrorCategory.PARSE,
+                "server_version_malformed",
+                "Risposta versione Immich non conforme al contratto atteso",
+            )
+
+        components = (data.get("major"), data.get("minor"), data.get("patch"))
+        if not all(type(component) is int and component >= 0 for component in components):
+            raise ImmichGatewayError(
+                ImmichErrorCategory.PARSE,
+                "server_version_malformed",
+                "Risposta versione Immich non conforme al contratto atteso",
+            )
+
+        major, minor, patch = components
+        version_tuple = (major, minor, patch)
+        if not (SUPPORTED_MIN_VERSION <= version_tuple <= SUPPORTED_MAX_TESTED_VERSION):
+            raise ImmichGatewayError(
+                ImmichErrorCategory.UNSUPPORTED_VERSION,
+                "unsupported_server_version",
+                "Versione Immich non compresa nell'intervallo verificato",
+            )
+        return f"{major}.{minor}.{patch}"
 
     async def get_current_user(self) -> dict[str, Any]:
         """Verifica l'autenticazione leggendo il profilo dell'utente corrispondente all'API key."""

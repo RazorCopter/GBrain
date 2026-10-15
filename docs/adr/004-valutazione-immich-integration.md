@@ -13,13 +13,13 @@ Il percorso verticale è: configurazione URL/API key → verifica autenticazione
 
 La famiglia API supportata usa:
 
-- `GET /api/server-info/version` per la versione;
+- `GET /api/server/version` per la versione; solo se risponde `404` viene tentato il percorso legacy `GET /api/server-info/version`;
 - `GET /api/users/me` per autenticazione e identità;
 - `GET /api/albums` e `GET /api/albums/{id}` per album e relativi asset;
 - `POST /api/search/metadata` per ricerca temporale read-only;
 - `GET /api/people` per la capability persone.
 
-L'header di autenticazione è `x-api-key`; le risposte sono richieste come JSON. La compatibilità dichiarata è Immich `1.106.0`–`1.140.0`. Una versione esterna all'intervallo produce `unsupported_server_version`: non viene applicato un fallback euristico. Per la famiglia dichiarata `/api/people` deve usare il wrapper `{ "people": [...], "total": N }`; una lista nuda è considerata payload non conforme. Endpoint assente significa capability non disponibile, mentre auth, timeout e rete mantengono categorie distinte e non vengono degradati a “unsupported”.
+L'header di autenticazione è `x-api-key`; le risposte sono richieste come JSON. La compatibilità dichiarata resta Immich `1.106.0`–`1.140.0`: non è stata ampliata per la correzione dell'endpoint. Una versione esterna all'intervallo produce `unsupported_server_version`. Il fallback legacy della versione è circoscritto a un `404` dell'endpoint attuale e non maschera autenticazione, rete, timeout o payload non conforme. Per la famiglia dichiarata `/api/people` deve usare il wrapper `{ "people": [...], "total": N }`; una lista nuda è considerata payload non conforme. Endpoint di capability assente significa capability non disponibile, mentre auth, timeout e rete mantengono categorie distinte e non vengono degradati a “unsupported”.
 
 ## Selezione e limiti
 
