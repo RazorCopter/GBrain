@@ -8,6 +8,7 @@ import {
     GmailPreview,
     GmailSources,
     ImportJob,
+    ImmichAssetList,
     SourceCatalogItem,
     SourceCatalogResponse,
     SourceDisconnectResponse,
@@ -86,6 +87,9 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
     const [cancellingJob, setCancellingJob] = useState(false)
     const [countdownSec, setCountdownSec] = useState<number | null>(null)
     const [sourcesData, setSourcesData] = useState<GmailSources | null>(null)
+    const [databaseTotal, setDatabaseTotal] = useState<number | null>(null)
+    const [immichAssets, setImmichAssets] = useState<ImmichAssetList | null>(null)
+    const [immichAssetsLoading, setImmichAssetsLoading] = useState(false)
     const [searchQuery, setSearchQuery] = useState('')
     const [searching, setSearching] = useState(false)
 
@@ -148,8 +152,22 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                 if (statusRes.active_job) {
                     setActiveJob((prev) => (prev ? prev : statusRes.active_job ?? null))
                 }
+                if (statusRes.sync_config) {
+                    if (statusRes.sync_config.history_after) {
+                        setFormAfter(statusRes.sync_config.history_after.slice(0, 16))
+                    }
+                    if (statusRes.sync_config.history_before) {
+                        setFormBefore(statusRes.sync_config.history_before.slice(0, 16))
+                    }
+                    setFormLimit(statusRes.sync_config.item_limit)
+                    setFormBudget(statusRes.sync_config.request_budget)
+                    setFormBatchSize(statusRes.sync_config.batch_size)
+                }
             }
-            if (sourcesRes) setSourcesData(sourcesRes)
+            if (sourcesRes) {
+                setSourcesData(sourcesRes)
+                setDatabaseTotal(sourcesRes.total)
+            }
             if (gmailOldStatus?.account) setGmailAccount(gmailOldStatus.account)
             await loadDiagnostics(1)
         } catch (err) {
@@ -380,8 +398,14 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
         setGlobalError('')
         try {
             const trimmed = searchQuery.trim()
-            const res = trimmed ? await api.gmailSearch(trimmed) : await api.gmailSources(50)
-            setSourcesData(res)
+            if (trimmed) {
+                const res = await api.gmailSearch(trimmed)
+                setSourcesData(res)
+            } else {
+                const res = await api.gmailSources(50)
+                setSourcesData(res)
+                setDatabaseTotal(res.total)
+            }
         } catch (err) {
             setGlobalError(err instanceof ApiError ? err.message : 'Errore durante la ricerca dei messaggi.')
         } finally {
@@ -574,7 +598,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                             </div>
                             <div className="meta-cell">
                                 <span className="meta-label">Messaggi Mappati</span>
-                                <span className="meta-value">{sourcesData?.total ?? 0} nel database</span>
+                                <span className="meta-value">{databaseTotal !== null ? databaseTotal : (sourcesData?.total ?? 0)} nel database</span>
                             </div>
                         </div>
                     )}
@@ -609,6 +633,12 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                             <strong>⚠️ Nuova Revisione / Selezione da Importare:</strong> La configurazione desiderata è cambiata rispetto alla copertura storicizzata attuale. Avvia un'importazione dello storico per allineare la fonte. Il cambio filtro è additivo: i messaggi già importati che non corrispondono più non vengono rimossi o reindicizzati automaticamente.
                                         </div>
                                     )}
+                                    {gmailStatus?.active_job &&
+                                        gmailStatus.active_job_matches_config === false && (
+                                            <div className="requires-import-alert" role="status">
+                                                <strong>⚠️ Job attivo di una selezione precedente:</strong> il job resta osservabile e deve terminare o essere annullato prima di avviare una nuova importazione.
+                                            </div>
+                                        )}
 
                                     {/* Schede di stato sintetico */}
                                     <div className="panel-status-strip">
@@ -639,7 +669,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                         </div>
 
                                         <div className="status-cell">
-                                            <span className="cell-label">Copertura Effettiva</span>
+                                            <span className="cell-label">Intervallo Effettivamente Importato</span>
                                             <span className="cell-value">
                                                 {gmailStatus?.coverage?.covered_after || gmailStatus?.coverage?.covered_before ? (
                                                     <>
@@ -651,6 +681,9 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                                     <span className="text-warning">Incompleta / Da importare</span>
                                                 )}
                                             </span>
+                                            {(gmailStatus?.coverage_matches_config === false || gmailStatus?.coverage_period_matches_config === false) && (
+                                                <span className="badge-warning">⚠️ Diverso da revisione/selezione desiderata</span>
+                                            )}
                                             {gmailStatus?.coverage?.status === 'complete_with_gaps' || gmailStatus?.coverage?.has_gaps ? (
                                                 <span className="badge-warning">
                                                     ⚠️ Completa con Lacune ({gmailStatus?.coverage?.missing_count ?? 0} non importati)
@@ -665,14 +698,27 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                         <div className="status-cell">
                                             <span className="cell-label">Stato Backfill & Contatori</span>
                                             <span className="cell-value">
-                                                <span className={`status-tag status-${gmailStatus?.backfill_state?.status ?? 'idle'}`}>
-                                                    {(gmailStatus?.backfill_state?.status ?? 'IDLE').toUpperCase()}
+                                                <span className={`status-tag status-${gmailStatus?.selection_matches_config === false || gmailStatus?.period_matches_config === false ? 'idle' : (gmailStatus?.backfill_state?.status ?? 'idle')}`}>
+                                                    {gmailStatus?.selection_matches_config === false || gmailStatus?.period_matches_config === false
+                                                        ? 'PRECEDENTE REVISIONE/SELEZIONE'
+                                                        : (gmailStatus?.backfill_state?.status ?? 'IDLE').toUpperCase()}
                                                 </span>
                                             </span>
+                                            {gmailStatus?.backfill_state && (
+                                                <span className="cell-sub text-muted">
+                                                    Rev. #{gmailStatus.backfill_state.config_revision} · intervallo {new Date(gmailStatus.backfill_state.history_after).toLocaleDateString()} → {new Date(gmailStatus.backfill_state.history_before).toLocaleDateString()}
+                                                </span>
+                                            )}
                                             <span className="cell-sub text-muted">
                                                 Importati: <strong>{gmailStatus?.backfill_state?.items_imported ?? 0}</strong>
                                                 {' · '}
                                                 Non Importati (Lacune): <strong className={gmailStatus?.backfill_state?.items_not_imported ? 'text-warning' : ''}>{gmailStatus?.backfill_state?.items_not_imported ?? diagnosticsData?.open_count ?? 0}</strong>
+                                                {gmailStatus?.backfill_state?.page_token && (
+                                                    <span className="text-warning"> · Token ripresa presente</span>
+                                                )}
+                                                {gmailStatus?.incomplete_reason && (
+                                                    <span className="text-warning"> · {gmailStatus.incomplete_reason}</span>
+                                                )}
                                             </span>
                                         </div>
                                     </div>
@@ -712,7 +758,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                                 <button
                                                     type="button"
                                                     className="secondary compact"
-                                                    disabled={previewLoading || !formAfter}
+                                                    disabled={previewLoading || !formAfter || isJobActive(activeJob)}
                                                     onClick={handleHistoryPreview}
                                                     title="Esegue un'anteprima sicura senza mutare checkpoint o dati"
                                                 >
@@ -1017,6 +1063,26 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                 <div className="card-category-tag">{item.category.toUpperCase()}</div>
                                 <p className="card-desc">{item.description}</p>
                                 <div className="card-footer">
+                                    {item.id === 'immich' && isAvailable && (
+                                        <button
+                                            type="button"
+                                            className="secondary compact"
+                                            disabled={immichAssetsLoading}
+                                            onClick={async () => {
+                                                setImmichAssetsLoading(true)
+                                                setGlobalError('')
+                                                try {
+                                                    setImmichAssets(await api.fetchSourceItems('immich', 25))
+                                                } catch (err) {
+                                                    setGlobalError(err instanceof ApiError ? err.message : 'Errore nel caricamento asset Immich.')
+                                                } finally {
+                                                    setImmichAssetsLoading(false)
+                                                }
+                                            }}
+                                        >
+                                            {immichAssetsLoading ? 'Caricamento…' : 'Consulta metadati'}
+                                        </button>
+                                    )}
                                     {isAvailable ? (
                                         <button
                                             type="button"
@@ -1036,6 +1102,30 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                         )
                     })}
                 </div>
+                {immichAssets && (
+                    <section className="connected-source-card" style={{ marginTop: '1rem' }}>
+                        <h3>Asset Immich importati (solo metadati)</h3>
+                        <p className="muted">
+                            Totale autorevole: <strong>{immichAssets.total}</strong>. Visualizzati: {immichAssets.items.length} (limite 25). Gli originali restano in Immich.
+                        </p>
+                        <div className="table-responsive">
+                            <table>
+                                <thead><tr><th>Data / provenienza</th><th>Tipo</th><th>Descrizione</th><th>Album</th><th>Persone</th></tr></thead>
+                                <tbody>
+                                    {immichAssets.items.map((asset) => (
+                                        <tr key={asset.source_item_id}>
+                                            <td>{formatRomeDateTime(asset.occurred_at)}<br /><small>{asset.date_source}</small></td>
+                                            <td>{asset.asset_type}</td>
+                                            <td>{asset.description || '—'}</td>
+                                            <td>{asset.albums.map((album) => album.name).join(', ') || '—'}</td>
+                                            <td>{asset.people.map((person) => person.name).join(', ') || '—'}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                )}
             </div>
 
             {/* Sezione Messaggi Sincronizzati & Provenance */}
@@ -1044,7 +1134,9 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                     <div>
                         <h2>Esplora Messaggi Sincronizzati</h2>
                         <p className="muted">
-                            Ispezione dei metadati e citazioni con vincolo di provenance RFC-2822.
+                            {searchQuery.trim()
+                                ? `Risultati ricerca per "${searchQuery}": ${sourcesData?.items.length ?? 0} mostrati su ${sourcesData?.total ?? 0} trovati (${databaseTotal ?? 0} totali nel database).`
+                                : `Ispezione dei metadati e citazioni con vincolo di provenance RFC-2822: ${sourcesData?.items.length ?? 0} mostrati su ${databaseTotal ?? sourcesData?.total ?? 0} nel database.`}
                         </p>
                     </div>
                     <form onSubmit={handleSearch} className="search-form-row">

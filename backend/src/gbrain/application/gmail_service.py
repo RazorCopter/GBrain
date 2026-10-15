@@ -776,6 +776,8 @@ async def enqueue_history_import_job(
         or effective_after >= effective_before
     ):
         raise GmailServiceError("policy_period_invalid", "Intervallo storico Gmail non valido")
+    effective_after = effective_after.astimezone(UTC)
+    effective_before = effective_before.astimezone(UTC)
 
     fp = compute_query_fingerprint(
         selection_label="SENT",
@@ -807,32 +809,40 @@ async def enqueue_history_import_job(
 
     repo = AsyncPostgresGmailRepository(session)
     bf_state = await repo.load_backfill_state(account.id)
-    resume_token = None
-    if (
+    backfill_matches_effective_selection = bool(
         bf_state
-        and bf_state.query_fingerprint == config.query_fingerprint
-        and bf_state.status == "partial"
-    ):
-        resume_token = bf_state.page_token
-
-    await repo.upsert_backfill_state(
-        account.id,
-        GmailBackfillStateData(
-            config_revision=config.revision,
-            query_fingerprint=config.query_fingerprint,
-            history_after=effective_after,
-            history_before=effective_before,
-            page_token=resume_token,
-            status="running",
-            items_imported=bf_state.items_imported if (bf_state and resume_token) else 0,
-            last_run_at=datetime.now(UTC),
-        ),
+        and bf_state.config_revision == config.revision
+        and bf_state.query_fingerprint == fp
+        and bf_state.history_after.astimezone(UTC) == effective_after
+        and bf_state.history_before.astimezone(UTC) == effective_before
     )
+    resume_token = (
+        bf_state.page_token
+        if bf_state and backfill_matches_effective_selection and bf_state.status == "partial"
+        else None
+    )
+
+    # Un backfill diverso conserva il proprio checkpoint finché il nuovo job non produce
+    # un avanzamento. In questo modo un enqueue concorrente/fallito non perde il cursore storico.
+    if bf_state is None or backfill_matches_effective_selection:
+        await repo.upsert_backfill_state(
+            account.id,
+            GmailBackfillStateData(
+                config_revision=config.revision,
+                query_fingerprint=fp,
+                history_after=effective_after,
+                history_before=effective_before,
+                page_token=resume_token,
+                status="running",
+                items_imported=bf_state.items_imported if (bf_state and resume_token) else 0,
+                last_run_at=datetime.now(UTC),
+            ),
+        )
 
     snapshot = {
         "purpose": "history",
         "config_revision": config.revision,
-        "query_fingerprint": config.query_fingerprint,
+        "query_fingerprint": fp,
         "config_query_fingerprint": config.query_fingerprint,
         "effective_query_fingerprint": fp,
         "after": effective_after.astimezone(UTC).isoformat(),
@@ -851,13 +861,13 @@ async def enqueue_history_import_job(
         source_policy_id=policy.id,
         mode=GmailSyncMode.FULL.value,
         config_revision=config.revision,
-        query_fingerprint=config.query_fingerprint,
+        query_fingerprint=fp,
         policy_snapshot=snapshot,
         checkpoint={
             "phase": "created",
             "purpose": "history",
             "config_revision": config.revision,
-            "query_fingerprint": config.query_fingerprint,
+            "query_fingerprint": fp,
             "policy": snapshot,
             "resumption_token": resume_token,
             "persisted_messages": None,
@@ -932,6 +942,33 @@ def _owner_source_query(owner_id: uuid.UUID) -> Any:
     )
 
 
+async def count_imported_sources(
+    session: AsyncSession,
+    owner_id: uuid.UUID,
+    *,
+    account_id: uuid.UUID | None = None,
+    after: datetime | None = None,
+    before: datetime | None = None,
+) -> int:
+    query = (
+        select(func.count(SourceItem.id))
+        .join(ConnectorAccount, ConnectorAccount.id == SourceItem.connector_account_id)
+        .where(
+            ConnectorAccount.owner_id == owner_id,
+            SourceItem.source_kind == GMAIL_SOURCE_KIND,
+            SourceItem.source_state == SourceItemState.ACTIVE,
+        )
+    )
+    if account_id:
+        query = query.where(SourceItem.connector_account_id == account_id)
+    if after:
+        query = query.where(SourceItem.occurred_at >= after)
+    if before:
+        query = query.where(SourceItem.occurred_at < before)
+    val = await session.scalar(query)
+    return int(val or 0)
+
+
 async def list_imported_sources(
     session: AsyncSession,
     owner_id: uuid.UUID,
@@ -950,6 +987,35 @@ async def list_imported_sources(
         query = query.where(SourceItem.occurred_at < before)
     rows = await session.execute(query.order_by(desc(SourceItem.occurred_at)).limit(limit))
     return tuple(_citation(row[0], row[1]) for row in rows)
+
+
+async def count_search_sources(
+    session: AsyncSession,
+    owner_id: uuid.UUID,
+    query_text: str,
+    *,
+    account_id: uuid.UUID | None = None,
+    after: datetime | None = None,
+    before: datetime | None = None,
+) -> int:
+    clean = " ".join(query_text.split())
+    if len(clean) < 2 or len(clean) > 200:
+        raise GmailServiceError("search_query_invalid", "Ricerca da 2 a 200 caratteri richiesta")
+    base_query = _owner_source_query(owner_id).where(
+        text(
+            "to_tsvector('simple', coalesce(source_revisions.normalized_content::text, '')) "
+            "@@ websearch_to_tsquery('simple', :gmail_query)"
+        )
+    )
+    if account_id:
+        base_query = base_query.where(SourceItem.connector_account_id == account_id)
+    if after:
+        base_query = base_query.where(SourceItem.occurred_at >= after)
+    if before:
+        base_query = base_query.where(SourceItem.occurred_at < before)
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total = await session.scalar(count_query.params(gmail_query=clean))
+    return int(total or 0)
 
 
 async def search_imported_sources(

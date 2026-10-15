@@ -591,8 +591,9 @@ async def test_open_ended_history_job_does_not_become_stale_when_config_unchange
         query_fingerprint=cfg_fp,
     )
 
-    # Job storico creato: materializza effective_before = now nel suo snapshot,
-    # ma il suo query_fingerprint di fencing DEVE coincidere con config.query_fingerprint!
+    # Job storico creato: materializza effective_before = now nel suo snapshot.
+    # ImportJob/checkpoint mantengono l'identità effettiva; il fencing riceve
+    # separatamente la fingerprint configurata.
     effective_before = now
     mat_fp = compute_query_fingerprint(
         selection_label="SENT",
@@ -602,11 +603,12 @@ async def test_open_ended_history_job_does_not_become_stale_when_config_unchange
         aliases=("test@example.com",),
     )
 
-    # Lo snapshot conserva i bounds immutabili e il fingerprint semantico corretto
+    # Lo snapshot conserva entrambe le identità senza nomi ambigui.
     snapshot: dict[str, Any] = {
         "purpose": "history",
         "config_revision": 1,
-        "query_fingerprint": cfg_fp,
+        "query_fingerprint": mat_fp,
+        "config_query_fingerprint": cfg_fp,
         "effective_query_fingerprint": mat_fp,
         "after": (now - timedelta(days=30)).isoformat(),
         "before": effective_before.isoformat(),
@@ -623,12 +625,43 @@ async def test_open_ended_history_job_does_not_become_stale_when_config_unchange
         reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
         version=1,
         config_revision=1,
-        query_fingerprint=snapshot["query_fingerprint"],
+        query_fingerprint=snapshot["effective_query_fingerprint"],
     )
 
-    # Il checkpoint deve avere ESATTAMENTE lo stesso fingerprint semantico della config
-    assert checkpoint.query_fingerprint == config.query_fingerprint
+    assert checkpoint.query_fingerprint == mat_fp
+    assert snapshot["config_query_fingerprint"] == config.query_fingerprint
     assert checkpoint.config_revision == config.revision
+
+    class FakeAsyncSession:
+        def begin(self) -> Any:
+            class AsyncCtx:
+                async def __aenter__(self) -> None:
+                    return None
+
+                async def __aexit__(self, *args: Any) -> None:
+                    return None
+
+            return AsyncCtx()
+
+        async def scalar(self, *args: Any, **kwargs: Any) -> Any:
+            statement = args[0]
+            return config if "source_sync_configs" in str(statement) else None
+
+        async def get(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def add(self, value: Any) -> None:
+            self.added = value
+
+    repo = AsyncPostgresGmailRepository(cast(Any, FakeAsyncSession()))
+    outcomes = await repo.persist_batch(
+        account_id,
+        uuid.UUID(checkpoint.policy_id),
+        (),
+        checkpoint,
+        config_query_fingerprint=snapshot["config_query_fingerprint"],
+    )
+    assert outcomes == ()
 
 
 @pytest.mark.asyncio

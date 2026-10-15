@@ -83,12 +83,16 @@ export function SourceConnectionWizard({
     const [aliasSuccessMessage, setAliasSuccessMessage] = useState('')
     const [isEditingAliases, setIsEditingAliases] = useState(false)
 
-    // Step 2: Credenziali
+    // Step 2: Credenziali (Gmail e Immich)
     const [credMode, setCredMode] = useState<'upload' | 'manual'>('upload')
     const [uploadedJsonContent, setUploadedJsonContent] = useState<string | null>(null)
     const [uploadedFileName, setUploadedFileName] = useState<string>('')
     const [clientId, setClientId] = useState('')
     const [clientSecret, setClientSecret] = useState('')
+    const [immichBaseUrl, setImmichBaseUrl] = useState('http://127.0.0.1:2283')
+    const [immichApiKey, setImmichApiKey] = useState('')
+    const [immichSelectionMode, setImmichSelectionMode] = useState<'period' | 'album'>('period')
+    const [immichAlbumId, setImmichAlbumId] = useState('')
     const [showSecret, setShowSecret] = useState(false)
     const [redirectUriOverride, setRedirectUriOverride] = useState('')
     const [copySuccess, setCopySuccess] = useState(false)
@@ -122,6 +126,7 @@ export function SourceConnectionWizard({
     // Step 6: Sync
     const [syncStarting, setSyncStarting] = useState(false)
     const [activeJob, setActiveJob] = useState<ImportJob | null>(null)
+    const [syncCancelling, setSyncCancelling] = useState(false)
     const [syncError, setSyncError] = useState('')
 
     // Carica stato della sorgente selezionata
@@ -281,14 +286,31 @@ export function SourceConnectionWizard({
         if (!activeJob || !['pending', 'running'].includes(activeJob.status)) return
         const intervalId = window.setInterval(async () => {
             try {
-                const refreshed = await api.gmailJob(activeJob.id)
-                setActiveJob(refreshed)
+                const st = await api.fetchSourceStatus(selectedSourceId)
+                if (st.active_job) {
+                    setActiveJob(st.active_job)
+                } else if (st.latest_job) {
+                    setActiveJob(st.latest_job)
+                }
             } catch {
                 // Ignore transient polling failure
             }
         }, 2000)
         return () => window.clearInterval(intervalId)
-    }, [activeJob])
+    }, [activeJob, selectedSourceId])
+
+    async function handleCancelActiveJob() {
+        if (!activeJob || selectedSourceId !== 'immich' || !['pending', 'running'].includes(activeJob.status)) return
+        setSyncCancelling(true)
+        setSyncError('')
+        try {
+            setActiveJob(await api.cancelSourceJob('immich', activeJob.id))
+        } catch (err) {
+            setSyncError(err instanceof ApiError ? err.message : 'Impossibile annullare il job Immich.')
+        } finally {
+            setSyncCancelling(false)
+        }
+    }
 
     // Funzione copia con fallback universale (supporta anche contesti HTTP non protetti su LAN)
     async function copyText(text: string, key = 'uri') {
@@ -356,37 +378,54 @@ export function SourceConnectionWizard({
 
         try {
             let payload: Record<string, unknown> = {}
-            if (credMode === 'upload') {
-                if (!uploadedJsonContent) {
-                    setCredError('Seleziona o trascina un file JSON di credenziali Google prima di salvare.')
+            if (selectedSourceId === 'immich') {
+                if (!immichBaseUrl.trim() || !immichApiKey.trim()) {
+                    setCredError("Inserisci sia l'URL dell'istanza Immich che l'API Key.")
                     setCredSaving(false)
                     return
                 }
-                const parsed = JSON.parse(uploadedJsonContent)
                 payload = {
-                    raw_json: parsed,
-                    redirect_uri_override: redirectUriOverride.trim() || undefined,
+                    base_url: immichBaseUrl.trim(),
+                    api_key: immichApiKey.trim(),
                 }
             } else {
-                if (!clientId.trim() || !clientSecret.trim()) {
-                    setCredError('Inserisci sia il Client ID che il Client Secret.')
-                    setCredSaving(false)
-                    return
-                }
-                payload = {
-                    client_id: clientId.trim(),
-                    client_secret: clientSecret.trim(),
-                    redirect_uri_override: redirectUriOverride.trim() || undefined,
+                if (credMode === 'upload') {
+                    if (!uploadedJsonContent) {
+                        setCredError('Seleziona o trascina un file JSON di credenziali Google prima di salvare.')
+                        setCredSaving(false)
+                        return
+                    }
+                    const parsed = JSON.parse(uploadedJsonContent)
+                    payload = {
+                        raw_json: parsed,
+                        redirect_uri_override: redirectUriOverride.trim() || undefined,
+                    }
+                } else {
+                    if (!clientId.trim() || !clientSecret.trim()) {
+                        setCredError('Inserisci sia il Client ID che il Client Secret.')
+                        setCredSaving(false)
+                        return
+                    }
+                    payload = {
+                        client_id: clientId.trim(),
+                        client_secret: clientSecret.trim(),
+                        redirect_uri_override: redirectUriOverride.trim() || undefined,
+                    }
                 }
             }
 
             const res = await api.saveSourceCredentials(selectedSourceId, payload)
             setCredSuccessMessage(res.message || 'Credenziali client salvate con crittografia AES-256-GCM.')
             const updated = await refreshStatus(selectedSourceId)
-            // Avanza automaticamente allo step 3 se salvate
+            // Avanza automaticamente allo step successivo (step 4 per Immich perché non usa OAuth)
             if (updated?.configured) {
                 setTimeout(() => {
-                    setCurrentStep(3)
+                    if (selectedSourceId === 'immich') {
+                        setCurrentStep(4)
+                        handleTestConnection('immich')
+                    } else {
+                        setCurrentStep(3)
+                    }
                 }, 800)
             }
         } catch (err) {
@@ -476,18 +515,25 @@ export function SourceConnectionWizard({
         setSyncStarting(true)
         setSyncError('')
         try {
+            const isImmich = selectedSourceId === 'immich'
             const payload: SourceSyncPayload = {
-                period_after: new Date(periodAfter).toISOString(),
-                period_before: new Date(periodBefore).toISOString(),
-                item_limit: itemLimit,
-                request_budget: requestBudget,
+                album_id: isImmich && immichSelectionMode === 'album' ? immichAlbumId.trim() : undefined,
+                period_after: (!isImmich || immichSelectionMode === 'period') ? new Date(periodAfter).toISOString() : undefined,
+                period_before: (!isImmich || immichSelectionMode === 'period') ? new Date(periodBefore).toISOString() : undefined,
+                item_limit: isImmich ? Math.min(itemLimit, 25) : itemLimit,
+                request_budget: isImmich ? 50 : requestBudget,
                 batch_size: 25,
                 mode: 'full',
             }
             const res = await api.triggerSourceSync(selectedSourceId, payload)
-            // Carica lo stato del job appena creato
-            const jobData = await api.gmailJob(res.job_id)
-            setActiveJob(jobData)
+            // Carica lo stato della fonte per inizializzare il job
+            if (isImmich) {
+                const st = await api.fetchSourceStatus('immich')
+                setActiveJob(st.active_job || st.latest_job || null)
+            } else {
+                const jobData = await api.gmailJob(res.job_id)
+                setActiveJob(jobData)
+            }
         } catch (err) {
             setSyncError(err instanceof ApiError ? err.message : "Errore nell'avvio della sincronizzazione.")
         } finally {
@@ -775,113 +821,153 @@ export function SourceConnectionWizard({
                                 </div>
                             )}
 
-                            {/* Selettore modalità di inserimento credenziali */}
-                            <div className="cred-tabs-wrap">
-                                <div className="cred-tabs" role="tablist">
-                                    <button
-                                        type="button"
-                                        role="tab"
-                                        aria-selected={credMode === 'upload'}
-                                        className={`cred-tab-btn ${credMode === 'upload' ? 'active' : ''}`}
-                                        onClick={() => setCredMode('upload')}
-                                    >
-                                        📁 Carica file JSON (Consigliato)
-                                    </button>
-                                    <button
-                                        type="button"
-                                        role="tab"
-                                        aria-selected={credMode === 'manual'}
-                                        className={`cred-tab-btn ${credMode === 'manual' ? 'active' : ''}`}
-                                        onClick={() => setCredMode('manual')}
-                                    >
-                                        ✏️ Inserimento manuale ID & Secret
-                                    </button>
-                                </div>
-
-                                {credMode === 'upload' ? (
-                                    <div className="upload-dropzone-container">
-                                        <div
-                                            className={`dropzone ${uploadedFileName ? 'has-file' : ''}`}
-                                            onDragOver={(e) => e.preventDefault()}
-                                            onDrop={(e) => {
-                                                e.preventDefault()
-                                                const droppedFile = e.dataTransfer.files[0]
-                                                if (droppedFile) {
-                                                    handleFileUpload(droppedFile)
-                                                }
-                                            }}
-                                        >
-                                            <span className="dropzone-icon" aria-hidden="true">📥</span>
-                                            <p className="dropzone-text">
-                                                {uploadedFileName ? (
-                                                    <strong>File selezionato: {uploadedFileName}</strong>
-                                                ) : (
-                                                    <>
-                                                        Trascina qui il file <code>client_secret_*.json</code> scaricato da Google Cloud Console
-                                                        <br />
-                                                        <span className="muted">oppure fai clic sul pulsante sottostante</span>
-                                                    </>
-                                                )}
-                                            </p>
-                                            <label className="button-like secondary">
-                                                Sfoglia file JSON…
-                                                <input
-                                                    type="file"
-                                                    accept=".json,application/json"
-                                                    style={{ display: 'none' }}
-                                                    onChange={(e) => {
-                                                        const chosenFile = e.target.files?.[0]
-                                                        if (chosenFile) {
-                                                            handleFileUpload(chosenFile)
-                                                        }
-                                                    }}
-                                                />
-                                            </label>
+                            {selectedSourceId === 'immich' ? (
+                                <form onSubmit={handleSaveCredentials} className="manual-cred-form" style={{ marginTop: '1rem' }}>
+                                    <div className="wizard-callout info">
+                                        <div className="callout-header">
+                                            <span aria-hidden="true">🔒</span>
+                                            <strong>Connettore Immich Read-Only (Sola Lettura)</strong>
                                         </div>
+                                        <p>GBrain sincronizza esclusivamente i metadati dell'istanza (timestamp, album, descrizione, persone già etichettate). Nessun file originale o miniatura viene mai scaricato o modificato.</p>
                                     </div>
-                                ) : (
-                                    <form onSubmit={handleSaveCredentials} className="manual-cred-form">
-                                        <label>
-                                            Client ID Google
+                                    <label>
+                                        URL Istanza Immich (HTTPS o HTTP su rete LAN locale)
+                                        <input
+                                            type="text"
+                                            placeholder="es. http://192.168.1.100:2283 o https://immich.example.com"
+                                            value={immichBaseUrl}
+                                            onChange={(e) => setImmichBaseUrl(e.target.value)}
+                                            required
+                                        />
+                                    </label>
+                                    <label>
+                                        API Key Immich
+                                        <div className="password-input-wrap">
                                             <input
-                                                type="text"
-                                                placeholder="es. 123456789-abcdef.apps.googleusercontent.com"
-                                                value={clientId}
-                                                onChange={(e) => setClientId(e.target.value)}
+                                                type={showSecret ? 'text' : 'password'}
+                                                placeholder="Genera una API Key in Immich > Account Settings > API Keys"
+                                                value={immichApiKey}
+                                                onChange={(e) => setImmichApiKey(e.target.value)}
                                                 required
                                             />
-                                        </label>
-                                        <label>
-                                            Client Secret Google
-                                            <div className="password-input-wrap">
+                                            <button
+                                                type="button"
+                                                className="secondary compact"
+                                                onClick={() => setShowSecret(!showSecret)}
+                                            >
+                                                {showSecret ? 'Nascondi' : 'Mostra'}
+                                            </button>
+                                        </div>
+                                    </label>
+                                </form>
+                            ) : (
+                                <div className="cred-tabs-wrap">
+                                    <div className="cred-tabs" role="tablist">
+                                        <button
+                                            type="button"
+                                            role="tab"
+                                            aria-selected={credMode === 'upload'}
+                                            className={`cred-tab-btn ${credMode === 'upload' ? 'active' : ''}`}
+                                            onClick={() => setCredMode('upload')}
+                                        >
+                                            📁 Carica file JSON (Consigliato)
+                                        </button>
+                                        <button
+                                            type="button"
+                                            role="tab"
+                                            aria-selected={credMode === 'manual'}
+                                            className={`cred-tab-btn ${credMode === 'manual' ? 'active' : ''}`}
+                                            onClick={() => setCredMode('manual')}
+                                        >
+                                            ✏️ Inserimento manuale ID & Secret
+                                        </button>
+                                    </div>
+
+                                    {credMode === 'upload' ? (
+                                        <div className="upload-dropzone-container">
+                                            <div
+                                                className={`dropzone ${uploadedFileName ? 'has-file' : ''}`}
+                                                onDragOver={(e) => e.preventDefault()}
+                                                onDrop={(e) => {
+                                                    e.preventDefault()
+                                                    const droppedFile = e.dataTransfer.files[0]
+                                                    if (droppedFile) {
+                                                        handleFileUpload(droppedFile)
+                                                    }
+                                                }}
+                                            >
+                                                <span className="dropzone-icon" aria-hidden="true">📥</span>
+                                                <p className="dropzone-text">
+                                                    {uploadedFileName ? (
+                                                        <strong>File selezionato: {uploadedFileName}</strong>
+                                                    ) : (
+                                                        <>
+                                                            Trascina qui il file <code>client_secret_*.json</code> scaricato da Google Cloud Console
+                                                            <br />
+                                                            <span className="muted">oppure fai clic sul pulsante sottostante</span>
+                                                        </>
+                                                    )}
+                                                </p>
+                                                <label className="button-like secondary">
+                                                    Sfoglia file JSON…
+                                                    <input
+                                                        type="file"
+                                                        accept=".json,application/json"
+                                                        style={{ display: 'none' }}
+                                                        onChange={(e) => {
+                                                            const chosenFile = e.target.files?.[0]
+                                                            if (chosenFile) {
+                                                                handleFileUpload(chosenFile)
+                                                            }
+                                                        }}
+                                                    />
+                                                </label>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <form onSubmit={handleSaveCredentials} className="manual-cred-form">
+                                            <label>
+                                                Client ID Google
                                                 <input
-                                                    type={showSecret ? 'text' : 'password'}
-                                                    placeholder="GOCSPX-..."
-                                                    value={clientSecret}
-                                                    onChange={(e) => setClientSecret(e.target.value)}
+                                                    type="text"
+                                                    placeholder="es. 123456789-abcdef.apps.googleusercontent.com"
+                                                    value={clientId}
+                                                    onChange={(e) => setClientId(e.target.value)}
                                                     required
                                                 />
-                                                <button
-                                                    type="button"
-                                                    className="secondary compact"
-                                                    onClick={() => setShowSecret(!showSecret)}
-                                                >
-                                                    {showSecret ? 'Nascondi' : 'Mostra'}
-                                                </button>
-                                            </div>
-                                        </label>
-                                        <label>
-                                            Redirect URI Override (Opzionale)
-                                            <input
-                                                type="url"
-                                                placeholder="Lascia vuoto per rilevamento automatico dal server"
-                                                value={redirectUriOverride}
-                                                onChange={(e) => setRedirectUriOverride(e.target.value)}
-                                            />
-                                        </label>
-                                    </form>
-                                )}
-                            </div>
+                                            </label>
+                                            <label>
+                                                Client Secret Google
+                                                <div className="password-input-wrap">
+                                                    <input
+                                                        type={showSecret ? 'text' : 'password'}
+                                                        placeholder="GOCSPX-..."
+                                                        value={clientSecret}
+                                                        onChange={(e) => setClientSecret(e.target.value)}
+                                                        required
+                                                    />
+                                                    <button
+                                                        type="button"
+                                                        className="secondary compact"
+                                                        onClick={() => setShowSecret(!showSecret)}
+                                                    >
+                                                        {showSecret ? 'Nascondi' : 'Mostra'}
+                                                    </button>
+                                                </div>
+                                            </label>
+                                            <label>
+                                                Redirect URI Override (Opzionale)
+                                                <input
+                                                    type="url"
+                                                    placeholder="Lascia vuoto per rilevamento automatico dal server"
+                                                    value={redirectUriOverride}
+                                                    onChange={(e) => setRedirectUriOverride(e.target.value)}
+                                                />
+                                            </label>
+                                        </form>
+                                    )}
+                                </div>
+                            )}
 
                             {credError && <p className="error" role="alert">{credError}</p>}
                             {credSuccessMessage && <p className="success-msg" role="status">{credSuccessMessage}</p>}
@@ -893,7 +979,7 @@ export function SourceConnectionWizard({
                                 <button
                                     type="button"
                                     className="primary"
-                                    disabled={credSaving || (credMode === 'upload' && !uploadedJsonContent)}
+                                    disabled={credSaving || (selectedSourceId === 'immich' ? (!immichBaseUrl.trim() || !immichApiKey.trim()) : (credMode === 'upload' && !uploadedJsonContent))}
                                     onClick={() => handleSaveCredentials()}
                                 >
                                     {credSaving ? 'Salvataggio sicuro in corso…' : 'Salva credenziali crittografate e continua →'}
@@ -902,94 +988,124 @@ export function SourceConnectionWizard({
                         </div>
                     )}
 
-                    {/* STEP 3: Autorizzazione Account Google */}
+                    {/* STEP 3: Autorizzazione Account */}
                     {currentStep === 3 && (
                         <div className="wizard-step-content">
-                            <h3>3. Autorizzazione account con Google OAuth</h3>
-                            <p className="wizard-description">
-                                Collega in modo sicuro la tua casella di posta per consentire l'analisi del grafo di conoscenza.
-                            </p>
-
-                            <div className="privacy-badge-box">
-                                <div className="privacy-icon" aria-hidden="true">🛡️</div>
-                                <div>
-                                    <h4>Politica di Accesso e Privacy Restrittiva</h4>
-                                    <ul className="privacy-list">
-                                        <li>
-                                            <strong>Scope richiesto</strong>: <code>https://www.googleapis.com/auth/gmail.readonly</code> in modalità di sola lettura.
-                                        </li>
-                                        <li>
-                                            <strong>Vincolo cartella SENT</strong>: GBrain scarica ed elabora <strong>esclusivamente la posta inviata</strong> dall'utente per mappare le interazioni. Nessuna email in arrivo (INBOX), bozza o messaggio privato non inviato viene mai aperto o salvato.
-                                        </li>
-                                        <li>
-                                            <strong>Sovranità locale</strong>: I dati e i token non lasciano mai la tua istanza privata.
-                                        </li>
-                                    </ul>
-                                </div>
-                            </div>
-
-                            {sourceStatus?.account_connected ? (
-                                <div className="wizard-callout success">
-                                    <div className="callout-header">
-                                        <span aria-hidden="true">✅</span>
-                                        <strong>Account attualmente connesso: {sourceStatus.primary_email}</strong>
+                            {selectedSourceId === 'immich' ? (
+                                <>
+                                    <h3>3. Autenticazione Immich</h3>
+                                    <div className="wizard-callout info">
+                                        <div className="callout-header">
+                                            <span aria-hidden="true">🔑</span>
+                                            <strong>Autenticazione con API Key Header</strong>
+                                        </div>
+                                        <p>Immich utilizza l'autenticazione tramite chiave API. L'API Key configurata nel passaggio precedente è salvata e cifrata con AES-256-GCM. Il flusso OAuth non è necessario.</p>
                                     </div>
-                                    <p>L'account Google risulta già autorizzato e pronto per la verifica.</p>
-                                    <div className="callout-actions">
+                                    <div className="wizard-actions">
+                                        <button type="button" className="secondary" onClick={() => setCurrentStep(2)}>
+                                            ← Torna alle credenziali
+                                        </button>
                                         <button
                                             type="button"
                                             className="primary"
                                             onClick={() => {
                                                 setCurrentStep(4)
-                                                handleTestConnection()
+                                                handleTestConnection('immich')
                                             }}
                                         >
-                                            Procedi con questo account →
-                                        </button>
-                                        <button
-                                            type="button"
-                                            className="secondary"
-                                            disabled={oauthStarting}
-                                            onClick={handleStartOAuth}
-                                        >
-                                            {oauthStarting ? 'Reindirizzamento…' : 'Ricollega o cambia account Google'}
+                                            Verifica connessione Immich →
                                         </button>
                                     </div>
-                                </div>
+                                </>
                             ) : (
-                                <div className="oauth-start-wrap">
-                                    <p>Fai clic sul pulsante sottostante per avviare il flusso di consenso sul server di Google:</p>
-                                    <button
-                                        type="button"
-                                        className="google-oauth-btn"
-                                        disabled={oauthStarting}
-                                        onClick={handleStartOAuth}
-                                    >
-                                        <span className="google-icon" aria-hidden="true">G</span>
-                                        <span>{oauthStarting ? 'Preparazione collegamento…' : 'Collega con Google'}</span>
-                                    </button>
-                                </div>
+                                <>
+                                    <h3>3. Autorizzazione account con Google OAuth</h3>
+                                    <p className="wizard-description">
+                                        Collega in modo sicuro la tua casella di posta per consentire l'analisi del grafo di conoscenza.
+                                    </p>
+
+                                    <div className="privacy-badge-box">
+                                        <div className="privacy-icon" aria-hidden="true">🛡️</div>
+                                        <div>
+                                            <h4>Politica di Accesso e Privacy Restrittiva</h4>
+                                            <ul className="privacy-list">
+                                                <li>
+                                                    <strong>Scope richiesto</strong>: <code>https://www.googleapis.com/auth/gmail.readonly</code> in modalità di sola lettura.
+                                                </li>
+                                                <li>
+                                                    <strong>Vincolo cartella SENT</strong>: GBrain scarica ed elabora <strong>esclusivamente la posta inviata</strong> dall'utente per mappare le interazioni. Nessuna email in arrivo (INBOX), bozza o messaggio privato non inviato viene mai aperto o salvato.
+                                                </li>
+                                                <li>
+                                                    <strong>Sovranità locale</strong>: I dati e i token non lasciano mai la tua istanza privata.
+                                                </li>
+                                            </ul>
+                                        </div>
+                                    </div>
+
+                                    {sourceStatus?.account_connected ? (
+                                        <div className="wizard-callout success">
+                                            <div className="callout-header">
+                                                <span aria-hidden="true">✅</span>
+                                                <strong>Account attualmente connesso: {sourceStatus.primary_email}</strong>
+                                            </div>
+                                            <p>L'account Google risulta già autorizzato e pronto per la verifica.</p>
+                                            <div className="callout-actions">
+                                                <button
+                                                    type="button"
+                                                    className="primary"
+                                                    onClick={() => {
+                                                        setCurrentStep(4)
+                                                        handleTestConnection()
+                                                    }}
+                                                >
+                                                    Procedi con questo account →
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    className="secondary"
+                                                    disabled={oauthStarting}
+                                                    onClick={handleStartOAuth}
+                                                >
+                                                    {oauthStarting ? 'Reindirizzamento…' : 'Ricollega o cambia account Google'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="oauth-start-wrap">
+                                            <p>Fai clic sul pulsante sottostante per avviare il flusso di consenso sul server di Google:</p>
+                                            <button
+                                                type="button"
+                                                className="google-oauth-btn"
+                                                disabled={oauthStarting}
+                                                onClick={handleStartOAuth}
+                                            >
+                                                <span className="google-icon" aria-hidden="true">G</span>
+                                                <span>{oauthStarting ? 'Preparazione collegamento…' : 'Collega con Google'}</span>
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {oauthError && <p className="error" role="alert">{oauthError}</p>}
+
+                                    <div className="wizard-actions">
+                                        <button type="button" className="secondary" onClick={() => setCurrentStep(2)}>
+                                            ← Torna alle credenziali
+                                        </button>
+                                        {sourceStatus?.account_connected && (
+                                            <button
+                                                type="button"
+                                                className="primary"
+                                                onClick={() => {
+                                                    setCurrentStep(4)
+                                                    handleTestConnection()
+                                                }}
+                                            >
+                                                Continua alla verifica connessione →
+                                            </button>
+                                        )}
+                                    </div>
+                                </>
                             )}
-
-                            {oauthError && <p className="error" role="alert">{oauthError}</p>}
-
-                            <div className="wizard-actions">
-                                <button type="button" className="secondary" onClick={() => setCurrentStep(2)}>
-                                    ← Torna alle credenziali
-                                </button>
-                                {sourceStatus?.account_connected && (
-                                    <button
-                                        type="button"
-                                        className="primary"
-                                        onClick={() => {
-                                            setCurrentStep(4)
-                                            handleTestConnection()
-                                        }}
-                                    >
-                                        Continua alla verifica connessione →
-                                    </button>
-                                )}
-                            </div>
                         </div>
                     )}
 
@@ -1004,7 +1120,11 @@ export function SourceConnectionWizard({
                             {testingConnection && (
                                 <div className="status-loading-box">
                                     <div className="spinner" aria-hidden="true"></div>
-                                    <p>Interrogazione profilo Gmail in corso…</p>
+                                    <p>
+                                        {selectedSourceId === 'immich'
+                                            ? 'Verifica versione e capacità Immich in corso…'
+                                            : 'Interrogazione profilo Gmail in corso…'}
+                                    </p>
                                 </div>
                             )}
 
@@ -1020,6 +1140,23 @@ export function SourceConnectionWizard({
 
                                     {testResult.connected && (
                                         <div className="result-details-grid">
+                                            {selectedSourceId === 'immich' && (
+                                                <>
+                                                    <div>
+                                                        <span className="detail-label">Versione server:</span>
+                                                        <strong className="detail-val">{testResult.server_version ?? 'Non disponibile'}</strong>
+                                                    </div>
+                                                    <div>
+                                                        <span className="detail-label">Capacità:</span>
+                                                        <strong className="detail-val">
+                                                            {Object.entries(testResult.capabilities ?? {})
+                                                                .filter(([, enabled]) => enabled)
+                                                                .map(([name]) => name)
+                                                                .join(', ') || 'Nessuna capacità utilizzabile'}
+                                                        </strong>
+                                                    </div>
+                                                </>
+                                            )}
                                             <div>
                                                 <span className="detail-label">Identità Primaria:</span>
                                                 <strong className="detail-val">{testResult.primary_identity ?? 'Non specificato'}</strong>
@@ -1194,44 +1331,103 @@ export function SourceConnectionWizard({
                     {/* STEP 5: Anteprima Dati / Importazione */}
                     {currentStep === 5 && (
                         <div className="wizard-step-content">
-                            <h3>5. Anteprima messaggi inviati (SENT)</h3>
+                            <h3>{selectedSourceId === 'immich' ? '5. Anteprima metadati Immich' : '5. Anteprima messaggi inviati (SENT)'}</h3>
                             <p className="wizard-description">
-                                Ispeziona una stima della posta inviata e visualizza un campione dei messaggi prima di avviare qualsiasi sincronizzazione persistente.
+                                {selectedSourceId === 'immich'
+                                    ? 'Ispeziona i metadati degli asset prima di avviare l\'importazione. Nessun originale verrà scaricato (limite massimo di 25 elementi).'
+                                    : 'Ispeziona una stima della posta inviata e visualizza un campione dei messaggi prima di avviare qualsiasi sincronizzazione persistente.'}
                             </p>
 
-                            <div className="preview-params-bar">
-                                <div className="param-field">
-                                    <label htmlFor="period-after">Dal</label>
-                                    <input
-                                        id="period-after"
-                                        type="datetime-local"
-                                        value={periodAfter}
-                                        onChange={(e) => setPeriodAfter(e.target.value)}
-                                    />
+                            {selectedSourceId === 'immich' ? (
+                                <div className="preview-params-bar">
+                                    <div className="param-field" style={{ minWidth: '220px' }}>
+                                        <label htmlFor="immich-sel-mode">Modalità di selezione</label>
+                                        <select
+                                            id="immich-sel-mode"
+                                            value={immichSelectionMode}
+                                            onChange={(e) => setImmichSelectionMode(e.target.value as 'period' | 'album')}
+                                        >
+                                            <option value="period">📅 Intervallo Temporale</option>
+                                            <option value="album">📁 Per Album ID</option>
+                                        </select>
+                                    </div>
+                                    {immichSelectionMode === 'album' ? (
+                                        <div className="param-field" style={{ flex: 1 }}>
+                                            <label htmlFor="immich-album-id">Album ID</label>
+                                            <input
+                                                id="immich-album-id"
+                                                type="text"
+                                                placeholder="UUID dell'album da importare"
+                                                value={immichAlbumId}
+                                                onChange={(e) => setImmichAlbumId(e.target.value)}
+                                            />
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="param-field">
+                                                <label htmlFor="period-after">Dal</label>
+                                                <input
+                                                    id="period-after"
+                                                    type="datetime-local"
+                                                    value={periodAfter}
+                                                    onChange={(e) => setPeriodAfter(e.target.value)}
+                                                />
+                                            </div>
+                                            <div className="param-field">
+                                                <label htmlFor="period-before">Al</label>
+                                                <input
+                                                    id="period-before"
+                                                    type="datetime-local"
+                                                    value={periodBefore}
+                                                    onChange={(e) => setPeriodBefore(e.target.value)}
+                                                />
+                                            </div>
+                                        </>
+                                    )}
+                                    <button
+                                        type="button"
+                                        className="secondary"
+                                        disabled={previewLoading}
+                                        onClick={handleLoadPreview}
+                                    >
+                                        {previewLoading ? 'Lettura anteprima…' : 'Ricalcola anteprima'}
+                                    </button>
                                 </div>
-                                <div className="param-field">
-                                    <label htmlFor="period-before">Al</label>
-                                    <input
-                                        id="period-before"
-                                        type="datetime-local"
-                                        value={periodBefore}
-                                        onChange={(e) => setPeriodBefore(e.target.value)}
-                                    />
+                            ) : (
+                                <div className="preview-params-bar">
+                                    <div className="param-field">
+                                        <label htmlFor="period-after">Dal</label>
+                                        <input
+                                            id="period-after"
+                                            type="datetime-local"
+                                            value={periodAfter}
+                                            onChange={(e) => setPeriodAfter(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="param-field">
+                                        <label htmlFor="period-before">Al</label>
+                                        <input
+                                            id="period-before"
+                                            type="datetime-local"
+                                            value={periodBefore}
+                                            onChange={(e) => setPeriodBefore(e.target.value)}
+                                        />
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="secondary"
+                                        disabled={previewLoading}
+                                        onClick={handleLoadPreview}
+                                    >
+                                        {previewLoading ? 'Lettura anteprima…' : 'Ricalcola anteprima'}
+                                    </button>
                                 </div>
-                                <button
-                                    type="button"
-                                    className="secondary"
-                                    disabled={previewLoading}
-                                    onClick={handleLoadPreview}
-                                >
-                                    {previewLoading ? 'Lettura anteprima…' : 'Ricalcola anteprima'}
-                                </button>
-                            </div>
+                            )}
 
                             {previewLoading && (
                                 <div className="status-loading-box">
                                     <div className="spinner" aria-hidden="true"></div>
-                                    <p>Recupero campioni in corso da Gmail…</p>
+                                    <p>Recupero campioni in corso da {selectedSourceId === 'immich' ? 'Immich' : 'Gmail'}…</p>
                                 </div>
                             )}
 
@@ -1309,11 +1505,17 @@ export function SourceConnectionWizard({
                                     <strong className="summary-val">{selectedCatalogItem?.name ?? selectedSourceId}</strong>
                                 </div>
                                 <div className="summary-item">
-                                    <span className="summary-key">Account Autenticato</span>
-                                    <strong className="summary-val">{sourceStatus?.primary_email ?? '—'}</strong>
+                                    <span className="summary-key">
+                                        {selectedSourceId === 'immich' ? 'Istanza verificata' : 'Account autenticato'}
+                                    </span>
+                                    <strong className="summary-val">
+                                        {selectedSourceId === 'immich' ? (testResult?.primary_identity ?? 'Immich') : (sourceStatus?.primary_email ?? '—')}
+                                    </strong>
                                 </div>
                                 <div className="summary-item">
-                                    <span className="summary-key">Alias Confermati</span>
+                                    <span className="summary-key">
+                                        {selectedSourceId === 'immich' ? 'Selezione' : 'Alias confermati'}
+                                    </span>
                                     {selectedSourceId === 'gmail' ? (
                                         aliasesReady && confirmedAliases.length > 0 ? (
                                             <strong className="summary-val text-success">
@@ -1325,7 +1527,9 @@ export function SourceConnectionWizard({
                                             </strong>
                                         )
                                     ) : (
-                                        <strong className="summary-val">Non applicabile</strong>
+                                        <strong className="summary-val">
+                                            {immichAlbumId ? `Album ${immichAlbumId}` : 'Periodo selezionato'}
+                                        </strong>
                                     )}
                                 </div>
                                 <div className="summary-item">
@@ -1335,33 +1539,39 @@ export function SourceConnectionWizard({
                                     </strong>
                                 </div>
                                 <div className="summary-item">
-                                    <span className="summary-key">Modalità Import</span>
-                                    <strong className="summary-val">Full (Iniziale)</strong>
+                                    <span className="summary-key">Modalità import</span>
+                                    <strong className="summary-val">
+                                        {selectedSourceId === 'immich' ? 'Solo metadati (max 25 asset)' : 'Full (iniziale)'}
+                                    </strong>
                                 </div>
                             </div>
 
-                            <div className="sync-policy-controls">
-                                <label>
-                                    Limite massimo messaggi da elaborare
-                                    <input
-                                        type="number"
-                                        min={1}
-                                        max={5000}
-                                        value={itemLimit}
-                                        onChange={(e) => setItemLimit(Number(e.target.value))}
-                                    />
-                                </label>
-                                <label>
-                                    Budget massimo chiamate API
-                                    <input
-                                        type="number"
-                                        min={1}
-                                        max={2000}
-                                        value={requestBudget}
-                                        onChange={(e) => setRequestBudget(Number(e.target.value))}
-                                    />
-                                </label>
-                            </div>
+                            {selectedSourceId === 'gmail' ? (
+                                <div className="sync-policy-controls">
+                                    <label>
+                                        Limite massimo messaggi da elaborare
+                                        <input
+                                            type="number"
+                                            min={1}
+                                            max={5000}
+                                            value={itemLimit}
+                                            onChange={(e) => setItemLimit(Number(e.target.value))}
+                                        />
+                                    </label>
+                                    <label>
+                                        Budget massimo chiamate API
+                                        <input
+                                            type="number"
+                                            min={1}
+                                            max={2000}
+                                            value={requestBudget}
+                                            onChange={(e) => setRequestBudget(Number(e.target.value))}
+                                        />
+                                    </label>
+                                </div>
+                            ) : (
+                                <p className="muted">L'importazione è read-only, solo metadati e limitata a 25 asset.</p>
+                            )}
 
                             {/* Stato del Job attivo se avviato */}
                             {activeJob ? (
@@ -1374,20 +1584,36 @@ export function SourceConnectionWizard({
                                             </span>
                                         </div>
                                         <span className="job-items-count">
-                                            {activeJob.processed_items} messaggi elaborati
+                                            {activeJob.processed_items} {selectedSourceId === 'immich' ? 'asset elaborati' : 'messaggi elaborati'}
                                         </span>
                                     </div>
 
                                     {['pending', 'running'].includes(activeJob.status) && (
-                                        <div className="progress-bar-container">
-                                            <div className="progress-bar-indeterminate"></div>
+                                        <>
+                                            <div className="progress-bar-container">
+                                                <div className="progress-bar-indeterminate"></div>
+                                            </div>
+                                            {selectedSourceId === 'immich' && (
+                                                <button
+                                                    type="button"
+                                                    className="secondary compact"
+                                                    disabled={syncCancelling}
+                                                    onClick={handleCancelActiveJob}
+                                                >
+                                                    {syncCancelling ? 'Annullamento…' : 'Annulla import Immich'}
+                                                </button>
+                                            )}
+                                        </>
+                                    )}
+
+                                    {['completed', 'completed_with_warnings'].includes(activeJob.status) && (
+                                        <div className="job-finished-message">
+                                            ✅ Sincronizzazione iniziale completata con successo! {selectedSourceId === 'immich' ? 'I metadati degli asset sono stati' : 'I messaggi sono stati'} memorizzati nell'archivio protetto.
                                         </div>
                                     )}
 
-                                    {activeJob.status === 'finished' && (
-                                        <div className="job-finished-message">
-                                            ✅ Sincronizzazione iniziale completata con successo! I messaggi sono stati memorizzati nell'archivio protetto.
-                                        </div>
+                                    {activeJob.status === 'cancelled' && (
+                                        <div className="job-failed-message">Import annullato in sicurezza.</div>
                                     )}
 
                                     {activeJob.status === 'failed' && (

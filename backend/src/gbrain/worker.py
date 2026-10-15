@@ -14,12 +14,14 @@ from gbrain.application.gmail_jobs import (
     best_effort_terminate_job,
     execute_gmail_job,
 )
+from gbrain.application.immich_jobs import execute_immich_job
 from gbrain.config import get_settings
+from gbrain.domain.job_queue import GMAIL_QUEUE_IDENTITY, IMMICH_QUEUE_IDENTITY
 from gbrain.domain.models import ImportJob, ImportJobStatus, OutboxEvent, OutboxStatus
 from gbrain.infrastructure.database import Database
 from gbrain.infrastructure.task_queue import (
-    GMAIL_TASK_NAME,
     GmailJobRetryStrategy,
+    ImmichJobRetryStrategy,
     create_procrastinate_app,
 )
 from gbrain.logging import configure_logging
@@ -28,7 +30,12 @@ settings = get_settings()
 procrastinate_app = create_procrastinate_app(settings)
 logger = logging.getLogger(__name__)
 
-WORKER_QUEUES: tuple[str, ...] = ("maintenance", "outbox", "gmail")
+WORKER_QUEUES: tuple[str, ...] = (
+    "maintenance",
+    "outbox",
+    GMAIL_QUEUE_IDENTITY.queue_name,
+    IMMICH_QUEUE_IDENTITY.queue_name,
+)
 
 
 @procrastinate_app.task(name="gbrain.heartbeat", queue="maintenance")
@@ -66,8 +73,8 @@ async def consume_outbox_placeholder(event_id: str) -> None:
 
 
 @procrastinate_app.task(
-    name=GMAIL_TASK_NAME,
-    queue="gmail",
+    name=GMAIL_QUEUE_IDENTITY.task_name,
+    queue="gmail",  # Contratto: GMAIL_QUEUE_IDENTITY.queue_name
     lock="gmail-heavy-global",
     retry=GmailJobRetryStrategy(
         max_attempts=settings.gmail_job_retry_budget,
@@ -193,6 +200,26 @@ async def gmail_sync(job_id: str, account_id: str, mode: str) -> None:
                 phase="failed_unexpected",
             )
             raise
+    finally:
+        await database.close()
+
+
+@procrastinate_app.task(
+    name=IMMICH_QUEUE_IDENTITY.task_name,
+    queue=IMMICH_QUEUE_IDENTITY.queue_name,
+    retry=ImmichJobRetryStrategy(max_attempts=4),
+)
+async def immich_sync(job_id: str, account_id: str, mode: str) -> None:
+    """Payload privo di segreti: il worker carica e decifra URL/chiave API dal DB."""
+    database = Database(settings)
+    try:
+        await execute_immich_job(
+            database,
+            settings,
+            job_id=job_id,
+            account_id=account_id,
+            mode=mode,
+        )
     finally:
         await database.close()
 

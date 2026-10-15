@@ -103,6 +103,8 @@ class InMemorySession:
         self.sync_configs: dict[UUID, SourceSyncConfig] = {}
         self.backfill_states: dict[UUID, GmailBackfillState] = {}
         self.coverages: dict[UUID, GmailCoverage] = {}
+        self.source_items: dict[UUID, Any] = {}
+        self.revisions: dict[UUID, Any] = {}
 
     async def get(self, entity: Any, ident: Any, **kwargs: Any) -> Any:
         if getattr(entity, "__tablename__", None) == "gmail_checkpoints":
@@ -123,6 +125,8 @@ class InMemorySession:
 
     async def scalar(self, stmt: Any) -> Any:
         stmt_str = str(stmt).lower()
+        if "count(" in stmt_str:
+            return len(self.source_items)
         if "source_client_credentials" in stmt_str:
             for cred in self.credentials.values():
                 return cred
@@ -168,9 +172,65 @@ class InMemorySession:
                 if job.status == ImportJobStatus.PENDING:
                     return job
             return None
+        if "max(" in stmt_str and "source_revisions" in stmt_str:
+            revs = [getattr(r, "revision_number", 1) for r in self.revisions.values()]
+            return max(revs) if revs else 1
+        if "source_items" in stmt_str and "count(" not in stmt_str:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                compiled = getattr(stmt, "compile", lambda: None)()
+                params = getattr(compiled, "params", {})
+                target_ext = params.get("external_id_1") or params.get("external_id")
+                if target_ext is not None:
+                    for item in self.source_items.values():
+                        if getattr(item, "external_id", None) == target_ext:
+                            return item
+                    return None
+            for item in self.source_items.values():
+                return item
+            return None
         return None
 
     async def execute(self, stmt: Any) -> Any:
+        stmt_str = str(stmt).lower()
+        if "source_items" in stmt_str and "count(" not in stmt_str:
+            import re
+
+            rows = []
+            for item in self.source_items.values():
+                rev = next(
+                    (
+                        r
+                        for r in self.revisions.values()
+                        if getattr(r, "source_item_id", None) == item.id
+                    ),
+                    None,
+                )
+                if rev is not None:
+                    rows.append((item, rev))
+            limit_val = getattr(getattr(stmt, "_limit_clause", None), "value", None) or getattr(
+                stmt, "_limit", None
+            )
+            if isinstance(limit_val, int):
+                rows = rows[:limit_val]
+            else:
+                limit_m = re.search(r"limit\s+(\d+)", stmt_str)
+                if limit_m:
+                    rows = rows[: int(limit_m.group(1))]
+
+            class _SourceExecResult:
+                def __init__(self, data: list[Any]) -> None:
+                    self._data = data
+
+                def all(self) -> list[Any]:
+                    return self._data
+
+                def __iter__(self) -> Any:
+                    return iter(self._data)
+
+            return _SourceExecResult(rows)
+
         class _ExecResult:
             def all(self) -> list[Any]:
                 return []
@@ -225,6 +285,14 @@ class InMemorySession:
             self.backfill_states[obj.connector_account_id] = obj
         elif isinstance(obj, GmailCoverage):
             self.coverages[obj.connector_account_id] = obj
+        elif hasattr(obj, "__tablename__") and obj.__tablename__ == "source_items":
+            if getattr(obj, "id", None) is None:
+                obj.id = uuid4()
+            self.source_items[obj.id] = obj
+        elif hasattr(obj, "__tablename__") and obj.__tablename__ == "source_revisions":
+            if getattr(obj, "id", None) is None:
+                obj.id = uuid4()
+            self.revisions[obj.id] = obj
 
     async def delete(self, obj: Any) -> None:
         if isinstance(obj, SourceClientCredential):
@@ -448,11 +516,18 @@ def test_source_catalog_complete_metadata() -> None:
     assert gmail_desc.import_policy is not None
     assert gmail_desc.import_policy.label_restriction == "SENT"
 
-    # Gli altri 8 connettori devono essere coming_soon
+    # Immich è ora disponibile come connettore foto & video
+    immich_desc = get_source_descriptor("immich")
+    assert immich_desc is not None
+    assert immich_desc.status == ConnectorStatus.FULLY_AVAILABLE
+    assert immich_desc.test_available is True
+    assert immich_desc.sync_capabilities is not None
+    assert immich_desc.sync_capabilities.read_only is True
+
+    # Gli altri 7 connettori devono essere coming_soon
     coming_soon_ids = [
         "google_drive",
         "google_calendar",
-        "immich",
         "synology",
         "local_documents",
         "github",
@@ -613,7 +688,7 @@ def test_sources_credentials_validation_and_errors() -> None:
 
     # 7. Sorgente non implementata -> 400
     resp_unsupported = client.post(
-        "/api/sources/immich/credentials",
+        "/api/sources/synology/credentials",
         json={"raw_json": valid_web_json},
     )
     assert resp_unsupported.status_code == 400
@@ -1213,3 +1288,131 @@ def test_gmail_account_and_alias_confirmation_flow() -> None:
     st_data2 = st_resp2.json()
     assert st_data2["aliases_ready"] is True
     assert st_data2["confirmed_aliases"] == ["user@testdomain.com"]
+
+
+def test_immich_sources_endpoints_lifecycle() -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from gbrain.domain.immich import (
+        ImmichAssetType,
+        ImmichCapabilities,
+        ImmichDateSource,
+        ImmichNormalizedAsset,
+        compute_immich_canonical_hash,
+    )
+
+    procrastinate_mock = MagicMock()
+    defer_mock = AsyncMock(return_value=999)
+    procrastinate_mock.configure_task.return_value.defer_async = defer_mock
+
+    client, _session, _owner = _build_test_client(procrastinate_mock=procrastinate_mock)
+
+    # 1. Stato iniziale: non configurato
+    st0 = client.get("/api/sources/immich/status")
+    assert st0.status_code == 200
+    assert st0.json()["configured"] is False
+    assert st0.json()["status"] == "not_configured"
+
+    # 2. Configura credenziali con URL non valido (HTTP su IP pubblico) -> 400
+    bad_cred = client.post(
+        "/api/sources/immich/credentials",
+        json={"base_url": "http://8.8.8.8:2283", "api_key": "my-key"},
+    )
+    assert bad_cred.status_code == 400
+
+    # 3. Configura credenziali con URL valido (loopback) -> 200
+    ok_cred = client.post(
+        "/api/sources/immich/credentials",
+        json={"base_url": "http://127.0.0.1:2283", "api_key": "my-valid-key"},
+    )
+    assert ok_cred.status_code == 200
+    assert ok_cred.json()["source_id"] == "immich"
+
+    # 4. Stato dopo credenziali: configured True
+    st1 = client.get("/api/sources/immich/status")
+    assert st1.status_code == 200
+    assert st1.json()["configured"] is True
+    assert st1.json()["account_connected"] is False
+
+    # 5. Test connessione con mock gateway -> 200 e account connesso
+    mock_user = {"id": "immich-user-1", "email": "immich@test.local", "name": "Immich User"}
+    mock_capabilities = ImmichCapabilities(
+        server_version="1.106.0",
+        version_supported=True,
+        supports_albums=True,
+        supports_people=True,
+        supports_search=True,
+    )
+    with (
+        patch(
+            "gbrain.infrastructure.immich_gateway.ImmichGateway.get_current_user",
+            new=AsyncMock(return_value=mock_user),
+        ),
+        patch(
+            "gbrain.infrastructure.immich_gateway.ImmichGateway.inspect_capabilities",
+            new=AsyncMock(return_value=mock_capabilities),
+        ),
+    ):
+        conn_resp = client.post("/api/sources/immich/test-connection")
+        assert conn_resp.status_code == 200
+        assert conn_resp.json()["connected"] is True
+        assert "1.106.0" in conn_resp.json()["message"]
+
+    # 6. Anteprima con mock gateway
+    dt = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+    chash = compute_immich_canonical_hash(
+        external_id="asset-1",
+        occurred_at=dt,
+        date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+        asset_type=ImmichAssetType.IMAGE,
+        albums=[],
+        description="Foto test",
+        people=[],
+    )
+    mock_asset = ImmichNormalizedAsset(
+        external_id="asset-1",
+        occurred_at=dt,
+        date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+        asset_type=ImmichAssetType.IMAGE,
+        albums=(),
+        description="Foto test",
+        people=(),
+        canonical_hash=chash,
+        provenance_payload={},
+    )
+    with patch(
+        "gbrain.infrastructure.immich_gateway.ImmichGateway.search_period_assets",
+        new=AsyncMock(return_value=[mock_asset]),
+    ):
+        prev_resp = client.get("/api/sources/immich/preview?limit=10")
+        assert prev_resp.status_code == 200
+        prev_data = prev_resp.json()
+        assert prev_data["source_id"] == "immich"
+        assert len(prev_data["sample_items"]) == 1
+        assert prev_data["sample_items"][0]["id"] == "asset-1"
+
+    # 7. Avvio sincronizzazione -> job creato e accodato su Procrastinate
+    sync_resp = client.post(
+        "/api/sources/immich/sync",
+        json={"item_limit": 25, "mode": "full"},
+    )
+    assert sync_resp.status_code == 200
+    sync_data = sync_resp.json()
+    assert sync_data["source_id"] == "immich"
+    assert sync_data["queue_job_id"] == 999
+
+    # 8. Consultazione items importati
+    items_resp = client.get("/api/sources/immich/items")
+    assert items_resp.status_code == 200
+    assert items_resp.json()["source_kind"] == "immich"
+
+    # 9. Disconnessione e rimozione credenziali
+    del_resp = client.delete("/api/sources/immich?remove_credentials=true")
+    assert del_resp.status_code == 200
+    assert del_resp.json()["disconnected"] is True
+    assert del_resp.json()["credentials_removed"] is True
+
+    # 10. Stato finale: non configurato
+    st_final = client.get("/api/sources/immich/status")
+    assert st_final.status_code == 200
+    assert st_final.json()["configured"] is False

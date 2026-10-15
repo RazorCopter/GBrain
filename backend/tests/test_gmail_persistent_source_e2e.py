@@ -22,7 +22,12 @@ import pytest
 
 from gbrain.application.gmail_jobs import _load_job_context, _selection
 from gbrain.application.gmail_oauth import encrypt_credentials
-from gbrain.application.gmail_service import GmailServiceError, PreviewData, SyncConfigInput
+from gbrain.application.gmail_service import (
+    GmailServiceError,
+    PreviewData,
+    SyncConfigInput,
+    enqueue_history_import_job,
+)
 from gbrain.domain.gmail import (
     GMAIL_READONLY_SCOPE,
     GmailCheckpointState,
@@ -37,11 +42,14 @@ from gbrain.domain.models import (
     ImportJob,
     ImportJobStatus,
     OwnerAccount,
+    SourcePolicy,
+    SourcePolicyStatus,
     SourceSyncConfig,
 )
 from gbrain.infrastructure.gmail_gateway import _temporal_query
 from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
-from tests.test_gmail_sync_mode_and_checkpoints import FakeDatabase
+from tests.fakes.gmail_gateway import FakeGmailGateway
+from tests.test_gmail_sync_mode_and_checkpoints import FakeDatabase, _fixture
 from tests.test_sources_wizard_backend import (
     InMemorySession,
     _build_test_client,
@@ -197,6 +205,100 @@ def test_scenario_e_and_f_config_update_invalidates_partial_backfill() -> None:
     )
     assert fp_old != fp_new
     # Invariante: nessun riuso token se query_fingerprint != job_fp
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revision_delta", "override_days", "expect_resume"),
+    [(0, 0, True), (0, 1, False), (1, 0, False)],
+    ids=("same-effective-selection", "different-period", "different-revision"),
+)
+async def test_history_enqueue_resumes_only_the_same_effective_selection(
+    revision_delta: int, override_days: int, expect_resume: bool
+) -> None:
+    session = InMemorySession()
+    account = ConnectorAccount(
+        id=uuid4(),
+        owner_id=uuid4(),
+        connector_kind="gmail",
+        external_account_id="resume@example.test",
+        primary_email="resume@example.test",
+        status=ConnectorAccountStatus.ACTIVE,
+        confirmed_aliases=["resume@example.test"],
+    )
+    after = datetime(2026, 1, 1, tzinfo=UTC)
+    before = datetime(2026, 2, 1, tzinfo=UTC)
+    revision = 3
+    fingerprint = compute_query_fingerprint(
+        selection_label="SENT", after=after, before=before, aliases=account.confirmed_aliases
+    )
+    session.add(account)
+    session.add(
+        SourceSyncConfig(
+            id=uuid4(),
+            connector_account_id=account.id,
+            revision=revision,
+            history_after=after,
+            history_before=before,
+            selection_label="SENT",
+            item_limit=100,
+            request_budget=200,
+            batch_size=25,
+            update_policy="continuous",
+            query_fingerprint=fingerprint,
+        )
+    )
+    session.add(
+        SourcePolicy(
+            id=uuid4(),
+            connector_account_id=account.id,
+            selection_label="SENT",
+            period_after=after,
+            period_before=before,
+            item_limit=100,
+            request_budget=200,
+            batch_size=25,
+            status=SourcePolicyStatus.ACTIVE,
+        )
+    )
+    historical = GmailBackfillState(
+        id=uuid4(),
+        connector_account_id=account.id,
+        config_revision=revision - revision_delta,
+        query_fingerprint=fingerprint,
+        history_after=after,
+        history_before=before,
+        page_token="resume-token",  # noqa: S106
+        status="partial",
+        items_imported=7,
+    )
+    session.add(historical)
+
+    async def enqueue(**_: Any) -> int:
+        return 901
+
+    effective_after = after - timedelta(days=override_days)
+    job = await enqueue_history_import_job(
+        session,  # type: ignore[arg-type]
+        account,
+        enqueue,
+        after=effective_after,
+        before=before,
+    )
+
+    assert job.checkpoint["resumption_token"] == ("resume-token" if expect_resume else None)
+    expected_fp = compute_query_fingerprint(
+        selection_label="SENT",
+        after=effective_after,
+        before=before,
+        aliases=account.confirmed_aliases,
+    )
+    assert job.query_fingerprint == expected_fp
+    assert job.policy_snapshot["after"] == effective_after.isoformat()
+    assert job.policy_snapshot["before"] == before.isoformat()
+    if not expect_resume:
+        assert historical.page_token == "resume-token"  # noqa: S105
+        assert historical.status == "partial"
 
 
 def test_sources_api_config_and_history_endpoints() -> None:
@@ -553,3 +655,179 @@ async def test_repository_idempotent_message_persistence() -> None:
 
     res2 = await repo.persist_batch(account_id, policy_id, [msg], chk)
     assert len(res2) == 1
+
+
+def test_sources_endpoint_pagination_total_independent_from_limit() -> None:
+    import asyncio
+
+    from gbrain.application.gmail_mime import normalize_gmail_message
+    from tests.test_gmail_core import _raw
+
+    client, session, owner = _build_test_client()
+    repo = AsyncPostgresGmailRepository(session)  # type: ignore[arg-type]
+
+    account = ConnectorAccount(
+        id=uuid4(),
+        owner_id=owner.id,
+        connector_kind="gmail",
+        external_account_id="test@gmail.com",
+        primary_email="test@gmail.com",
+        status=ConnectorAccountStatus.ACTIVE,
+    )
+    policy = SourcePolicy(
+        id=uuid4(),
+        connector_account_id=account.id,
+        selection_label="SENT",
+        period_after=datetime(2026, 1, 1, tzinfo=UTC),
+        period_before=datetime(2026, 2, 1, tzinfo=UTC),
+        item_limit=50,
+        request_budget=100,
+    )
+    session.add(account)
+    session.add(policy)
+
+    chk = GmailCheckpointState(
+        account_id=str(account.id),
+        policy_id=str(policy.id),
+        history_id="1",
+        page_token=None,
+        coverage_after=datetime(2026, 1, 1, tzinfo=UTC),
+        coverage_before=datetime(2026, 2, 1, tzinfo=UTC),
+        last_synced_at=datetime.now(UTC),
+        reconciliation_state=GmailReconciliationState.NOT_REQUIRED,
+    )
+
+    msg1 = normalize_gmail_message(
+        _raw("sent-plain-1"), ("owner@example.test", "alias@example.test")
+    )
+    msg2 = normalize_gmail_message(
+        _raw("sent-alias-html"), ("owner@example.test", "alias@example.test")
+    )
+    asyncio.run(repo.persist_batch(account.id, policy.id, [msg1, msg2], chk))
+
+    # Richiediamo con limit=1
+    resp = client.get("/api/gmail/sources?limit=1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["items"]) == 1
+    # total deve essere 2 (conteggio autorevole), NON 1 (dimensione pagina)!
+    assert data["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_backfill_and_coverage_lifecycle_completed_on_full_sync() -> None:
+    from gbrain.application.gmail_jobs import execute_gmail_job
+    from gbrain.domain.gmail import GmailBackfillStateData
+
+    session = InMemorySession()
+    db = FakeDatabase(session)
+
+    owner_id = uuid4()
+    owner = OwnerAccount(
+        id=owner_id,
+        owner_slot=1,
+        username="test_owner2",
+        display_name="Test Owner",
+        password_hash="dummy_hash_for_test",  # noqa: S106
+    )
+    account = ConnectorAccount(
+        id=uuid4(),
+        owner_id=owner_id,
+        connector_kind="gmail",
+        external_account_id="user@example.test",
+        primary_email="user@example.test",
+        status=ConnectorAccountStatus.ACTIVE,
+        confirmed_aliases=["user@example.test"],
+        oauth_token_ciphertext=encrypt_credentials(_synthetic_credentials(), _test_settings()),
+        oauth_token_format_version=1,
+    )
+    policy = SourcePolicy(
+        id=uuid4(),
+        connector_account_id=account.id,
+        selection_label="SENT",
+        period_after=datetime(2026, 1, 1, tzinfo=UTC),
+        period_before=datetime(2026, 2, 1, tzinfo=UTC),
+        item_limit=50,
+        request_budget=100,
+        status=SourcePolicyStatus.ACTIVE,
+    )
+    sync_config = SourceSyncConfig(
+        id=uuid4(),
+        connector_account_id=account.id,
+        revision=1,
+        history_after=policy.period_after,
+        history_before=policy.period_before,
+        query_fingerprint="fp123",
+        item_limit=50,
+        request_budget=100,
+    )
+    job = ImportJob(
+        id=uuid4(),
+        source_kind="gmail",
+        connector_account_id=account.id,
+        source_policy_id=policy.id,
+        status=ImportJobStatus.PENDING,
+        mode="full",
+        checkpoint={"phase": "queued"},
+        policy_snapshot={
+            "purpose": "history",
+            "after": policy.period_after.isoformat(),
+            "before": policy.period_before.isoformat(),
+            "item_limit": 50,
+            "request_budget": 100,
+            "batch_size": 25,
+        },
+        config_revision=1,
+        query_fingerprint="fp123",
+    )
+    session.add(owner)
+    session.add(account)
+    session.add(policy)
+    session.add(sync_config)
+    session.add(job)
+
+    # Inizialmente backfill state in running
+    repo = AsyncPostgresGmailRepository(session)  # type: ignore[arg-type]
+    await repo.upsert_backfill_state(
+        account.id,
+        GmailBackfillStateData(
+            config_revision=1,
+            query_fingerprint="fp123",
+            history_after=policy.period_after,
+            history_before=policy.period_before,
+            page_token=None,
+            status="running",
+            items_imported=0,
+            last_run_at=datetime.now(UTC),
+        ),
+    )
+
+    fake_gw = FakeGmailGateway(_fixture())
+    with patch(
+        "gbrain.application.gmail_jobs.decrypt_credentials", return_value=_synthetic_credentials()
+    ):
+        await execute_gmail_job(
+            cast(Any, db),
+            _test_settings(),
+            job_id=str(job.id),
+            account_id=str(account.id),
+            mode="full",
+            gateway_builder=cast(Any, lambda creds, sett: fake_gw),
+        )
+
+    # Verifica che il job sia completato
+    final_job = await session.get(ImportJob, job.id)
+    assert final_job is not None
+    assert final_job.status in (ImportJobStatus.COMPLETED, ImportJobStatus.COMPLETED_WITH_WARNINGS)
+
+    # Verifica che il backfill sia passato a completed e non sia più running
+    bf = await repo.load_backfill_state(account.id)
+    assert bf is not None
+    assert bf.status == "completed"
+    assert bf.page_token is None
+
+    # Verifica che la coverage sia stata aggiornata
+    cov = await repo.load_coverage(account.id)
+    assert cov is not None
+    assert cov.covered_after == policy.period_after
+    assert cov.covered_before == policy.period_before

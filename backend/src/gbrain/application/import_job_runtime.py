@@ -8,13 +8,13 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gbrain.domain.job_queue import get_source_queue_identity
 from gbrain.domain.models import ImportJob, ImportJobStatus
 from gbrain.infrastructure.procrastinate_jobs import (
     ProcrastinateJobSnapshot,
     fetch_procrastinate_job_snapshot,
     fetch_procrastinate_jobs_batch,
 )
-from gbrain.infrastructure.task_queue import GMAIL_QUEUE_NAME, GMAIL_TASK_NAME
 
 
 class ImportJobRuntimeStatus(enum.StrEnum):
@@ -150,14 +150,16 @@ def is_queue_identity_coherent(
 ) -> bool:
     """Verifica rigorosa dell'identità infrastrutturale del job in coda.
 
-    Controlla che la coda sia esattamente GMAIL_QUEUE_NAME ('gmail'), il task sia
-    GMAIL_TASK_NAME e che args contenga 'job_id' esattamente coincidente con job.id.
-    Args assenti o malformati (non-dict o job_id mancante/diverso) sono trattati
-    come mismatch.
+    Il tipo sorgente deve essere noto al contratto centrale; coda, task e
+    ``args.job_id`` devono coincidere esattamente. Qualunque dato assente o
+    malformato viene trattato conservativamente come mismatch.
     """
-    if queue_snapshot.queue_name != GMAIL_QUEUE_NAME:
+    identity = get_source_queue_identity(job.source_kind)
+    if identity is None:
         return False
-    if queue_snapshot.task_name != GMAIL_TASK_NAME:
+    if queue_snapshot.queue_name != identity.queue_name:
+        return False
+    if queue_snapshot.task_name != identity.task_name:
         return False
     if not isinstance(queue_snapshot.args, dict):
         return False

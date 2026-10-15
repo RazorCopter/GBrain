@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import httpx
+import pytest
+
+from gbrain.domain.immich import (
+    ImmichAssetType,
+    ImmichDateSource,
+    ImmichErrorCategory,
+    ImmichGatewayError,
+    ImmichSelection,
+)
+from gbrain.infrastructure.immich_gateway import (
+    ImmichGateway,
+    validate_immich_url,
+)
+
+
+def test_immich_selection_validation() -> None:
+    # 1. Limite oltre 25 rifiutato
+    with pytest.raises(ValueError, match="item_limit"):
+        ImmichSelection(album_id="album-1", item_limit=26)
+
+    # 2. Mutua esclusione album e intervallo temporale
+    with pytest.raises(ValueError, match="mutuamente esclusive"):
+        ImmichSelection(
+            album_id="album-1",
+            after=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+    # 3. Intervallo temporale after >= before non valido
+    with pytest.raises(ValueError, match="antecedente"):
+        ImmichSelection(
+            after=datetime(2026, 2, 1, tzinfo=UTC),
+            before=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+    # 4. Selezione valida per album
+    sel_album = ImmichSelection(album_id="album-uuid-1", item_limit=25)
+    assert sel_album.album_id == "album-uuid-1"
+    assert sel_album.item_limit == 25
+
+    # 5. Selezione valida per periodo
+    sel_period = ImmichSelection(
+        after=datetime(2026, 1, 1, tzinfo=UTC),
+        before=datetime(2026, 2, 1, tzinfo=UTC),
+        item_limit=10,
+    )
+    assert sel_period.album_id is None
+    assert sel_period.item_limit == 10
+
+
+def test_validate_immich_url_rules() -> None:
+    # HTTPS sempre consentito su qualsiasi host
+    clean_https, is_lan = validate_immich_url("https://immich.mydomain.com/api/../")
+    assert clean_https.startswith("https://immich.mydomain.com")
+    assert not is_lan
+
+    # HTTP consentito su loopback
+    clean_loopback, is_lan_lb = validate_immich_url("http://127.0.0.1:2283/")
+    assert clean_loopback == "http://127.0.0.1:2283"
+    assert is_lan_lb is True
+
+    # HTTP consentito su IP privato LAN RFC 1918
+    clean_lan, is_lan_priv = validate_immich_url("http://192.168.1.50:2283")
+    assert clean_lan == "http://192.168.1.50:2283"
+    assert is_lan_priv is True
+
+    # HTTP rifiutato su IP pubblico (es. 8.8.8.8)
+    with pytest.raises(ImmichGatewayError) as exc_pub:
+        validate_immich_url("http://8.8.8.8:2283")
+    assert exc_pub.value.reason_code == "insecure_http_rejected"
+
+    # Userinfo incorporato nell'URL rifiutato
+    with pytest.raises(ImmichGatewayError) as exc_user:
+        validate_immich_url("http://admin:secret@192.168.1.50:2283")
+    assert exc_user.value.reason_code == "userinfo_forbidden"
+
+    # Query string o fragment nell'URL di base rifiutati
+    with pytest.raises(ImmichGatewayError) as exc_query:
+        validate_immich_url("https://photos.example.com/?token=secret")
+    assert exc_query.value.reason_code == "query_fragment_forbidden"
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_discovery_and_auth_success() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Verifica che l'API key sia presente nell'header corretto
+        assert request.headers.get("x-api-key") == "test-immich-api-key"
+        path = request.url.path
+
+        if path == "/api/server-info/version":
+            return httpx.Response(200, json={"major": 1, "minor": 106, "patch": 4})
+        if path == "/api/users/me":
+            return httpx.Response(
+                200,
+                json={"id": "user-uuid-1", "email": "gian@example.test", "name": "Gian"},
+            )
+        if path == "/api/albums":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "alb-1", "albumName": "Vacanze 2026"},
+                    {"id": "alb-2", "albumName": "Famiglia"},
+                ],
+            )
+        if path == "/api/search/metadata":
+            assert request.method == "POST"
+            return httpx.Response(200, json={"assets": {"items": []}})
+        if path == "/api/people":
+            return httpx.Response(
+                200,
+                json={"people": [{"id": "person-1", "name": "Alice"}], "total": 1},
+            )
+        return httpx.Response(404)
+
+    mock_transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(
+        transport=mock_transport, base_url="https://immich.test"
+    ) as client:
+        gw = ImmichGateway("https://immich.test", "test-immich-api-key", client=client)
+
+        version = await gw.get_server_version()
+        assert version == "1.106.4"
+
+        user = await gw.get_current_user()
+        assert user["id"] == "user-uuid-1"
+        assert user["email"] == "gian@example.test"
+
+        albums = await gw.get_albums()
+        assert len(albums) == 2
+        assert albums[0].name == "Vacanze 2026"
+
+        caps = await gw.inspect_capabilities()
+        assert caps.server_version == "1.106.4"
+        assert caps.supports_albums is True
+        assert caps.supports_people is True
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_error_mapping() -> None:
+    # 1. Autenticazione non valida (401)
+    def auth_err_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"message": "Unauthorized"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(auth_err_handler), base_url="https://immich.test"
+    ) as client:
+        gw = ImmichGateway("https://immich.test", "bad-key", client=client)
+        with pytest.raises(ImmichGatewayError) as exc_auth:
+            await gw.get_current_user()
+        assert exc_auth.value.category == ImmichErrorCategory.AUTH
+        assert exc_auth.value.status_code == 401
+
+    # 2. Rate limit 429 (retryable)
+    def rate_limit_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"message": "Too Many Requests"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(rate_limit_handler), base_url="https://immich.test"
+    ) as client:
+        gw = ImmichGateway("https://immich.test", "key", client=client)
+        with pytest.raises(ImmichGatewayError) as exc_rl:
+            await gw.get_albums()
+        assert exc_rl.value.category == ImmichErrorCategory.TRANSIENT
+        assert exc_rl.value.retryable is True
+
+
+def test_immich_asset_normalization_and_provenance() -> None:
+    gw = ImmichGateway("https://immich.test", "fake-key")
+
+    raw_asset = {
+        "id": "asset-uuid-1234",
+        "type": "IMAGE",
+        "dateTimeOriginal": "2026-06-15T14:30:00.000Z",
+        "fileCreatedAt": "2026-06-15T15:00:00.000Z",
+        "originalFileName": "IMG_20260615.jpg",
+        "exifInfo": {
+            "description": "Tramonto sul mare",
+            "model": "Pixel 8 Pro",
+        },
+        "people": [
+            {"id": "p-1", "name": "Mario Rossi"},
+            {"id": "p-2", "name": ""},  # Nome vuoto -> deve essere escluso
+        ],
+    }
+
+    normalized = gw.normalize_asset(raw_asset)
+
+    assert normalized.external_id == "asset-uuid-1234"
+    assert normalized.occurred_at == datetime(2026, 6, 15, 14, 30, tzinfo=UTC)
+    assert normalized.date_source == ImmichDateSource.DATE_TIME_ORIGINAL
+    assert normalized.asset_type == ImmichAssetType.IMAGE
+    assert normalized.description == "Tramonto sul mare"
+    # Solo persone etichettate con nome
+    assert len(normalized.people) == 1
+    assert normalized.people[0].name == "Mario Rossi"
+    # Hash canonico calcolato
+    assert len(normalized.canonical_hash) == 64
+    assert "original_filename" not in normalized.provenance_payload
+    assert normalized.provenance_payload["selected_date_source"] == "dateTimeOriginal"
+    assert normalized.provenance_payload["metadata_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_immich_fetch_album_bounded_to_limit() -> None:
+    # Genera 30 asset fittizi
+    sample_assets = [
+        {
+            "id": f"asset-{i}",
+            "type": "IMAGE",
+            "fileCreatedAt": "2026-05-01T10:00:00.000Z",
+        }
+        for i in range(30)
+    ]
+
+    def album_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "alb-1",
+                "albumName": "Test Album",
+                "assets": sample_assets,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(album_handler), base_url="https://immich.test"
+    ) as client:
+        gw = ImmichGateway("https://immich.test", "key", client=client)
+        album_info, assets = await gw.fetch_album_assets("alb-1", limit=25)
+
+        assert album_info.name == "Test Album"
+        # Deve essere tassativamente limitato a max 25
+        assert len(assets) == 25
+        assert assets[0].external_id == "asset-0"
+        assert assets[24].external_id == "asset-24"

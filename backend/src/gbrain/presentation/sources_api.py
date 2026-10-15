@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -12,6 +13,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import desc as sa_desc
+from sqlalchemy import select
 
 from gbrain.application.crypto import encrypt_json
 from gbrain.application.gmail_oauth import (
@@ -39,6 +41,7 @@ from gbrain.application.gmail_service import (
     save_policy,
     update_sync_config,
 )
+from gbrain.application.import_job_cancel import cancel_import_job
 from gbrain.application.import_job_runtime import build_import_job_runtime
 from gbrain.domain.connectors import (
     RequestBudget,
@@ -46,7 +49,13 @@ from gbrain.domain.connectors import (
     get_source_catalog,
     get_source_descriptor,
 )
-from gbrain.domain.models import ConnectorAccountStatus, ImportJob
+from gbrain.domain.job_queue import GMAIL_QUEUE_IDENTITY, IMMICH_QUEUE_IDENTITY
+from gbrain.domain.models import (
+    ConnectorAccount,
+    ConnectorAccountStatus,
+    ImportJob,
+    ImportJobStatus,
+)
 from gbrain.infrastructure.gmail_gateway import OfficialGmailGateway
 from gbrain.infrastructure.gmail_rate_limiter import PostgresGmailRateLimiter
 from gbrain.infrastructure.gmail_repository import AsyncPostgresGmailRepository
@@ -68,6 +77,8 @@ from gbrain.presentation.schemas import (
     GmailPreviewResponse,
     HistoryImportRequest,
     HistoryPreviewRequest,
+    ImmichAssetListResponse,
+    ImmichAssetResponse,
     ImportJobResponse,
     ImportPolicyDescriptorResponse,
     LanWarningResponse,
@@ -87,6 +98,7 @@ from gbrain.presentation.schemas import (
     SourceTestConnectionResponse,
 )
 
+GMAIL_TASK_NAME = GMAIL_QUEUE_IDENTITY.task_name
 logger = logging.getLogger(__name__)
 
 sources_router = APIRouter(prefix="/sources", tags=["sources"])
@@ -239,8 +251,6 @@ async def get_source_status(
         checkpoint_history_id = None
         checkpoint_page_token = None
         if account:
-            from sqlalchemy import select
-
             from gbrain.domain.models import GmailCheckpoint
             from gbrain.infrastructure.gmail_repository import checkpoint_from_model
 
@@ -306,7 +316,13 @@ async def get_source_status(
                     status=cov.status,
                     last_completed_at=cov.last_completed_at,
                 )
-                if cov.query_fingerprint != cfg.query_fingerprint or cov.is_legacy:
+                if (
+                    cov.config_revision != cfg.revision
+                    or cov.query_fingerprint != cfg.query_fingerprint
+                    or cov.covered_after != cfg.history_after
+                    or cov.covered_before != cfg.history_before
+                    or cov.is_legacy
+                ):
                     requires_import = True
             else:
                 requires_import = True
@@ -329,18 +345,93 @@ async def get_source_status(
             if checkpoint_model and checkpoint_model.last_sync_at:
                 last_sync_at = checkpoint_model.last_sync_at
 
-        active_job_orm = None
+        latest_job_orm = None
+        latest_job_resp = None
         active_job_resp = None
+        active_job_matches_config = False
         if account is not None:
-            active_job_orm = await session.scalar(
+            latest_job_orm = await session.scalar(
                 select(ImportJob)
                 .where(ImportJob.connector_account_id == account.id)
                 .order_by(sa_desc(ImportJob.created_at))
                 .limit(1)
             )
-            if active_job_orm is not None:
-                runtime = await build_import_job_runtime(session, active_job_orm)
-                active_job_resp = ImportJobResponse.from_job_and_runtime(active_job_orm, runtime)
+            if latest_job_orm is not None:
+                runtime = await build_import_job_runtime(session, latest_job_orm)
+                latest_job_resp = ImportJobResponse.from_job_and_runtime(latest_job_orm, runtime)
+                if latest_job_orm.status in {ImportJobStatus.PENDING, ImportJobStatus.RUNNING}:
+                    active_job_resp = latest_job_resp
+                    snapshot = latest_job_orm.policy_snapshot or {}
+                    # La selezione effettiva può materializzare un upper bound anche
+                    # quando la configurazione è open-ended. Per stabilire se il job
+                    # appartiene alla configurazione corrente si usa esclusivamente
+                    # l'identità configurata catturata all'enqueue.
+                    config_fingerprint = snapshot.get("config_query_fingerprint")
+                    if config_fingerprint is None:
+                        # Compatibilità esplicita con job legacy, nei quali
+                        # ImportJob.query_fingerprint era la fingerprint configurata.
+                        config_fingerprint = latest_job_orm.query_fingerprint
+                    active_job_matches_config = bool(
+                        sync_config_resp
+                        and latest_job_orm.config_revision == sync_config_resp.revision
+                        and config_fingerprint == sync_config_resp.query_fingerprint
+                    )
+
+        selection_matches_config = True
+        period_matches_config = True
+        coverage_matches_config = True
+        coverage_period_matches_config = True
+        selection_complete = False
+        incomplete_reason = None
+
+        if sync_config_resp and backfill_resp:
+            selection_matches_config = bool(
+                backfill_resp.config_revision == sync_config_resp.revision
+                and backfill_resp.query_fingerprint == sync_config_resp.query_fingerprint
+            )
+            period_matches_config = bool(
+                backfill_resp.history_after == sync_config_resp.history_after
+                and backfill_resp.history_before == sync_config_resp.history_before
+            )
+            selection_complete = bool(
+                selection_matches_config
+                and period_matches_config
+                and backfill_resp.status == "completed"
+                and not backfill_resp.page_token
+            )
+            if not selection_matches_config:
+                incomplete_reason = (
+                    "Configurazione modificata: la scansione mostrata non è quella corrente"
+                )
+            elif not period_matches_config:
+                incomplete_reason = "Periodo importato diverso dal periodo desiderato"
+            elif not selection_complete:
+                if backfill_resp.status == "running":
+                    incomplete_reason = "Importazione in corso..."
+                elif backfill_resp.status == "partial":
+                    incomplete_reason = (
+                        "Scansione parziale (token di continuazione presente o limite raggiunto)"
+                    )
+                elif backfill_resp.status == "failed":
+                    incomplete_reason = (
+                        f"Scansione fallita ({backfill_resp.last_error_code or 'errore'})"
+                    )
+        elif sync_config_resp and not backfill_resp:
+            selection_complete = False
+            incomplete_reason = "Scansione iniziale non ancora eseguita"
+
+        if sync_config_resp and coverage_resp:
+            coverage_matches_config = bool(
+                coverage_resp.config_revision == sync_config_resp.revision
+                and coverage_resp.query_fingerprint == sync_config_resp.query_fingerprint
+                and not coverage_resp.is_legacy
+            )
+            coverage_period_matches_config = bool(
+                coverage_resp.covered_after == sync_config_resp.history_after
+                and coverage_resp.covered_before == sync_config_resp.history_before
+            )
+        elif sync_config_resp and not coverage_resp:
+            coverage_matches_config = False
 
         return SourceStatusResponse(
             source_id=source_id,
@@ -367,6 +458,89 @@ async def get_source_status(
             missing_count=coverage_resp.missing_count if coverage_resp else 0,
             requires_import=requires_import,
             last_sync_at=last_sync_at,
+            selection_matches_config=selection_matches_config,
+            period_matches_config=period_matches_config,
+            coverage_matches_config=coverage_matches_config,
+            coverage_period_matches_config=coverage_period_matches_config,
+            selection_complete=selection_complete,
+            incomplete_reason=incomplete_reason,
+            latest_job=latest_job_resp,
+            active_job=active_job_resp,
+            active_job_matches_config=active_job_matches_config,
+        )
+
+    if source_id == "immich":
+        from gbrain.infrastructure.immich_repository import AsyncPostgresImmichRepository
+
+        cred = await SourceCredentialsRepository.get_credentials(
+            session, principal.owner.id, "immich"
+        )
+        configured = cred is not None and cred.is_active
+        raw_payload = (
+            await SourceCredentialsRepository.get_decrypted_payload(
+                session, settings.source_credentials_encryption_key, principal.owner.id, "immich"
+            )
+            if configured
+            else None
+        )
+        immich_base_url = raw_payload.get("base_url") if raw_payload else None
+        lan_warn = detect_lan_http_warning(immich_base_url) if immich_base_url else lan_warning
+
+        account = await session.scalar(
+            select(ConnectorAccount).where(
+                ConnectorAccount.owner_id == principal.owner.id,
+                ConnectorAccount.connector_kind == "immich",
+            )
+        )
+        account_connected = account is not None and account.status == ConnectorAccountStatus.ACTIVE
+
+        latest_job_resp = None
+        active_job_resp = None
+        if account is not None:
+            latest_job_orm = await session.scalar(
+                select(ImportJob)
+                .where(
+                    ImportJob.source_kind == "immich",
+                    ImportJob.connector_account_id == account.id,
+                )
+                .order_by(sa_desc(ImportJob.created_at))
+                .limit(1)
+            )
+            if latest_job_orm is not None:
+                runtime = await build_import_job_runtime(session, latest_job_orm)
+                latest_job_resp = ImportJobResponse.from_job_and_runtime(latest_job_orm, runtime)
+                if latest_job_orm.status in {ImportJobStatus.PENDING, ImportJobStatus.RUNNING}:
+                    active_job_resp = latest_job_resp
+
+        immich_repo = AsyncPostgresImmichRepository(session)
+        total_assets = await immich_repo.count_imported_assets(principal.owner.id)
+
+        st = (
+            SourceOperationalStatus.CONNECTED.value
+            if account_connected
+            else (
+                SourceOperationalStatus.CREDENTIALS_CONFIGURED.value
+                if configured
+                else SourceOperationalStatus.NOT_CONFIGURED.value
+            )
+        )
+
+        return SourceStatusResponse(
+            source_id=source_id,
+            availability=descriptor.status.value,
+            configured=configured,
+            auth_source="db_encrypted" if configured else None,
+            client_id_preview=immich_base_url,
+            account_connected=account_connected,
+            external_account_id=account.external_account_id if account else None,
+            primary_email=account.primary_email if account else None,
+            status=st,
+            detected_callback_url=detected_callback,
+            lan_warning=lan_warn,
+            initial_import_completed=total_assets > 0,
+            has_checkpoint=latest_job_resp is not None,
+            selection_complete=total_assets > 0,
+            latest_job=latest_job_resp,
             active_job=active_job_resp,
         )
 
@@ -395,6 +569,54 @@ async def configure_source_credentials(
     principal: CsrfPrincipalDep,
 ) -> SourceCredentialsSaveResponse:
     """Configura o aggiorna le credenziali client della fonte crittografandole con AES-256-GCM."""
+    if source_id == "immich":
+        from gbrain.application.crypto import encrypt_payload
+        from gbrain.infrastructure.immich_gateway import validate_immich_url
+
+        base_url = payload.base_url
+        api_key = payload.api_key
+        if payload.raw_json and isinstance(payload.raw_json, dict):
+            base_url = base_url or payload.raw_json.get("base_url")
+            api_key = api_key or payload.raw_json.get("api_key")
+
+        if not base_url or not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Specificare sia 'base_url' (URL dell'istanza) sia 'api_key' per Immich.",
+            )
+
+        try:
+            clean_url, _ = validate_immich_url(base_url)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"URL istanza Immich non valido: {exc}",
+            ) from exc
+
+        creds_dict = {"base_url": clean_url, "api_key": api_key.strip()}
+        ciphertext = encrypt_payload(
+            json.dumps(creds_dict).encode("utf-8"),
+            settings.source_credentials_encryption_key,
+        )
+
+        await SourceCredentialsRepository.save_credentials(
+            session,
+            principal.owner.id,
+            "immich",
+            auth_method="api_key",
+            client_type="api_token",
+            client_id=clean_url,
+            encrypted_credentials=ciphertext,
+        )
+
+        return SourceCredentialsSaveResponse(
+            source_id="immich",
+            client_id=clean_url,
+            client_type="api_token",
+            configured_redirect_uri=None,
+            message="Credenziali Immich configurate con successo e cifrate con AES-256-GCM.",
+        )
+
     if source_id != "gmail":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -490,6 +712,73 @@ async def test_source_connection(
     principal: CsrfPrincipalDep,
 ) -> SourceTestConnectionResponse:
     """Verifica live dello stato di connettività verso le API remote del provider della fonte."""
+    if source_id == "immich":
+        from gbrain.infrastructure.immich_gateway import ImmichGateway
+
+        cred_payload = await SourceCredentialsRepository.get_decrypted_payload(
+            session, settings.source_credentials_encryption_key, principal.owner.id, "immich"
+        )
+        if not cred_payload or not cred_payload.get("base_url") or not cred_payload.get("api_key"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Credenziali Immich non configurate. Salva prima l'URL e l'API key.",
+            )
+
+        start_t = datetime.now(UTC)
+        try:
+            gw = ImmichGateway(cred_payload["base_url"], cred_payload["api_key"])
+            user = await gw.get_current_user()
+            capabilities = await gw.inspect_capabilities()
+            version = capabilities.server_version
+            latency = (datetime.now(UTC) - start_t).total_seconds() * 1000.0
+
+            # Crea o aggiorna ConnectorAccount attivo
+            account = await session.scalar(
+                select(ConnectorAccount).where(
+                    ConnectorAccount.owner_id == principal.owner.id,
+                    ConnectorAccount.connector_kind == "immich",
+                )
+            )
+            ext_id = f"immich_{user['id']}"
+            primary_email = user.get("email") or f"{user.get('name', 'user')}@immich.local"
+            if account is None:
+                account = ConnectorAccount(
+                    id=uuid.uuid4(),
+                    owner_id=principal.owner.id,
+                    connector_kind="immich",
+                    external_account_id=ext_id,
+                    primary_email=primary_email,
+                    status=ConnectorAccountStatus.ACTIVE,
+                    authorized_at=datetime.now(UTC),
+                    last_connection_test_at=datetime.now(UTC),
+                )
+                session.add(account)
+            else:
+                account.status = ConnectorAccountStatus.ACTIVE
+                account.external_account_id = ext_id
+                account.primary_email = primary_email
+                account.last_connection_test_at = datetime.now(UTC)
+            await session.commit()
+
+            return SourceTestConnectionResponse(
+                source_id="immich",
+                connected=True,
+                latency_ms=latency,
+                primary_identity=user.get("email") or user.get("name"),
+                aliases=[],
+                message=f"Connessione a Immich v{version} verificata con successo ({user.get('name')})",
+            )
+        except Exception as exc:
+            latency = (datetime.now(UTC) - start_t).total_seconds() * 1000.0
+            return SourceTestConnectionResponse(
+                source_id="immich",
+                connected=False,
+                latency_ms=latency,
+                primary_identity=None,
+                aliases=[],
+                message=f"Connessione a Immich fallita: {exc}",
+            )
+
     if source_id != "gmail":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -570,9 +859,77 @@ async def preview_source_import(
     principal: PrincipalDep,
     period_after: Annotated[datetime | None, Query()] = None,
     period_before: Annotated[datetime | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    album_id: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=25)] = 10,
 ) -> SourcePreviewResponse:
     """Restituisce un'anteprima read-only dei messaggi inviati senza persistere nulla a database."""
+    if source_id == "immich":
+        from gbrain.infrastructure.immich_gateway import ImmichGateway
+
+        cred_payload = await SourceCredentialsRepository.get_decrypted_payload(
+            session, settings.source_credentials_encryption_key, principal.owner.id, "immich"
+        )
+        if not cred_payload or not cred_payload.get("base_url") or not cred_payload.get("api_key"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Credenziali Immich non configurate.",
+            )
+
+        try:
+            gw = ImmichGateway(cred_payload["base_url"], cred_payload["api_key"])
+            bounded_limit = min(limit, 25)
+            if album_id and (period_after is not None or period_before is not None):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Selezionare un album oppure un periodo, non entrambi.",
+                )
+            if album_id:
+                _, assets = await gw.fetch_album_assets(album_id, limit=bounded_limit)
+                after_dt = None
+                before_dt = None
+            else:
+                before_dt = period_before or datetime.now(UTC)
+                after_dt = period_after or (before_dt - timedelta(days=30))
+                if after_dt >= before_dt:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Il limite inferiore UTC deve precedere quello superiore (intervallo [after, before)).",
+                    )
+                assets = await gw.search_period_assets(after_dt, before_dt, limit=bounded_limit)
+
+            samples = [
+                SourcePreviewSampleItem(
+                    id=a.external_id,
+                    date=a.occurred_at,
+                    subject=a.description or f"Asset ({a.asset_type})",
+                    to=[p.name for p in a.people],
+                    media_type=a.asset_type.value,
+                    description=a.description,
+                    albums=[al.name for al in a.albums],
+                )
+                for a in assets
+            ]
+            return SourcePreviewResponse(
+                source_id="immich",
+                estimated_count=len(assets),
+                period_after=after_dt,
+                period_before=before_dt,
+                sample_items=samples,
+                query=(
+                    f"immich_album({album_id}, limit={bounded_limit})"
+                    if album_id
+                    else f"immich_period_search(limit={bounded_limit})"
+                ),
+                note="Anteprima read-only di metadati Immich (max 25 asset; nessuna persistenza)",
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Errore durante l'anteprima Immich: {exc}",
+            ) from exc
+
     if source_id != "gmail":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -710,6 +1067,64 @@ async def trigger_source_sync(
     principal: CsrfPrincipalDep,
 ) -> SourceSyncResponse:
     """Accoda un job Procrastinate asincrono di importazione o sincronizzazione della fonte."""
+    if source_id == "immich":
+        account = await session.scalar(
+            select(ConnectorAccount).where(
+                ConnectorAccount.owner_id == principal.owner.id,
+                ConnectorAccount.connector_kind == "immich",
+                ConnectorAccount.status == ConnectorAccountStatus.ACTIVE,
+            )
+        )
+        if account is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Account Immich non connesso o non attivo. Esegui prima il test di connessione.",
+            )
+
+        bounded_limit = min(body.item_limit, 25)
+        immich_job = ImportJob(
+            id=uuid.uuid4(),
+            source_kind="immich",
+            connector_account_id=account.id,
+            mode="full",
+            status=ImportJobStatus.PENDING,
+            checkpoint={"phase": "queued", "item_limit": bounded_limit},
+            policy_snapshot={
+                "album_id": body.album_id,
+                "after": body.period_after.isoformat() if body.period_after else None,
+                "before": body.period_before.isoformat() if body.period_before else None,
+                "item_limit": bounded_limit,
+            },
+        )
+        session.add(immich_job)
+        await session.commit()
+        await session.refresh(immich_job)
+
+        queue_job_id = None
+        try:
+            queue_job_id = await procrastinate.configure_task(
+                IMMICH_QUEUE_IDENTITY.task_name,
+                queue=IMMICH_QUEUE_IDENTITY.queue_name,
+                lock=f"immich-sync-{account.id}",
+            ).defer_async(
+                job_id=str(immich_job.id),
+                account_id=str(account.id),
+                mode="full",
+            )
+            immich_job.queue_job_id = queue_job_id
+            await session.commit()
+        except Exception as exc:
+            logger.warning("Accodamento Procrastinate Immich non riuscito: %s", exc)
+
+        return SourceSyncResponse(
+            source_id="immich",
+            job_id=immich_job.id,
+            queue_job_id=queue_job_id,
+            status="pending",
+            mode="full",
+            message=f"Job di sincronizzazione Immich avviato con limite massimo di {bounded_limit} asset.",
+        )
+
     if source_id != "gmail":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -727,12 +1142,10 @@ async def trigger_source_sync(
             detail="Account Gmail non connesso o non attivo.",
         )
 
-    from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
-
     async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
         return await procrastinate.configure_task(
-            GMAIL_TASK_NAME,
-            queue="gmail",
+            GMAIL_QUEUE_IDENTITY.task_name,
+            queue=GMAIL_QUEUE_IDENTITY.queue_name,
             lock="gmail-heavy-global",
         ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
 
@@ -961,12 +1374,11 @@ async def import_history_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Account Gmail non connesso o non attivo.",
         )
-    from gbrain.infrastructure.task_queue import GMAIL_TASK_NAME
 
     async def enqueue(*, job_id: str, account_id: str, mode: str) -> int:
         return await procrastinate.configure_task(
-            GMAIL_TASK_NAME,
-            queue="gmail",
+            GMAIL_QUEUE_IDENTITY.task_name,
+            queue=GMAIL_QUEUE_IDENTITY.queue_name,
             lock="gmail-heavy-global",
         ).defer_async(job_id=job_id, account_id=account_id, mode=mode)
 
@@ -1053,6 +1465,33 @@ async def disconnect_source(
     remove_credentials: Annotated[bool, Query()] = False,
 ) -> SourceDisconnectResponse:
     """Disconnette la fonte, revoca i token remoti ed opzionalmente rimuove le credenziali client memorizzate."""
+    if source_id == "immich":
+        account = await session.scalar(
+            select(ConnectorAccount).where(
+                ConnectorAccount.owner_id == principal.owner.id,
+                ConnectorAccount.connector_kind == "immich",
+            )
+        )
+        disconnected = False
+        if account is not None:
+            account.status = ConnectorAccountStatus.REVOKED
+            disconnected = True
+            await session.commit()
+
+        credentials_removed = False
+        if remove_credentials:
+            credentials_removed = await SourceCredentialsRepository.delete_credentials(
+                session, principal.owner.id, "immich"
+            )
+
+        return SourceDisconnectResponse(
+            source_id="immich",
+            disconnected=disconnected,
+            remote_revoked=False,
+            credentials_removed=credentials_removed,
+            message="Fonte Immich disconnessa con successo.",
+        )
+
     if source_id != "gmail":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1172,3 +1611,79 @@ async def source_oauth_callback(
             url=f"/sources?error={exc.safe_message}",
             status_code=status.HTTP_302_FOUND,
         )
+
+
+@sources_router.post("/{source_id}/jobs/{job_id}/cancel", response_model=ImportJobResponse)
+async def cancel_source_job(
+    source_id: str,
+    job_id: uuid.UUID,
+    session: DbSession,
+    procrastinate: ProcrastinateApp,
+    principal: CsrfPrincipalDep,
+) -> ImportJobResponse:
+    """Annulla in sicurezza un job appartenente alla fonte e al proprietario correnti."""
+    if source_id != "immich":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lavoro non trovato")
+
+    job = await session.scalar(
+        select(ImportJob)
+        .join(ConnectorAccount, ImportJob.connector_account_id == ConnectorAccount.id)
+        .where(
+            ImportJob.id == job_id,
+            ImportJob.source_kind == source_id,
+            ConnectorAccount.connector_kind == source_id,
+            ConnectorAccount.owner_id == principal.owner.id,
+        )
+    )
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Lavoro Immich non trovato"
+        )
+
+    job = await cancel_import_job(
+        session,
+        procrastinate,
+        job,
+        expected_source_kind=source_id,
+    )
+    runtime = await build_import_job_runtime(session, job)
+    return ImportJobResponse.from_job_and_runtime(job, runtime)
+
+
+@sources_router.get("/{source_id}/items", response_model=ImmichAssetListResponse)
+async def list_source_items(
+    source_id: str,
+    session: DbSession,
+    principal: PrincipalDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> ImmichAssetListResponse:
+    """Restituisce gli item/asset importati per la fonte specificata con conteggio autorevole."""
+    if source_id == "immich":
+        from gbrain.infrastructure.immich_repository import AsyncPostgresImmichRepository
+
+        repo = AsyncPostgresImmichRepository(session)
+        raw_items = await repo.list_imported_assets(principal.owner.id, limit=limit)
+        total = await repo.count_imported_assets(principal.owner.id)
+
+        responses = [
+            ImmichAssetResponse(
+                source_item_id=item["source_item_id"],
+                external_id=item["external_id"],
+                occurred_at=datetime.fromisoformat(item["occurred_at"])
+                if item.get("occurred_at")
+                else None,
+                date_source=item.get("date_source", "unknown"),
+                asset_type=item.get("asset_type", "IMAGE"),
+                description=item.get("description"),
+                albums=item.get("albums", []),
+                people=item.get("people", []),
+                evidence=item.get("evidence", {}),
+            )
+            for item in raw_items
+        ]
+        return ImmichAssetListResponse(items=responses, total=total, source_kind="immich")
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Consultazione item non disponibile per la sorgente '{source_id}'.",
+    )

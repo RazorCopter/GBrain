@@ -711,6 +711,9 @@ class TestGmailJobApiEndpoints:
         assert data["active_job"]["queue_job_id"] == 700
         assert data["active_job"]["runtime"]["status"] == "scheduled_retry"
         assert data["active_job"]["runtime"]["active"] is True
+        # Il job resta diagnosticabile e blocca concorrenza anche se appartiene a una
+        # selezione precedente; non deve però essere etichettato come corrente.
+        assert data["active_job_matches_config"] is False
 
     def test_cancel_job_endpoint_404_when_not_owned(
         self,

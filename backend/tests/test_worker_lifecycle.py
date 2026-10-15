@@ -173,22 +173,27 @@ async def test_run_worker_forwards_expected_parameters() -> None:
 
     assert captured_kwargs == {
         "concurrency": settings.worker_concurrency,
-        "queues": ["maintenance", "outbox", "gmail"],
+        "queues": ["maintenance", "outbox", "gmail", "immich"],
         "wait": True,
         "listen_notify": True,
         "name": "gbrain-worker",
     }
     assert captured_kwargs["queues"] == list(WORKER_QUEUES)
     assert "gmail" in captured_kwargs["queues"]
+    assert "immich" in captured_kwargs["queues"]
 
 
 def test_gmail_job_and_worker_tasks_registered_on_procrastinate_app() -> None:
-    """Dimostra che i task attesi (incluso il job Gmail) sono registrati sull'istanza worker."""
+    """Dimostra che i task attesi (incluso il job Gmail e Immich) sono registrati sull'istanza worker."""
+    from gbrain.infrastructure.task_queue import IMMICH_TASK_NAME
     from gbrain.worker import WORKER_QUEUES, procrastinate_app, settings
 
     tasks = procrastinate_app.tasks
     assert GMAIL_TASK_NAME in tasks, (
         f"Task {GMAIL_TASK_NAME} non registrato su worker.procrastinate_app"
+    )
+    assert IMMICH_TASK_NAME in tasks, (
+        f"Task {IMMICH_TASK_NAME} non registrato su worker.procrastinate_app"
     )
 
     gmail_task = tasks[GMAIL_TASK_NAME]

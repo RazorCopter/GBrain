@@ -26,6 +26,7 @@ from gbrain.domain.connectors import (
     RequestBudget,
 )
 from gbrain.domain.gmail import (
+    GmailBackfillStateData,
     GmailCheckpointState,
     GmailCursor,
     GmailHistoryCursor,
@@ -161,10 +162,13 @@ async def _load_job_context(
             raise GmailJobPermanentError("Alias owner Gmail non confermati")
         repository = AsyncPostgresGmailRepository(session)
         config = await repository.load_sync_config(account.id, for_update=True)
+        config_query_fingerprint = (job.policy_snapshot or {}).get(
+            "config_query_fingerprint", job.query_fingerprint
+        )
         if job.config_revision is not None and (
             config is None
             or config.revision != job.config_revision
-            or (job.query_fingerprint and config.query_fingerprint != job.query_fingerprint)
+            or (config_query_fingerprint and config.query_fingerprint != config_query_fingerprint)
         ):
             logger.warning(
                 "Job Gmail stale bloccato prima dell'avvio: job_id=%s account_id=%s "
@@ -283,6 +287,20 @@ async def best_effort_terminate_job(
                 else:
                     cp = {**cp, "phase": phase}
                 job.checkpoint = cp
+
+                if job.connector_account_id is not None:
+                    try:
+                        repo = AsyncPostgresGmailRepository(session)
+                        bf = await repo.load_backfill_state(job.connector_account_id)
+                        if bf is not None and bf.status == "running":
+                            bf.status = "failed" if status == ImportJobStatus.FAILED else "partial"
+                            bf.last_error_code = error_code
+                    except Exception:
+                        logger.warning(
+                            "Aggiornamento best-effort backfill fallito: job_id=%s",
+                            job.id,
+                        )
+
                 await session.commit()
             except Exception:
                 await session.rollback()
@@ -397,6 +415,7 @@ async def _persist_page(
     messages: list[object],
     checkpoint: GmailCheckpointState,
     *,
+    config_query_fingerprint: str | None = None,
     removed_ids: frozenset[str] = frozenset(),
     out_of_scope_ids: frozenset[str] = frozenset(),
     gaps: Sequence[GmailItemGapData] = (),
@@ -412,6 +431,7 @@ async def _persist_page(
             policy_id,
             typed_messages,
             checkpoint,
+            config_query_fingerprint=config_query_fingerprint,
             removed_external_ids=removed_ids,
             out_of_scope_external_ids=out_of_scope_ids,
             gaps=gaps,
@@ -630,6 +650,9 @@ async def _run_incremental(
             job.source_policy_id,
             messages,
             current,
+            config_query_fingerprint=(job.policy_snapshot or {}).get(
+                "config_query_fingerprint", job.query_fingerprint
+            ),
             removed_ids=frozenset(page.deleted_message_ids),
             out_of_scope_ids=frozenset(out_of_scope),
             gaps=page_gaps,
@@ -891,6 +914,34 @@ async def execute_gmail_job(
                 job.id,
                 final_job.not_imported_items or 0,
             )
+
+        if (job.policy_snapshot.get("purpose") == "history") or (mode == GmailSyncMode.FULL.value):
+            async with database.session_factory() as session:
+                repo = AsyncPostgresGmailRepository(session)
+                bf_status = "partial" if is_partial else "completed"
+                await repo.upsert_backfill_state(
+                    account.id,
+                    GmailBackfillStateData(
+                        config_revision=job.config_revision or 1,
+                        query_fingerprint=job.query_fingerprint or "",
+                        history_after=selection.after,
+                        history_before=selection.before,
+                        page_token=checkpoint.page_token if is_partial else None,
+                        status=bf_status,
+                        items_imported=final_job.imported_items if final_job else processed,
+                        last_run_at=datetime.now(UTC),
+                        last_error_code=None,
+                    ),
+                )
+                if not is_partial:
+                    await repo.update_coverage(
+                        account.id,
+                        covered_after=selection.after,
+                        covered_before=selection.before,
+                        query_fingerprint=job.query_fingerprint,
+                        config_revision=job.config_revision,
+                    )
+                await session.commit()
     except (asyncio.CancelledError, TimeoutError):
         if await _cancel_requested(database, parsed_job_id):
             await best_effort_terminate_job(

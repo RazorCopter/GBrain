@@ -484,7 +484,15 @@ class SourceStatusResponse(BaseModel):
     missing_count: int = 0
     requires_import: bool = False
     last_sync_at: datetime | None = None
+    selection_matches_config: bool = True
+    period_matches_config: bool = True
+    coverage_matches_config: bool = True
+    coverage_period_matches_config: bool = True
+    selection_complete: bool = False
+    incomplete_reason: str | None = None
+    latest_job: ImportJobResponse | None = None
     active_job: ImportJobResponse | None = None
+    active_job_matches_config: bool = False
 
 
 class SourceCredentialsUploadRequest(BaseModel):
@@ -492,6 +500,8 @@ class SourceCredentialsUploadRequest(BaseModel):
     client_id: str | None = None
     client_secret: str | None = None
     redirect_uri_override: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
 
 
 class SourceCredentialsSaveResponse(BaseModel):
@@ -509,6 +519,9 @@ class SourceTestConnectionResponse(BaseModel):
     primary_identity: str | None = None
     aliases: list[str] = Field(default_factory=list)
     message: str
+    server_version: str | None = None
+    version_supported: bool | None = None
+    capabilities: dict[str, bool] = Field(default_factory=dict)
 
 
 class SourcePreviewSampleItem(BaseModel):
@@ -517,19 +530,23 @@ class SourcePreviewSampleItem(BaseModel):
     subject: str | None = None
     to: list[str] = Field(default_factory=list)
     snippet: str | None = None
+    media_type: str | None = None
+    description: str | None = None
+    albums: list[str] = Field(default_factory=list)
 
 
 class SourcePreviewResponse(BaseModel):
     source_id: str
     estimated_count: int
-    period_after: datetime
-    period_before: datetime
+    period_after: datetime | None = None
+    period_before: datetime | None = None
     sample_items: list[SourcePreviewSampleItem] = Field(default_factory=list)
     query: str
     note: str = "Anteprima di sola lettura per posta inviata (SENT)"
 
 
 class SourceSyncRequest(BaseModel):
+    album_id: str | None = None
     period_after: datetime | None = None
     period_before: datetime | None = None
     item_limit: int = Field(default=500, ge=1, le=5000)
@@ -537,6 +554,24 @@ class SourceSyncRequest(BaseModel):
     batch_size: int = Field(default=25, ge=1, le=500)
     concurrency: int = Field(default=1, ge=1, le=1)
     mode: Literal["full", "incremental", "reconciliation"] = "full"
+
+
+class ImmichAssetResponse(BaseModel):
+    source_item_id: str
+    external_id: str
+    occurred_at: datetime | None = None
+    date_source: str = "unknown"
+    asset_type: str = "IMAGE"
+    description: str | None = None
+    albums: list[dict[str, Any]] = Field(default_factory=list)
+    people: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class ImmichAssetListResponse(BaseModel):
+    items: list[ImmichAssetResponse]
+    total: int
+    source_kind: str = "immich"
 
 
 class SourceSyncResponse(BaseModel):

@@ -50,6 +50,7 @@ class AsyncPostgresGmailRepository:
         messages: Sequence[NormalizedGmailMessage],
         checkpoint: GmailCheckpointState,
         *,
+        config_query_fingerprint: str | None = None,
         removed_external_ids: frozenset[str] = frozenset(),
         out_of_scope_external_ids: frozenset[str] = frozenset(),
         gaps: Sequence[GmailItemGapData] = (),
@@ -65,10 +66,19 @@ class AsyncPostgresGmailRepository:
                     .where(SourceSyncConfig.connector_account_id == account_id)
                     .with_for_update()
                 )
+                # Il checkpoint descrive la selezione effettiva. Il fencing usa invece
+                # l'identità configurata catturata all'enqueue. L'assenza del valore è
+                # compatibilità esplicita per chiamanti/record legacy, nei quali le due
+                # fingerprint coincidevano.
+                fencing_fingerprint = (
+                    config_query_fingerprint
+                    if config_query_fingerprint is not None
+                    else checkpoint.query_fingerprint
+                )
                 if (
                     config is None
                     or config.revision != checkpoint.config_revision
-                    or config.query_fingerprint != checkpoint.query_fingerprint
+                    or config.query_fingerprint != fencing_fingerprint
                 ):
                     raise GmailJobStaleSnapshotError("stale_gmail_job_snapshot")
             for message in messages:
@@ -237,8 +247,12 @@ class AsyncPostgresGmailRepository:
                     .with_for_update()
                 )
                 if backfill_row is not None:
-                    backfill_row.items_imported += inserted_count
-                    backfill_row.items_not_imported += not_imported_count
+                    backfill_row.items_imported = (
+                        backfill_row.items_imported or 0
+                    ) + inserted_count
+                    backfill_row.items_not_imported = (
+                        backfill_row.items_not_imported or 0
+                    ) + not_imported_count
 
             await self._mark_source_states(
                 account_id,

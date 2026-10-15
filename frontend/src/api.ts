@@ -296,7 +296,15 @@ export interface SourceStatusResponse {
     missing_count?: number
     requires_import?: boolean
     last_sync_at?: string | null
+    selection_matches_config?: boolean
+    period_matches_config?: boolean
+    coverage_matches_config?: boolean
+    coverage_period_matches_config?: boolean
+    selection_complete?: boolean
+    incomplete_reason?: string | null
+    latest_job?: ImportJob | null
     active_job?: ImportJob | null
+    active_job_matches_config?: boolean
 }
 
 export interface SourceSyncConfig {
@@ -369,6 +377,8 @@ export interface SourceCredentialsUploadPayload {
     client_id?: string | null
     client_secret?: string | null
     redirect_uri_override?: string | null
+    base_url?: string | null
+    api_key?: string | null
 }
 
 export interface SourceCredentialsSaveResponse {
@@ -386,6 +396,9 @@ export interface SourceTestConnectionResponse {
     primary_identity: string | null
     aliases: string[]
     message: string
+    server_version?: string | null
+    version_supported?: boolean | null
+    capabilities?: Record<string, boolean>
 }
 
 export interface SourcePreviewSampleItem {
@@ -394,19 +407,23 @@ export interface SourcePreviewSampleItem {
     subject: string | null
     to: string[]
     snippet: string | null
+    media_type?: string | null
+    description?: string | null
+    albums?: string[]
 }
 
 export interface SourcePreviewResponse {
     source_id: string
     estimated_count: number
-    period_after: string
-    period_before: string
+    period_after: string | null
+    period_before: string | null
     sample_items: SourcePreviewSampleItem[]
     query: string
     note: string
 }
 
 export interface SourceSyncPayload {
+    album_id?: string | null
     period_after?: string | null
     period_before?: string | null
     item_limit?: number
@@ -423,6 +440,24 @@ export interface SourceSyncResponse {
     status: string
     mode: string
     message: string
+}
+
+export interface ImmichAsset {
+    source_item_id: string
+    external_id: string
+    occurred_at: string | null
+    date_source: string
+    asset_type: string
+    description: string | null
+    albums: Array<{ id: string; name: string }>
+    people: Array<{ id: string; name: string }>
+    evidence: Record<string, unknown>
+}
+
+export interface ImmichAssetList {
+    items: ImmichAsset[]
+    total: number
+    source_kind: string
 }
 
 export interface SourceDisconnectResponse {
@@ -557,6 +592,11 @@ export const api = {
     gmailCancelJob: (id: string) => request<ImportJob>(`/api/gmail/jobs/${id}/cancel`, {
         method: 'POST',
     }),
+    cancelSourceJob: (sourceId: string, id: string) =>
+        request<ImportJob>(
+            `/api/sources/${encodeURIComponent(sourceId)}/jobs/${encodeURIComponent(id)}/cancel`,
+            { method: 'POST' },
+        ),
     gmailSources: (limit = 50) => request<GmailSources>(
         `/api/gmail/sources${queryString({ limit })}`,
     ),
@@ -579,7 +619,7 @@ export const api = {
         }),
     fetchSourcePreview: (
         sourceId: string,
-        params?: { limit?: number; period_after?: string; period_before?: string },
+        params?: { limit?: number; period_after?: string; period_before?: string; album_id?: string },
     ) =>
         request<SourcePreviewResponse>(
             `/api/sources/${encodeURIComponent(sourceId)}/preview${queryString(params ?? {})}`,
@@ -589,6 +629,8 @@ export const api = {
             method: 'POST',
             body: JSON.stringify(payload ?? {}),
         }),
+    fetchSourceItems: (sourceId: string, limit = 50) =>
+        request<ImmichAssetList>(`/api/sources/${encodeURIComponent(sourceId)}/items${queryString({ limit })}`),
     deleteSource: (sourceId: string, removeCredentials = false) =>
         request<SourceDisconnectResponse>(
             `/api/sources/${encodeURIComponent(sourceId)}${queryString({
