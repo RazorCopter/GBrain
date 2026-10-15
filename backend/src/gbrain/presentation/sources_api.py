@@ -49,6 +49,7 @@ from gbrain.domain.connectors import (
     get_source_catalog,
     get_source_descriptor,
 )
+from gbrain.domain.immich import ImmichErrorCategory, ImmichGatewayError
 from gbrain.domain.job_queue import GMAIL_QUEUE_IDENTITY, IMMICH_QUEUE_IDENTITY
 from gbrain.domain.models import (
     ConnectorAccount,
@@ -725,11 +726,12 @@ async def test_source_connection(
             )
 
         start_t = datetime.now(UTC)
+        version: str | None = None
         try:
             gw = ImmichGateway(cred_payload["base_url"], cred_payload["api_key"])
             user = await gw.get_current_user()
-            capabilities = await gw.inspect_capabilities()
-            version = capabilities.server_version
+            version = await gw.get_server_version()
+            capabilities = await gw.inspect_capabilities(server_version=version)
             latency = (datetime.now(UTC) - start_t).total_seconds() * 1000.0
 
             # Crea o aggiorna ConnectorAccount attivo
@@ -767,8 +769,34 @@ async def test_source_connection(
                 primary_identity=user.get("email") or user.get("name"),
                 aliases=[],
                 message=f"Connessione a Immich v{version} verificata con successo ({user.get('name')})",
+                server_version=version,
+                version_supported=True,
+                capabilities={
+                    "albums": capabilities.supports_albums,
+                    "search": capabilities.supports_search,
+                    "people": capabilities.supports_people,
+                },
             )
-        except Exception as exc:
+        except ImmichGatewayError as exc:
+            latency = (datetime.now(UTC) - start_t).total_seconds() * 1000.0
+            known_version = exc.server_version or version
+            return SourceTestConnectionResponse(
+                source_id="immich",
+                connected=False,
+                latency_ms=latency,
+                primary_identity=None,
+                aliases=[],
+                message=exc.message,
+                server_version=known_version,
+                version_supported=(
+                    False if exc.category == ImmichErrorCategory.UNSUPPORTED_VERSION else None
+                ),
+                error_category=exc.category.value,
+                error_code=exc.reason_code,
+                failure_phase=exc.phase,
+            )
+        except Exception:
+            logger.exception("Test connessione Immich fallito per errore interno")
             latency = (datetime.now(UTC) - start_t).total_seconds() * 1000.0
             return SourceTestConnectionResponse(
                 source_id="immich",
@@ -776,7 +804,11 @@ async def test_source_connection(
                 latency_ms=latency,
                 primary_identity=None,
                 aliases=[],
-                message=f"Connessione a Immich fallita: {exc}",
+                message="Test di connessione Immich fallito per un errore interno",
+                server_version=version,
+                error_category="internal",
+                error_code="unexpected_error",
+                failure_phase="application",
             )
 
     if source_id != "gmail":

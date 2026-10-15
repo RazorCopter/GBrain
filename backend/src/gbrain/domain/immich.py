@@ -45,6 +45,8 @@ class ImmichGatewayError(RuntimeError):
         *,
         status_code: int | None = None,
         retryable: bool = False,
+        phase: str | None = None,
+        server_version: str | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -52,6 +54,8 @@ class ImmichGatewayError(RuntimeError):
         self.message = message
         self.status_code = status_code
         self.retryable = retryable
+        self.phase = phase
+        self.server_version = server_version
 
 
 @dataclass(frozen=True, slots=True)

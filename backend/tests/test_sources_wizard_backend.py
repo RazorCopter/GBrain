@@ -1349,6 +1349,10 @@ def test_immich_sources_endpoints_lifecycle() -> None:
             new=AsyncMock(return_value=mock_user),
         ),
         patch(
+            "gbrain.infrastructure.immich_gateway.ImmichGateway.get_server_version",
+            new=AsyncMock(return_value="1.106.0"),
+        ),
+        patch(
             "gbrain.infrastructure.immich_gateway.ImmichGateway.inspect_capabilities",
             new=AsyncMock(return_value=mock_capabilities),
         ),

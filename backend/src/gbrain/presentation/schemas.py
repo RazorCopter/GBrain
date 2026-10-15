@@ -522,6 +522,9 @@ class SourceTestConnectionResponse(BaseModel):
     server_version: str | None = None
     version_supported: bool | None = None
     capabilities: dict[str, bool] = Field(default_factory=dict)
+    error_category: str | None = None
+    error_code: str | None = None
+    failure_phase: str | None = None
 
 
 class SourcePreviewSampleItem(BaseModel):

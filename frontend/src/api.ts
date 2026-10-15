@@ -399,6 +399,9 @@ export interface SourceTestConnectionResponse {
     server_version?: string | null
     version_supported?: boolean | null
     capabilities?: Record<string, boolean>
+    error_category?: string | null
+    error_code?: string | null
+    failure_phase?: string | null
 }
 
 export interface SourcePreviewSampleItem {

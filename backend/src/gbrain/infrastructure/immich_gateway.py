@@ -21,6 +21,15 @@ from gbrain.domain.immich import (
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitized_transport_detail(exc: httpx.RequestError) -> str:
+    """Restituisce solo informazioni tecniche non sensibili sulla catena di errore."""
+    cause = exc.__cause__
+    if cause is None:
+        return "cause=unavailable"
+    return f"cause={type(cause).__name__}"
+
+
 # Contratto API verificato per la famiglia v1 che espone /api/server/version,
 # /api/users/me, /api/albums, /api/search/metadata e /api/people.
 # /api/server-info/version è mantenuto esclusivamente come fallback legacy su 404.
@@ -186,20 +195,51 @@ class ImmichGateway:
                     retryable=True,
                 )
             resp.raise_for_status()
-            return resp.json()
+            try:
+                return resp.json()
+            except (ValueError, UnicodeDecodeError) as exc:
+                logger.warning(
+                    "Risposta JSON Immich non valida method=%s path=%s exception=%s",
+                    method.upper(),
+                    path.split("?", 1)[0],
+                    type(exc).__name__,
+                )
+                raise ImmichGatewayError(
+                    ImmichErrorCategory.PARSE,
+                    "invalid_json_response",
+                    "Risposta JSON Immich non valida",
+                    status_code=resp.status_code,
+                    phase="decode_response",
+                ) from exc
         except httpx.TimeoutException as exc:
+            logger.warning(
+                "Trasporto Immich fallito method=%s path=%s exception=%s detail=%s",
+                method.upper(),
+                path.split("?", 1)[0],
+                type(exc).__name__,
+                _sanitized_transport_detail(exc),
+            )
             raise ImmichGatewayError(
                 ImmichErrorCategory.TRANSIENT,
                 "network_timeout",
-                "Timeout di connessione o lettura verso l'istanza Immich",
+                "Timeout durante invio o lettura della risposta Immich",
                 retryable=True,
+                phase="transport",
             ) from exc
         except httpx.RequestError as exc:
+            logger.warning(
+                "Trasporto Immich fallito method=%s path=%s exception=%s detail=%s",
+                method.upper(),
+                path.split("?", 1)[0],
+                type(exc).__name__,
+                _sanitized_transport_detail(exc),
+            )
             raise ImmichGatewayError(
                 ImmichErrorCategory.TRANSIENT,
                 "network_error",
-                "Errore di rete durante la comunicazione con l'istanza Immich",
+                "Errore durante invio o lettura della risposta Immich",
                 retryable=True,
+                phase="transport",
             ) from exc
         finally:
             if should_close:
@@ -233,13 +273,16 @@ class ImmichGateway:
 
         major, minor, patch = components
         version_tuple = (major, minor, patch)
+        version = f"{major}.{minor}.{patch}"
         if not (SUPPORTED_MIN_VERSION <= version_tuple <= SUPPORTED_MAX_TESTED_VERSION):
             raise ImmichGatewayError(
                 ImmichErrorCategory.UNSUPPORTED_VERSION,
                 "unsupported_server_version",
                 "Versione Immich non compresa nell'intervallo verificato",
+                phase="version_validation",
+                server_version=version,
             )
-        return f"{major}.{minor}.{patch}"
+        return version
 
     async def get_current_user(self) -> dict[str, Any]:
         """Verifica l'autenticazione leggendo il profilo dell'utente corrispondente all'API key."""
@@ -285,9 +328,11 @@ class ImmichGateway:
             )
         return parts
 
-    async def inspect_capabilities(self) -> ImmichCapabilities:
+    async def inspect_capabilities(
+        self, *, server_version: str | None = None
+    ) -> ImmichCapabilities:
         """Valida la versione e prova i soli endpoint read-only richiesti dal percorso."""
-        version = await self.get_server_version()
+        version = server_version or await self.get_server_version()
         parsed_version = self._parse_version(version)
         if parsed_version < SUPPORTED_MIN_VERSION or parsed_version > SUPPORTED_MAX_TESTED_VERSION:
             raise ImmichGatewayError(
@@ -296,13 +341,22 @@ class ImmichGateway:
                 f"Versione Immich {version} fuori dall'intervallo supportato "
                 f"{'.'.join(map(str, SUPPORTED_MIN_VERSION))}-"
                 f"{'.'.join(map(str, SUPPORTED_MAX_TESTED_VERSION))}",
+                phase="version_validation",
+                server_version=version,
             )
 
-        supports_albums = await self._probe_capability("GET", "/api/albums")
-        supports_search = await self._probe_capability(
-            "POST", "/api/search/metadata", json={"page": 1, "size": 1}
-        )
-        supports_people = await self._probe_people_capability(parsed_version)
+        try:
+            supports_albums = await self._probe_capability("GET", "/api/albums")
+            supports_search = await self._probe_capability(
+                "POST", "/api/search/metadata", json={"page": 1, "size": 1}
+            )
+            supports_people = await self._probe_people_capability(parsed_version)
+        except ImmichGatewayError as exc:
+            if exc.phase is None:
+                exc.phase = "capability_probe"
+            if exc.server_version is None:
+                exc.server_version = version
+            raise
         return ImmichCapabilities(
             server_version=version,
             version_supported=True,

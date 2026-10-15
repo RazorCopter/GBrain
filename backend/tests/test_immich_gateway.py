@@ -214,6 +214,76 @@ async def test_immich_gateway_rejects_unsupported_version() -> None:
 
     assert exc_info.value.category == ImmichErrorCategory.UNSUPPORTED_VERSION
     assert exc_info.value.reason_code == "unsupported_server_version"
+    assert exc_info.value.phase == "version_validation"
+    assert exc_info.value.server_version == "2.0.0"
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_transport_error_logs_sanitized_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "api-key-must-not-leak"  # noqa: S105 - synthetic PII sentinel
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"connection failed with {secret}",
+            request=request,
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gateway = ImmichGateway("https://immich.test", secret, client=client)
+        with caplog.at_level("WARNING"):
+            with pytest.raises(ImmichGatewayError) as exc_info:
+                await gateway.get_current_user()
+
+    assert exc_info.value.category == ImmichErrorCategory.TRANSIENT
+    assert exc_info.value.reason_code == "network_error"
+    assert exc_info.value.phase == "transport"
+    assert "method=GET" in caplog.text
+    assert "path=/api/users/me" in caplog.text
+    assert "exception=ConnectError" in caplog.text
+    assert secret not in caplog.text
+    assert "connection failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_invalid_json_is_parse_not_network() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/server/version"
+        return httpx.Response(200, content=b"not-json")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gateway = ImmichGateway("https://immich.test", "test-key", client=client)
+        with pytest.raises(ImmichGatewayError) as exc_info:
+            await gateway.get_server_version()
+
+    assert exc_info.value.category == ImmichErrorCategory.PARSE
+    assert exc_info.value.reason_code == "invalid_json_response"
+    assert exc_info.value.phase == "decode_response"
+
+
+@pytest.mark.asyncio
+async def test_immich_capability_failure_preserves_validated_version() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/albums":
+            raise httpx.ReadError("read failed", request=request)
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gateway = ImmichGateway("https://immich.test", "test-key", client=client)
+        with pytest.raises(ImmichGatewayError) as exc_info:
+            await gateway.inspect_capabilities(server_version="1.106.4")
+
+    assert exc_info.value.category == ImmichErrorCategory.TRANSIENT
+    assert exc_info.value.reason_code == "network_error"
+    assert exc_info.value.phase == "transport"
+    assert exc_info.value.server_version == "1.106.4"
 
 
 @pytest.mark.asyncio
