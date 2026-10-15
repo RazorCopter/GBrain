@@ -185,3 +185,114 @@ async def test_execute_immich_job_full_flow() -> None:
     assert final_job.status == ImportJobStatus.COMPLETED
     assert final_job.imported_items == 10
     assert final_job.checkpoint["phase"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_immich_job_lifecycle_period_v3_fixture_and_replay_idempotency() -> None:
+    session = InMemorySession()
+    db = FakeDatabase(session)
+
+    owner_id = uuid4()
+    account_id = uuid4()
+    job_id = uuid4()
+
+    owner = OwnerAccount(
+        id=owner_id,
+        owner_slot=1,
+        username="test_owner_v3",
+        display_name="Test V3",
+        password_hash="dummy_hash_for_test",  # noqa: S106
+    )
+    account = ConnectorAccount(
+        id=account_id,
+        owner_id=owner_id,
+        connector_kind="immich",
+        external_account_id="inst-v3",
+        primary_email="owner@immich.local",
+        status=ConnectorAccountStatus.ACTIVE,
+    )
+
+    settings = _test_settings()
+    raw_creds = json.dumps(
+        {"base_url": "http://127.0.0.1:2283", "api_key": "valid-api-key"}
+    ).encode("utf-8")
+    enc_creds = encrypt_payload(raw_creds, settings.source_credentials_encryption_key)
+    cred = SourceClientCredential(
+        owner_id=owner_id,
+        source_kind="immich",
+        auth_method="api_key",
+        client_type="api_token",
+        encrypted_credentials=enc_creds,
+        is_active=True,
+    )
+
+    job = ImportJob(
+        id=job_id,
+        source_kind="immich",
+        connector_account_id=account_id,
+        mode="full",
+        status=ImportJobStatus.PENDING,
+        checkpoint={"phase": "queued"},
+        policy_snapshot={
+            "after": "2026-01-01T00:00:00+00:00",
+            "before": "2026-06-01T00:00:00+00:00",
+            "item_limit": 25,
+        },
+    )
+
+    session.add(owner)
+    session.add(account)
+    session.add(cred)
+    session.add(job)
+
+    # 1. Prima esecuzione: 5 asset conformi allo schema v3.3.3
+    mock_gw = MagicMock()
+    mock_gw.search_period_assets = AsyncMock(
+        return_value=[_sample_asset(f"v3-asset-{i}") for i in range(5)]
+    )
+
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,
+        job_id=str(job_id),
+        account_id=str(account_id),
+        mode="full",
+        gateway_factory=lambda url, key: mock_gw,
+    )
+
+    final_job = await session.get(ImportJob, job_id)
+    assert final_job is not None
+    assert final_job.status == ImportJobStatus.COMPLETED
+    assert final_job.imported_items == 5
+
+    # 2. Replay idempotente: la riesecuzione non duplica item e non solleva conflitti
+    second_job_id = uuid4()
+    second_job = ImportJob(
+        id=second_job_id,
+        source_kind="immich",
+        connector_account_id=account_id,
+        mode="full",
+        status=ImportJobStatus.PENDING,
+        checkpoint={"phase": "queued"},
+        policy_snapshot={
+            "after": "2026-01-01T00:00:00+00:00",
+            "before": "2026-06-01T00:00:00+00:00",
+            "item_limit": 25,
+        },
+    )
+    session.add(second_job)
+
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,
+        job_id=str(second_job_id),
+        account_id=str(account_id),
+        mode="full",
+        gateway_factory=lambda url, key: mock_gw,
+    )
+
+    final_second_job = await session.get(ImportJob, second_job_id)
+    assert final_second_job is not None
+    assert final_second_job.status == ImportJobStatus.COMPLETED
+    assert final_second_job.imported_items == 0
+    assert final_second_job.checkpoint["phase"] == "completed"

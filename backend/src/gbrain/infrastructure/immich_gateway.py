@@ -30,11 +30,19 @@ def _sanitized_transport_detail(exc: httpx.RequestError) -> str:
     return f"cause={type(cause).__name__}"
 
 
-# Contratto API verificato per la famiglia v1 che espone /api/server/version,
-# /api/users/me, /api/albums, /api/search/metadata e /api/people.
-# /api/server-info/version è mantenuto esclusivamente come fallback legacy su 404.
-SUPPORTED_MIN_VERSION = (1, 106, 0)
-SUPPORTED_MAX_TESTED_VERSION = (1, 140, 0)
+# Contratti verificati sullo spec e sul codice del tag immich-app/immich v3.3.3.
+# Le sole versioni dichiarate sono la precedente famiglia testata e l'esatta 3.3.3:
+# non si presume compatibilità con versioni intermedie o successive.
+SUPPORTED_LEGACY_MIN_VERSION = (1, 106, 0)
+SUPPORTED_LEGACY_MAX_VERSION = (1, 140, 0)
+SUPPORTED_V3_VERSION = (3, 3, 3)
+
+
+def _is_supported_version(version: tuple[int, int, int]) -> bool:
+    """Verifica se la versione corrisponde a uno dei contratti formalmente verificati."""
+    if SUPPORTED_LEGACY_MIN_VERSION <= version <= SUPPORTED_LEGACY_MAX_VERSION:
+        return True
+    return version == SUPPORTED_V3_VERSION
 
 
 def is_ip_private_or_loopback(ip_str: str) -> bool:
@@ -263,18 +271,29 @@ class ImmichGateway:
                 "Risposta versione Immich non conforme al contratto atteso",
             )
 
-        components = (data.get("major"), data.get("minor"), data.get("patch"))
-        if not all(type(component) is int and component >= 0 for component in components):
+        major_raw = data.get("major")
+        minor_raw = data.get("minor")
+        patch_raw = data.get("patch")
+        if (
+            type(major_raw) is not int
+            or major_raw < 0
+            or type(minor_raw) is not int
+            or minor_raw < 0
+            or type(patch_raw) is not int
+            or patch_raw < 0
+        ):
             raise ImmichGatewayError(
                 ImmichErrorCategory.PARSE,
                 "server_version_malformed",
                 "Risposta versione Immich non conforme al contratto atteso",
             )
 
-        major, minor, patch = components
-        version_tuple = (major, minor, patch)
+        major = major_raw
+        minor = minor_raw
+        patch = patch_raw
+        version_tuple: tuple[int, int, int] = (major, minor, patch)
         version = f"{major}.{minor}.{patch}"
-        if not (SUPPORTED_MIN_VERSION <= version_tuple <= SUPPORTED_MAX_TESTED_VERSION):
+        if not _is_supported_version(version_tuple):
             raise ImmichGatewayError(
                 ImmichErrorCategory.UNSUPPORTED_VERSION,
                 "unsupported_server_version",
@@ -334,21 +353,28 @@ class ImmichGateway:
         """Valida la versione e prova i soli endpoint read-only richiesti dal percorso."""
         version = server_version or await self.get_server_version()
         parsed_version = self._parse_version(version)
-        if parsed_version < SUPPORTED_MIN_VERSION or parsed_version > SUPPORTED_MAX_TESTED_VERSION:
+        if not _is_supported_version(parsed_version):
             raise ImmichGatewayError(
                 ImmichErrorCategory.UNSUPPORTED_VERSION,
                 "unsupported_server_version",
-                f"Versione Immich {version} fuori dall'intervallo supportato "
-                f"{'.'.join(map(str, SUPPORTED_MIN_VERSION))}-"
-                f"{'.'.join(map(str, SUPPORTED_MAX_TESTED_VERSION))}",
+                f"Versione Immich {version} non inclusa nei contratti verificati",
                 phase="version_validation",
                 server_version=version,
             )
 
         try:
             supports_albums = await self._probe_capability("GET", "/api/albums")
+            search_probe = (
+                {
+                    "size": 1,
+                    "filter": {"takenAt": {"gte": "1970-01-01T00:00:00Z"}},
+                    "orderBy": {"field": "localDateTime", "direction": "desc"},
+                }
+                if parsed_version == SUPPORTED_V3_VERSION
+                else {"page": 1, "size": 1}
+            )
             supports_search = await self._probe_capability(
-                "POST", "/api/search/metadata", json={"page": 1, "size": 1}
+                "POST", "/api/search/metadata", json=search_probe
             )
             supports_people = await self._probe_people_capability(parsed_version)
         except ImmichGatewayError as exc:
@@ -419,7 +445,9 @@ class ImmichGateway:
         limit: int = IMMICH_MAX_ITEMS_LIMIT,
     ) -> tuple[ImmichAlbumInfo, list[ImmichNormalizedAsset]]:
         """Recupera e normalizza i metadati degli asset di un determinato album (max 25)."""
-        data = await self._handle_request("GET", f"/api/albums/{album_id}")
+        data = await self._handle_request(
+            "GET", f"/api/albums/{album_id}", params={"withoutAssets": "false"}
+        )
         if not isinstance(data, dict):
             raise ImmichGatewayError(
                 ImmichErrorCategory.PARSE,
@@ -445,11 +473,34 @@ class ImmichGateway:
     ) -> list[ImmichNormalizedAsset]:
         """Cerca asset in base all'intervallo temporale specificato (max 25)."""
         bounded_limit = min(max(limit, 1), IMMICH_MAX_ITEMS_LIMIT)
-        payload: dict[str, Any] = {"page": 1, "size": bounded_limit}
-        if after:
-            payload["takenAfter"] = after.astimezone(UTC).isoformat()
-        if before:
-            payload["takenBefore"] = before.astimezone(UTC).isoformat()
+        version = await self.get_server_version()
+        parsed_version = self._parse_version(version)
+
+        payload: dict[str, Any]
+        if parsed_version == SUPPORTED_V3_VERSION:
+            taken_at: dict[str, str] = {}
+            if after is not None:
+                taken_at["gte"] = after.astimezone(UTC).isoformat()
+            if before is not None:
+                taken_at["lt"] = before.astimezone(UTC).isoformat()
+            payload = {
+                "size": bounded_limit,
+                "withExif": True,
+                "withPeople": True,
+                "filter": {"takenAt": taken_at} if taken_at else {},
+                "orderBy": {"field": "localDateTime", "direction": "desc"},
+            }
+        else:
+            payload = {
+                "page": 1,
+                "size": bounded_limit,
+                "withExif": True,
+                "withPeople": True,
+            }
+            if after is not None:
+                payload["takenAfter"] = after.astimezone(UTC).isoformat()
+            if before is not None:
+                payload["takenBefore"] = before.astimezone(UTC).isoformat()
 
         try:
             data = await self._handle_request("POST", "/api/search/metadata", json=payload)

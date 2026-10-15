@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import httpx
@@ -200,10 +201,91 @@ async def test_immich_gateway_version_does_not_mask_non_404_errors(
 
 
 @pytest.mark.asyncio
+async def test_immich_gateway_supports_verified_v3_3_3() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/server/version":
+            return httpx.Response(
+                200, json={"major": 3, "minor": 3, "patch": 3, "prerelease": None}
+            )
+        if request.url.path == "/api/users/me":
+            return httpx.Response(
+                200, json={"id": "user-v3", "email": "v3@immich.test", "name": "V3 User"}
+            )
+        if request.url.path == "/api/albums":
+            return httpx.Response(200, json=[{"id": "alb-v3", "albumName": "V3 Album"}])
+        if request.url.path == "/api/search/metadata":
+            assert request.method == "POST"
+            # Verifica che il payload utilizzi lo schema Zod strutturato di v3.3.3
+            body = json.loads(request.content.decode("utf-8"))
+            assert "filter" in body
+            assert "orderBy" in body
+            assert body["orderBy"]["field"] == "localDateTime"
+            return httpx.Response(
+                200,
+                json={
+                    "assets": {
+                        "count": 1,
+                        "items": [
+                            {
+                                "id": "asset-v3-1",
+                                "type": "IMAGE",
+                                "fileCreatedAt": "2026-05-01T10:00:00Z",
+                                "localDateTime": "2026-05-01T12:00:00",
+                                "originalFileName": "IMG_v3.jpg",
+                                "exifInfo": {
+                                    "dateTimeOriginal": "2026-05-01T10:00:00Z",
+                                    "description": "V3 Spec",
+                                },
+                                "people": [{"id": "p-1", "name": "Elena"}],
+                            }
+                        ],
+                    }
+                },
+            )
+        if request.url.path == "/api/people":
+            return httpx.Response(
+                200,
+                json={
+                    "people": [{"id": "p-1", "name": "Elena"}],
+                    "total": 1,
+                    "hidden": 0,
+                    "hasNextPage": False,
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gw = ImmichGateway("https://immich.test", "test-immich-api-key", client=client)
+        version = await gw.get_server_version()
+        assert version == "3.3.3"
+
+        caps = await gw.inspect_capabilities()
+        assert caps.server_version == "3.3.3"
+        assert caps.version_supported is True
+        assert caps.supports_albums is True
+        assert caps.supports_search is True
+        assert caps.supports_people is True
+
+        assets = await gw.search_period_assets(
+            after=datetime(2026, 1, 1, tzinfo=UTC),
+            before=datetime(2026, 6, 1, tzinfo=UTC),
+            limit=10,
+        )
+        assert len(assets) == 1
+        assert assets[0].external_id == "asset-v3-1"
+        assert len(assets[0].people) == 1
+        assert assets[0].people[0].name == "Elena"
+        assert assets[0].people[0].id == "p-1"
+
+
+@pytest.mark.asyncio
 async def test_immich_gateway_rejects_unsupported_version() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/server/version"
-        return httpx.Response(200, json={"major": 2, "minor": 0, "patch": 0})
+        # Release 3.3.4 non verificata o 2.0.0 devono essere esplicitamente rifiutate
+        return httpx.Response(200, json={"major": 3, "minor": 3, "patch": 4})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="https://immich.test"
@@ -215,7 +297,7 @@ async def test_immich_gateway_rejects_unsupported_version() -> None:
     assert exc_info.value.category == ImmichErrorCategory.UNSUPPORTED_VERSION
     assert exc_info.value.reason_code == "unsupported_server_version"
     assert exc_info.value.phase == "version_validation"
-    assert exc_info.value.server_version == "2.0.0"
+    assert exc_info.value.server_version == "3.3.4"
 
 
 @pytest.mark.asyncio

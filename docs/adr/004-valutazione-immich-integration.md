@@ -19,7 +19,21 @@ La famiglia API supportata usa:
 - `POST /api/search/metadata` per ricerca temporale read-only;
 - `GET /api/people` per la capability persone.
 
-L'header di autenticazione è `x-api-key`; le risposte sono richieste come JSON. La compatibilità dichiarata resta Immich `1.106.0`–`1.140.0`: non è stata ampliata per la correzione dell'endpoint. Una versione esterna all'intervallo produce `unsupported_server_version`. Il fallback legacy della versione è circoscritto a un `404` dell'endpoint attuale e non maschera autenticazione, rete, timeout o payload non conforme. Per la famiglia dichiarata `/api/people` deve usare il wrapper `{ "people": [...], "total": N }`; una lista nuda è considerata payload non conforme. Endpoint di capability assente significa capability non disponibile, mentre auth, timeout e rete mantengono categorie distinte e non vengono degradati a “unsupported”.
+L'header di autenticazione è `x-api-key`; le risposte sono richieste come JSON. Le versioni formalmente supportate e verificate sui contratti ufficiali sono:
+
+- la famiglia legacy testata: Immich `1.106.0`–`1.140.0`;
+- la release reale verificata: Immich `3.3.3` (tag ufficiale `v3.3.3` di `immich-app/immich`).
+
+Non viene presunta alcuna compatibilità automatica con versioni intermedie o successive: una versione differente produce esplicitamente `unsupported_server_version`.
+
+Per Immich 3.3.3:
+- `/api/server/version` è l'endpoint ufficiale canonico (il fallback legacy su `/api/server-info/version` viene tentato esclusivamente su `404`);
+- `/api/users/me` restituisce l'utente autenticato;
+- `/api/albums` e `/api/albums/{id}?withoutAssets=false` mantengono la lista album e gli asset dell'album;
+- `/api/search/metadata` adotta la nuova struttura Zod v3 (`size`, `filter: { takenAt: { gte, lt } }`, `orderBy: { field: "localDateTime", direction: "desc" }`), disaccoppiata dai campi flat deprecati in v3.2;
+- `/api/people` continua a rispondere con il wrapper `{ "people": [...], "total": N }`.
+
+Endpoint di capability assente significa capability non disponibile, mentre auth, timeout e rete mantengono categorie distinte e non vengono degradati a “unsupported”.
 
 ## Selezione e limiti
 
