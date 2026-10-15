@@ -153,7 +153,9 @@ async def test_execute_immich_job_full_flow() -> None:
         checkpoint={"phase": "queued"},
         policy_snapshot={
             "album_id": "album-vacanze",
-            "item_limit": 25,
+            "item_limit": 60,
+            # Un album usa una sola request remota; il budget non conta i chunk locali.
+            "request_budget": 1,
         },
     )
 
@@ -167,7 +169,7 @@ async def test_execute_immich_job_full_flow() -> None:
     mock_gw.fetch_album_assets = AsyncMock(
         return_value=(
             ImmichAlbumInfo(id="album-vacanze", name="Vacanze"),
-            [_sample_asset(f"asset-{i}") for i in range(10)],
+            [_sample_asset(f"asset-{i}") for i in range(60)],
         )
     )
 
@@ -183,8 +185,12 @@ async def test_execute_immich_job_full_flow() -> None:
     final_job = await session.get(ImportJob, job_id)
     assert final_job is not None
     assert final_job.status == ImportJobStatus.COMPLETED
-    assert final_job.imported_items == 10
+    assert final_job.imported_items == 60
     assert final_job.checkpoint["phase"] == "completed"
+    assert final_job.checkpoint["album_offset"] == 60
+    assert final_job.checkpoint["pages_completed"] == 3
+    assert final_job.checkpoint["requests_completed"] == 1
+    mock_gw.fetch_album_assets.assert_awaited_once_with("album-vacanze")
 
 
 @pytest.mark.asyncio
@@ -236,7 +242,7 @@ async def test_immich_job_lifecycle_period_v3_fixture_and_replay_idempotency() -
         policy_snapshot={
             "after": "2026-01-01T00:00:00+00:00",
             "before": "2026-06-01T00:00:00+00:00",
-            "item_limit": 25,
+            "item_limit": 30,
         },
     )
 
@@ -245,10 +251,13 @@ async def test_immich_job_lifecycle_period_v3_fixture_and_replay_idempotency() -
     session.add(cred)
     session.add(job)
 
-    # 1. Prima esecuzione: 5 asset conformi allo schema v3.3.3
+    # 1. Prima esecuzione: due pagine cursor v3.3.3 (25 + 5 asset).
     mock_gw = MagicMock()
     mock_gw.search_period_assets = AsyncMock(
-        return_value=[_sample_asset(f"v3-asset-{i}") for i in range(5)]
+        side_effect=[
+            ([_sample_asset(f"v3-asset-{i}") for i in range(25)], "cursor-page-2"),
+            ([_sample_asset(f"v3-asset-{i}") for i in range(25, 30)], None),
+        ]
     )
 
     await execute_immich_job(
@@ -263,7 +272,10 @@ async def test_immich_job_lifecycle_period_v3_fixture_and_replay_idempotency() -
     final_job = await session.get(ImportJob, job_id)
     assert final_job is not None
     assert final_job.status == ImportJobStatus.COMPLETED
-    assert final_job.imported_items == 5
+    assert final_job.imported_items == 30
+    assert final_job.checkpoint["pages_completed"] == 2
+    assert final_job.checkpoint["requests_completed"] == 2
+    assert mock_gw.search_period_assets.await_args_list[1].kwargs["cursor"] == "cursor-page-2"
 
     # 2. Replay idempotente: la riesecuzione non duplica item e non solleva conflitti
     second_job_id = uuid4()
@@ -277,10 +289,17 @@ async def test_immich_job_lifecycle_period_v3_fixture_and_replay_idempotency() -
         policy_snapshot={
             "after": "2026-01-01T00:00:00+00:00",
             "before": "2026-06-01T00:00:00+00:00",
-            "item_limit": 25,
+            "item_limit": 30,
         },
     )
     session.add(second_job)
+    replay_gw = MagicMock()
+    replay_gw.search_period_assets = AsyncMock(
+        side_effect=[
+            ([_sample_asset(f"v3-asset-{i}") for i in range(25)], "cursor-page-2"),
+            ([_sample_asset(f"v3-asset-{i}") for i in range(25, 30)], None),
+        ]
+    )
 
     await execute_immich_job(
         db,  # type: ignore[arg-type]
@@ -288,11 +307,149 @@ async def test_immich_job_lifecycle_period_v3_fixture_and_replay_idempotency() -
         job_id=str(second_job_id),
         account_id=str(account_id),
         mode="full",
-        gateway_factory=lambda url, key: mock_gw,
+        gateway_factory=lambda url, key: replay_gw,
     )
 
     final_second_job = await session.get(ImportJob, second_job_id)
     assert final_second_job is not None
     assert final_second_job.status == ImportJobStatus.COMPLETED
     assert final_second_job.imported_items == 0
+    assert final_second_job.duplicate_items == 30
     assert final_second_job.checkpoint["phase"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_immich_resume_budget_and_cooperative_cancel_contracts() -> None:
+    async def build_job(
+        *,
+        checkpoint: dict[str, object],
+        policy_snapshot: dict[str, object],
+    ) -> tuple[InMemorySession, FakeDatabase, object, ConnectorAccount, ImportJob]:
+        session = InMemorySession()
+        db = FakeDatabase(session)
+        owner = OwnerAccount(
+            id=uuid4(),
+            owner_slot=1,
+            username=f"owner-{uuid4()}",
+            display_name="Test",
+            password_hash="dummy_hash_for_test",  # noqa: S106
+        )
+        account = ConnectorAccount(
+            id=uuid4(),
+            owner_id=owner.id,
+            connector_kind="immich",
+            external_account_id=f"instance-{uuid4()}",
+            primary_email="owner@immich.local",
+            status=ConnectorAccountStatus.ACTIVE,
+        )
+        settings = _test_settings()
+        encrypted = encrypt_payload(
+            json.dumps({"base_url": "http://127.0.0.1:2283", "api_key": "valid-api-key"}).encode(),
+            settings.source_credentials_encryption_key,
+        )
+        credential = SourceClientCredential(
+            owner_id=owner.id,
+            source_kind="immich",
+            auth_method="api_key",
+            client_type="api_token",
+            encrypted_credentials=encrypted,
+            is_active=True,
+        )
+        job = ImportJob(
+            id=uuid4(),
+            source_kind="immich",
+            connector_account_id=account.id,
+            mode="full",
+            status=ImportJobStatus.PENDING,
+            checkpoint=checkpoint,
+            policy_snapshot=policy_snapshot,
+        )
+        for entity in (owner, account, credential, job):
+            session.add(entity)
+        return session, db, settings, account, job
+
+    period = {
+        "after": "2026-01-01T00:00:00+00:00",
+        "before": "2026-06-01T00:00:00+00:00",
+        "item_limit": 30,
+    }
+
+    # Resume: il cursor committato viene riutilizzato e i primi 25 elementi non sono richiesti di nuovo.
+    session, db, settings, account, job = await build_job(
+        checkpoint={
+            "phase": "paginating",
+            "cursor": "cursor-page-2",
+            "total_enumerated": 25,
+            "total_inserted": 25,
+            "pages_completed": 1,
+            "requests_completed": 1,
+        },
+        policy_snapshot=period,
+    )
+    resume_gateway = MagicMock()
+    resume_gateway.search_period_assets = AsyncMock(
+        return_value=([_sample_asset(f"resume-{i}") for i in range(5)], None)
+    )
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,  # type: ignore[arg-type]
+        job_id=str(job.id),
+        account_id=str(account.id),
+        mode="full",
+        gateway_factory=lambda url, key: resume_gateway,
+    )
+    resumed = await session.get(ImportJob, job.id)
+    assert resumed.status == ImportJobStatus.COMPLETED
+    assert resumed.processed_items == 30
+    assert resume_gateway.search_period_assets.await_args.kwargs["cursor"] == "cursor-page-2"
+
+    # Budget: una pagina con cursor residuo non viene dichiarata completata.
+    session, db, settings, account, job = await build_job(
+        checkpoint={"phase": "queued"},
+        policy_snapshot={**period, "request_budget": 1},
+    )
+    budget_gateway = MagicMock()
+    budget_gateway.search_period_assets = AsyncMock(
+        return_value=([_sample_asset(f"budget-{i}") for i in range(25)], "still-more")
+    )
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,  # type: ignore[arg-type]
+        job_id=str(job.id),
+        account_id=str(account.id),
+        mode="full",
+        gateway_factory=lambda url, key: budget_gateway,
+    )
+    budgeted = await session.get(ImportJob, job.id)
+    assert budgeted.status == ImportJobStatus.COMPLETED_WITH_WARNINGS
+    assert budgeted.checkpoint["stopped_reason"] == "request_budget_reached"
+    assert budgeted.checkpoint["cursor"] == "still-more"
+    assert budgeted.checkpoint["requests_completed"] == 1
+
+    # Cancel: una richiesta arrivata durante il batch viene osservata prima del batch seguente.
+    session, db, settings, account, job = await build_job(
+        checkpoint={"phase": "queued"},
+        policy_snapshot={**period, "item_limit": 50},
+    )
+
+    async def first_page_then_cancel(
+        *args: object, **kwargs: object
+    ) -> tuple[list[ImmichNormalizedAsset], str]:
+        job.cancel_requested_at = datetime.now(UTC)
+        return [_sample_asset(f"cancel-{i}") for i in range(25)], "next-page"
+
+    cancel_gateway = MagicMock()
+    cancel_gateway.search_period_assets = AsyncMock(side_effect=first_page_then_cancel)
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,  # type: ignore[arg-type]
+        job_id=str(job.id),
+        account_id=str(account.id),
+        mode="full",
+        gateway_factory=lambda url, key: cancel_gateway,
+    )
+    cancelled = await session.get(ImportJob, job.id)
+    assert cancelled.status == ImportJobStatus.CANCELLED
+    assert cancelled.processed_items == 25
+    assert cancelled.checkpoint["cursor"] == "next-page"
+    cancel_gateway.search_period_assets.assert_awaited_once()

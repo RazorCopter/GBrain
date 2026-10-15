@@ -549,14 +549,47 @@ class SourcePreviewResponse(BaseModel):
 
 
 class SourceSyncRequest(BaseModel):
+    selection: Literal["all", "range", "album"] | None = None
     album_id: str | None = None
     period_after: datetime | None = None
     period_before: datetime | None = None
-    item_limit: int = Field(default=500, ge=1, le=5000)
+    # I default e il range del contratto condiviso restano compatibili con Gmail.
+    # Il percorso Immich applica autonomamente batch remoto fisso a 25 e limite totale.
+    item_limit: int = Field(default=500, ge=1, le=50000)
     request_budget: int = Field(default=200, ge=1, le=2000)
     batch_size: int = Field(default=25, ge=1, le=500)
     concurrency: int = Field(default=1, ge=1, le=1)
     mode: Literal["full", "incremental", "reconciliation"] = "full"
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> SourceSyncRequest:
+        selected = self.selection
+        if selected is None:
+            # Compatibilità multi-connettore: la validazione specifica Immich è attivata
+            # soltanto quando il chiamante dichiara la selezione, oppure usa i suoi campi.
+            if self.album_id:
+                selected = "album"
+            elif self.period_after is not None or self.period_before is not None:
+                selected = "range"
+            else:
+                return self
+        if selected == "all":
+            if self.album_id or self.period_after or self.period_before:
+                raise ValueError("La selezione all non accetta album o intervallo")
+        elif selected == "album":
+            if not self.album_id or not self.album_id.strip():
+                raise ValueError("La selezione album richiede album_id")
+            if self.period_after or self.period_before:
+                raise ValueError("Album e intervallo sono mutuamente esclusivi")
+        else:
+            if self.album_id:
+                raise ValueError("Range e album sono mutuamente esclusivi")
+            if self.period_after is None or self.period_before is None:
+                raise ValueError("La selezione range richiede entrambe le date")
+            if self.period_after >= self.period_before:
+                raise ValueError("period_after deve precedere period_before")
+        self.selection = selected
+        return self
 
 
 class ImmichAssetResponse(BaseModel):

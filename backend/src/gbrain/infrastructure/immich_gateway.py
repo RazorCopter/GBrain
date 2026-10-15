@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 
 from gbrain.domain.immich import (
-    IMMICH_MAX_ITEMS_LIMIT,
+    IMMICH_API_BATCH_SIZE,
     ImmichAlbumInfo,
     ImmichCapabilities,
     ImmichErrorCategory,
@@ -442,9 +442,9 @@ class ImmichGateway:
     async def fetch_album_assets(
         self,
         album_id: str,
-        limit: int = IMMICH_MAX_ITEMS_LIMIT,
+        limit: int | None = None,
     ) -> tuple[ImmichAlbumInfo, list[ImmichNormalizedAsset]]:
-        """Recupera e normalizza i metadati degli asset di un determinato album (max 25)."""
+        """Recupera i metadati inline di un album; il job li suddivide in batch locali."""
         data = await self._handle_request(
             "GET", f"/api/albums/{album_id}", params={"withoutAssets": "false"}
         )
@@ -461,18 +461,24 @@ class ImmichGateway:
         if not isinstance(raw_assets, list):
             raw_assets = []
 
-        bounded = raw_assets[: min(max(limit, 1), IMMICH_MAX_ITEMS_LIMIT)]
-        normalized = [self.normalize_asset(a, albums=(album_info,)) for a in bounded]
+        selected_assets = raw_assets if limit is None else raw_assets[: min(max(limit, 1), 25)]
+        normalized = [
+            self.normalize_asset(asset, albums=(album_info,))
+            for asset in selected_assets
+            if isinstance(asset, dict)
+        ]
         return album_info, normalized
 
     async def search_period_assets(
         self,
         after: datetime | None,
         before: datetime | None,
-        limit: int = IMMICH_MAX_ITEMS_LIMIT,
-    ) -> list[ImmichNormalizedAsset]:
-        """Cerca asset in base all'intervallo temporale specificato (max 25)."""
-        bounded_limit = min(max(limit, 1), IMMICH_MAX_ITEMS_LIMIT)
+        limit: int = IMMICH_API_BATCH_SIZE,
+        *,
+        cursor: str | None = None,
+    ) -> tuple[list[ImmichNormalizedAsset], str | None]:
+        """Cerca una pagina di asset, con request remota sempre limitata a 25 elementi."""
+        bounded_limit = min(max(limit, 1), IMMICH_API_BATCH_SIZE)
         version = await self.get_server_version()
         parsed_version = self._parse_version(version)
 
@@ -490,9 +496,21 @@ class ImmichGateway:
                 "filter": {"takenAt": taken_at} if taken_at else {},
                 "orderBy": {"field": "localDateTime", "direction": "desc"},
             }
+            if cursor is not None:
+                payload["cursor"] = cursor
         else:
+            legacy_page = 1
+            if cursor is not None:
+                try:
+                    legacy_page = int(cursor)
+                except ValueError as exc:
+                    raise ImmichGatewayError(
+                        ImmichErrorCategory.PARSE,
+                        "legacy_cursor_invalid",
+                        "Checkpoint di paginazione legacy Immich non valido",
+                    ) from exc
             payload = {
-                "page": 1,
+                "page": legacy_page,
                 "size": bounded_limit,
                 "withExif": True,
                 "withPeople": True,
@@ -514,10 +532,39 @@ class ImmichGateway:
                 ) from err
             raise
 
-        assets_container = data.get("assets", {}) if isinstance(data, dict) else {}
-        items = assets_container.get("items") or [] if isinstance(assets_container, dict) else []
+        if not isinstance(data, dict):
+            raise ImmichGatewayError(
+                ImmichErrorCategory.PARSE,
+                "metadata_search_invalid",
+                "Risposta ricerca Immich non valida",
+            )
+        assets_container = data.get("assets")
+        if not isinstance(assets_container, dict):
+            raise ImmichGatewayError(
+                ImmichErrorCategory.PARSE,
+                "metadata_search_invalid",
+                "Contenitore assets Immich non valido",
+            )
+        items = assets_container.get("items")
         if not isinstance(items, list):
-            items = []
+            raise ImmichGatewayError(
+                ImmichErrorCategory.PARSE,
+                "metadata_search_invalid",
+                "Elenco assets Immich non valido",
+            )
 
         bounded = items[:bounded_limit]
-        return [self.normalize_asset(a) for a in bounded if isinstance(a, dict)]
+        normalized = [self.normalize_asset(a) for a in bounded if isinstance(a, dict)]
+        if parsed_version == SUPPORTED_V3_VERSION:
+            raw_next_cursor = assets_container.get("nextCursor")
+            if raw_next_cursor is not None and not isinstance(raw_next_cursor, str):
+                raise ImmichGatewayError(
+                    ImmichErrorCategory.PARSE,
+                    "metadata_cursor_invalid",
+                    "Cursor Immich v3 non valido",
+                )
+            next_cursor = raw_next_cursor or None
+        else:
+            # Il ramo legacy usa pagine numeriche; una pagina corta conclude l'enumerazione.
+            next_cursor = str(int(payload["page"]) + 1) if len(items) >= bounded_limit else None
+        return normalized, next_cursor

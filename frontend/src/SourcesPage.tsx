@@ -18,6 +18,7 @@ import {
     api,
     isConnectorAvailable,
 } from './api'
+import { ImmichConfigPanel } from './ImmichConfigPanel'
 import { SourceConnectionWizard } from './SourceConnectionWizard'
 
 export interface SourcesPageProps {
@@ -97,6 +98,7 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
     const [wizardOpen, setWizardOpen] = useState(false)
     const [wizardSourceId, setWizardSourceId] = useState('gmail')
     const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2 | 3 | 4 | 5 | 6 | undefined>(undefined)
+    const [immichPanelOpen, setImmichPanelOpen] = useState(false)
     const [disconnectModalOpen, setDisconnectModalOpen] = useState(false)
     const [removeStoredCredentials, setRemoveStoredCredentials] = useState(false)
     const [disconnecting, setDisconnecting] = useState(false)
@@ -1036,6 +1038,8 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                 </div>
             )}
 
+            {immichPanelOpen && <ImmichConfigPanel onClose={() => setImmichPanelOpen(false)} />}
+
             {/* Catalogo Connettori */}
             <div className="hub-catalog-section">
                 <div className="section-header-row">
@@ -1064,23 +1068,8 @@ export function SourcesPage({ demoMode }: SourcesPageProps) {
                                 <p className="card-desc">{item.description}</p>
                                 <div className="card-footer">
                                     {item.id === 'immich' && isAvailable && (
-                                        <button
-                                            type="button"
-                                            className="secondary compact"
-                                            disabled={immichAssetsLoading}
-                                            onClick={async () => {
-                                                setImmichAssetsLoading(true)
-                                                setGlobalError('')
-                                                try {
-                                                    setImmichAssets(await api.fetchSourceItems('immich', 25))
-                                                } catch (err) {
-                                                    setGlobalError(err instanceof ApiError ? err.message : 'Errore nel caricamento asset Immich.')
-                                                } finally {
-                                                    setImmichAssetsLoading(false)
-                                                }
-                                            }}
-                                        >
-                                            {immichAssetsLoading ? 'Caricamento…' : 'Consulta metadati'}
+                                        <button type="button" className="secondary compact" onClick={() => setImmichPanelOpen(true)}>
+                                            Configura importazione
                                         </button>
                                     )}
                                     {isAvailable ? (

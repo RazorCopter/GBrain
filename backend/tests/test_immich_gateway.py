@@ -20,9 +20,9 @@ from gbrain.infrastructure.immich_gateway import (
 
 
 def test_immich_selection_validation() -> None:
-    # 1. Limite oltre 25 rifiutato
+    # Il limite totale è distinto dal batch remoto da 25 e arriva fino a 50.000.
     with pytest.raises(ValueError, match="item_limit"):
-        ImmichSelection(album_id="album-1", item_limit=26)
+        ImmichSelection(album_id="album-1", item_limit=50_001)
 
     # 2. Mutua esclusione album e intervallo temporale
     with pytest.raises(ValueError, match="mutuamente esclusive"):
@@ -268,11 +268,12 @@ async def test_immich_gateway_supports_verified_v3_3_3() -> None:
         assert caps.supports_search is True
         assert caps.supports_people is True
 
-        assets = await gw.search_period_assets(
+        assets, next_cursor = await gw.search_period_assets(
             after=datetime(2026, 1, 1, tzinfo=UTC),
             before=datetime(2026, 6, 1, tzinfo=UTC),
             limit=10,
         )
+        assert next_cursor is None
         assert len(assets) == 1
         assert assets[0].external_id == "asset-v3-1"
         assert len(assets[0].people) == 1

@@ -1386,7 +1386,7 @@ def test_immich_sources_endpoints_lifecycle() -> None:
     )
     with patch(
         "gbrain.infrastructure.immich_gateway.ImmichGateway.search_period_assets",
-        new=AsyncMock(return_value=[mock_asset]),
+        new=AsyncMock(return_value=([mock_asset], None)),
     ):
         prev_resp = client.get("/api/sources/immich/preview?limit=10")
         assert prev_resp.status_code == 200

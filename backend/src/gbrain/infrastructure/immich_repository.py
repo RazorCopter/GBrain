@@ -136,7 +136,12 @@ class AsyncPostgresImmichRepository:
                     job.duplicate_items = (job.duplicate_items or 0) + duplicate_count
                     job.processed_items = (job.processed_items or 0) + len(assets)
                     if checkpoint is not None:
-                        job.checkpoint = checkpoint
+                        job.checkpoint = {
+                            **checkpoint,
+                            "total_enumerated": job.processed_items,
+                            "total_inserted": job.imported_items,
+                            "total_duplicates": job.duplicate_items,
+                        }
 
         return inserted_count, duplicate_count
 

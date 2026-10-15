@@ -426,12 +426,13 @@ export interface SourcePreviewResponse {
 }
 
 export interface SourceSyncPayload {
+    selection?: 'all' | 'range' | 'album'
     album_id?: string | null
     period_after?: string | null
     period_before?: string | null
     item_limit?: number
     request_budget?: number
-    batch_size?: number
+    batch_size?: 25
     concurrency?: number
     mode?: 'full' | 'incremental' | 'reconciliation'
 }

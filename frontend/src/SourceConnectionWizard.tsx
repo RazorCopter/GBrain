@@ -1318,11 +1318,17 @@ export function SourceConnectionWizard({
                                     className="primary"
                                     disabled={!testResult?.connected || testingConnection}
                                     onClick={() => {
+                                        if (selectedSourceId === 'immich') {
+                                            onSuccess()
+                                            return
+                                        }
                                         setCurrentStep(5)
                                         handleLoadPreview()
                                     }}
                                 >
-                                    Continua all'anteprima dati →
+                                    {selectedSourceId === 'immich'
+                                        ? 'Completa collegamento'
+                                        : "Continua all'anteprima dati →"}
                                 </button>
                             </div>
                         </div>

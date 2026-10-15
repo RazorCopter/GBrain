@@ -9,7 +9,10 @@ from enum import StrEnum
 from typing import Any
 
 IMMICH_SOURCE_KIND = "immich"
-IMMICH_MAX_ITEMS_LIMIT = 25
+IMMICH_API_BATCH_SIZE = 25
+IMMICH_MAX_ITEMS_LIMIT = 50_000
+IMMICH_DEFAULT_ITEMS_LIMIT = 5_000
+IMMICH_DEFAULT_REQUEST_BUDGET = 200
 
 
 class ImmichDateSource(StrEnum):
@@ -75,7 +78,8 @@ class ImmichSelection:
     album_id: str | None = None
     after: datetime | None = None
     before: datetime | None = None
-    item_limit: int = IMMICH_MAX_ITEMS_LIMIT
+    import_all: bool = False
+    item_limit: int = IMMICH_DEFAULT_ITEMS_LIMIT
 
     def __post_init__(self) -> None:
         if self.item_limit < 1 or self.item_limit > IMMICH_MAX_ITEMS_LIMIT:
@@ -83,17 +87,19 @@ class ImmichSelection:
         if self.album_id is not None:
             if not self.album_id.strip():
                 raise ValueError("album_id non può essere una stringa vuota")
+            if self.import_all or self.after is not None or self.before is not None:
+                raise ValueError(
+                    "La selezione per album, intervallo e intera libreria sono mutuamente esclusive"
+                )
+        elif self.import_all:
             if self.after is not None or self.before is not None:
                 raise ValueError(
-                    "La selezione per album e la selezione temporale sono mutuamente esclusive"
+                    "La selezione dell'intera libreria e l'intervallo sono mutuamente esclusivi"
                 )
-        else:
-            if self.after is None and self.before is None:
-                raise ValueError(
-                    "Specificare un album_id oppure un intervallo temporale (after/before)"
-                )
-            if self.after is not None and self.before is not None and self.after >= self.before:
-                raise ValueError("after deve essere temporalmente antecedente a before")
+        elif self.after is None and self.before is None:
+            raise ValueError("Specificare un album_id, un intervallo temporale oppure import_all")
+        if self.after is not None and self.before is not None and self.after >= self.before:
+            raise ValueError("after deve essere temporalmente antecedente a before")
 
 
 @dataclass(frozen=True, slots=True)

@@ -927,7 +927,7 @@ async def preview_source_import(
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                         detail="Il limite inferiore UTC deve precedere quello superiore (intervallo [after, before)).",
                     )
-                assets = await gw.search_period_assets(after_dt, before_dt, limit=bounded_limit)
+                assets, _ = await gw.search_period_assets(after_dt, before_dt, limit=bounded_limit)
 
             samples = [
                 SourcePreviewSampleItem(
@@ -1113,19 +1113,36 @@ async def trigger_source_sync(
                 detail="Account Immich non connesso o non attivo. Esegui prima il test di connessione.",
             )
 
-        bounded_limit = min(body.item_limit, 25)
+        selection = body.selection or ("album" if body.album_id else "range")
+        item_limit = body.item_limit
         immich_job = ImportJob(
             id=uuid.uuid4(),
             source_kind="immich",
             connector_account_id=account.id,
             mode="full",
             status=ImportJobStatus.PENDING,
-            checkpoint={"phase": "queued", "item_limit": bounded_limit},
+            checkpoint={
+                "phase": "queued",
+                "cursor": None,
+                "album_offset": 0,
+                "total_enumerated": 0,
+                "total_inserted": 0,
+                "total_duplicates": 0,
+                "pages_completed": 0,
+                "item_limit": item_limit,
+                "request_budget": body.request_budget,
+                "batch_size": 25,
+            },
             policy_snapshot={
-                "album_id": body.album_id,
+                "selection": selection,
+                "album_id": body.album_id if selection == "album" else None,
                 "after": body.period_after.isoformat() if body.period_after else None,
                 "before": body.period_before.isoformat() if body.period_before else None,
-                "item_limit": bounded_limit,
+                "import_all": selection == "all",
+                "item_limit": item_limit,
+                "request_budget": body.request_budget,
+                "batch_size": 25,
+                "concurrency": 1,
             },
         )
         session.add(immich_job)
@@ -1154,7 +1171,7 @@ async def trigger_source_sync(
             queue_job_id=queue_job_id,
             status="pending",
             mode="full",
-            message=f"Job di sincronizzazione Immich avviato con limite massimo di {bounded_limit} asset.",
+            message=f"Job di sincronizzazione Immich avviato con limite totale di {item_limit} asset.",
         )
 
     if source_id != "gmail":
