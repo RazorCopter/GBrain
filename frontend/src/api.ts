@@ -430,11 +430,12 @@ export interface SourceSyncPayload {
     album_id?: string | null
     period_after?: string | null
     period_before?: string | null
-    item_limit?: number
-    request_budget?: number
+    item_limit?: number | null
+    request_budget?: number | null
     batch_size?: 25
     concurrency?: number
-    mode?: 'full' | 'incremental' | 'reconciliation'
+    mode?: 'full' | 'incremental' | 'reconciliation' | 'enrichment'
+    resume_from_job_id?: string | null
 }
 
 export interface SourceSyncResponse {

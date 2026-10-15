@@ -10,7 +10,6 @@ from gbrain.domain.immich import (
     IMMICH_API_BATCH_SIZE,
     IMMICH_DEFAULT_ITEMS_LIMIT,
     IMMICH_DEFAULT_REQUEST_BUDGET,
-    IMMICH_MAX_ITEMS_LIMIT,
     IMMICH_SOURCE_KIND,
     ImmichGatewayError,
     ImmichSelection,
@@ -130,16 +129,18 @@ async def execute_immich_job(
         after = datetime.fromisoformat(str(raw_after)) if raw_after else None
         before = datetime.fromisoformat(str(raw_before)) if raw_before else None
         import_all = bool(snapshot.get("import_all", False))
-        item_limit = int(snapshot.get("item_limit", IMMICH_DEFAULT_ITEMS_LIMIT))
-        request_budget = int(snapshot.get("request_budget", IMMICH_DEFAULT_REQUEST_BUDGET))
-        if request_budget < 1:
-            raise ValueError("request_budget deve essere positivo")
+        raw_item_limit = snapshot.get("item_limit", IMMICH_DEFAULT_ITEMS_LIMIT)
+        item_limit = None if raw_item_limit is None else int(raw_item_limit)
+        raw_request_budget = snapshot.get("request_budget", IMMICH_DEFAULT_REQUEST_BUDGET)
+        request_budget = None if raw_request_budget is None else int(raw_request_budget)
+        if request_budget is not None and request_budget < 1:
+            raise ValueError("request_budget deve essere positivo oppure null")
         selection = ImmichSelection(
             album_id=album_id,
             after=after,
             before=before,
             import_all=import_all,
-            item_limit=min(item_limit, IMMICH_MAX_ITEMS_LIMIT),
+            item_limit=item_limit,
         )
     except (TypeError, ValueError, OverflowError) as exc:
         logger.warning("Snapshot selezione Immich non valido per job %s: %s", job_id, exc)
@@ -161,9 +162,15 @@ async def execute_immich_job(
 
     total_enumerated = _checkpoint_int(checkpoint, "total_enumerated")
     total_inserted = _checkpoint_int(checkpoint, "total_inserted")
-    total_duplicates = _checkpoint_int(checkpoint, "total_duplicates")
+    total_updated = _checkpoint_int(checkpoint, "total_updated")
+    total_unchanged = _checkpoint_int(checkpoint, "total_unchanged")
+    if not total_unchanged:
+        total_unchanged = _checkpoint_int(checkpoint, "total_duplicates")
+    total_invalid = _checkpoint_int(checkpoint, "total_invalid")
     pages_completed = _checkpoint_int(checkpoint, "pages_completed")
     requests_completed = _checkpoint_int(checkpoint, "requests_completed")
+    high_water_raw = checkpoint.get("high_water_updated_at")
+    high_water_updated_at = high_water_raw if isinstance(high_water_raw, str) else None
     cursor_raw = checkpoint.get("cursor")
     cursor = cursor_raw if isinstance(cursor_raw, str) and cursor_raw else None
     album_offset = _checkpoint_int(checkpoint, "album_offset")
@@ -174,15 +181,19 @@ async def execute_immich_job(
         while True:
             if await _cancel_if_requested(database, parsed_job_id):
                 return
-            if total_enumerated >= selection.item_limit:
+            if selection.item_limit is not None and total_enumerated >= selection.item_limit:
                 stopped_reason = "item_limit_reached"
                 break
 
-            remaining = selection.item_limit - total_enumerated
+            remaining = (
+                selection.item_limit - total_enumerated
+                if selection.item_limit is not None
+                else IMMICH_API_BATCH_SIZE
+            )
             batch_limit = min(IMMICH_API_BATCH_SIZE, remaining)
             if selection.album_id is not None:
                 if album_assets is None:
-                    if requests_completed >= request_budget:
+                    if request_budget is not None and requests_completed >= request_budget:
                         stopped_reason = "request_budget_reached"
                         break
                     _, album_assets = await gateway.fetch_album_assets(selection.album_id)
@@ -192,7 +203,7 @@ async def execute_immich_job(
                 has_more = next_album_offset < len(album_assets)
                 next_cursor = None
             else:
-                if requests_completed >= request_budget:
+                if request_budget is not None and requests_completed >= request_budget:
                     stopped_reason = "request_budget_reached"
                     break
                 assets, next_cursor = await gateway.search_period_assets(
@@ -205,53 +216,55 @@ async def execute_immich_job(
                 next_album_offset = album_offset
                 has_more = next_cursor is not None
 
-            next_enumerated = total_enumerated + len(assets)
+            for asset in assets:
+                remote_updated_at = asset.metadata.get("remote_updated_at")
+                if isinstance(remote_updated_at, str) and (
+                    high_water_updated_at is None or remote_updated_at > high_water_updated_at
+                ):
+                    high_water_updated_at = remote_updated_at
+
             next_pages = pages_completed + 1
             next_checkpoint: dict[str, Any] = {
                 "phase": "paginating",
                 "cursor": next_cursor,
                 "album_offset": next_album_offset,
-                "total_enumerated": next_enumerated,
+                "total_enumerated": total_enumerated,
                 "total_inserted": total_inserted,
-                "total_duplicates": total_duplicates,
+                "total_updated": total_updated,
+                "total_unchanged": total_unchanged,
+                "total_duplicates": total_unchanged,
+                "total_invalid": total_invalid,
+                "total_missing": 0,
+                "missing_evaluation": "not_evaluated",
                 "pages_completed": next_pages,
                 "requests_completed": requests_completed,
                 "item_limit": selection.item_limit,
                 "request_budget": request_budget,
                 "batch_size": IMMICH_API_BATCH_SIZE,
+                "high_water_updated_at": high_water_updated_at,
+                "overlap_ready": True,
             }
 
+            raw_invalid = getattr(gateway, "last_invalid_count", 0)
+            batch_invalid = raw_invalid if type(raw_invalid) is int else 0
             async with database.session_factory() as session:
                 repo = AsyncPostgresImmichRepository(session)
-                inserted, duplicates = await repo.persist_asset_batch(
+                outcome = await repo.persist_asset_batch(
                     parsed_account_id,
                     assets,
                     job_id=parsed_job_id,
                     checkpoint=next_checkpoint,
+                    invalid_count=batch_invalid,
                 )
 
-            total_enumerated = next_enumerated
-            total_inserted += inserted
-            total_duplicates += duplicates
+            total_enumerated += len(assets) + outcome.invalid
+            total_inserted += outcome.inserted
+            total_updated += outcome.updated
+            total_unchanged += outcome.unchanged
+            total_invalid += outcome.invalid
             pages_completed = next_pages
             cursor = next_cursor
             album_offset = next_album_offset
-
-            # I contatori vengono riallineati dal checkpoint al riavvio; asset e posizione
-            # di resume sono già stati committati atomicamente dal repository.
-            async with database.session_factory() as session:
-                job = await session.get(ImportJob, parsed_job_id)
-                if job is not None:
-                    current = job.checkpoint if isinstance(job.checkpoint, dict) else {}
-                    job.checkpoint = {
-                        **current,
-                        "total_inserted": total_inserted,
-                        "total_duplicates": total_duplicates,
-                    }
-                    job.processed_items = total_enumerated
-                    job.imported_items = total_inserted
-                    job.duplicate_items = total_duplicates
-                    await session.commit()
 
             if not has_more:
                 stopped_reason = "source_exhausted"
@@ -267,10 +280,11 @@ async def execute_immich_job(
                 ImportJobStatus.COMPLETED_WITH_WARNINGS if incomplete else ImportJobStatus.COMPLETED
             )
             job.processed_items = total_enumerated
-            job.imported_items = total_inserted
-            job.duplicate_items = total_duplicates
+            job.imported_items = total_inserted + total_updated
+            job.duplicate_items = total_unchanged
             job.total_items = total_enumerated
             job.finished_at = datetime.now(UTC)
+            exhaustive = not incomplete and stopped_reason == "source_exhausted"
             job.checkpoint = {
                 **current,
                 "phase": "incomplete" if incomplete else "completed",
@@ -278,7 +292,15 @@ async def execute_immich_job(
                 "album_offset": album_offset,
                 "total_enumerated": total_enumerated,
                 "total_inserted": total_inserted,
-                "total_duplicates": total_duplicates,
+                "total_updated": total_updated,
+                "total_unchanged": total_unchanged,
+                "total_duplicates": total_unchanged,
+                "total_invalid": total_invalid,
+                "total_missing": 0,
+                "missing_evaluation": "not_evaluated",
+                "scan_exhaustive": exhaustive,
+                "high_water_updated_at": high_water_updated_at,
+                "overlap_ready": True,
                 "pages_completed": pages_completed,
                 "requests_completed": requests_completed,
                 "stopped_reason": stopped_reason,

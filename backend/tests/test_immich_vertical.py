@@ -453,3 +453,314 @@ async def test_immich_resume_budget_and_cooperative_cancel_contracts() -> None:
     assert cancelled.processed_items == 25
     assert cancelled.checkpoint["cursor"] == "next-page"
     cancel_gateway.search_period_assets.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_immich_repository_v1_to_v2_migration_semantics() -> None:
+    from gbrain.domain.immich import (
+        IMMICH_PIPELINE_VERSION,
+        IMMICH_SCHEMA_VERSION,
+        IMMICH_SOURCE_KIND,
+        compute_immich_v1_canonical_hash,
+    )
+    from gbrain.domain.models import SourceItem, SourceItemState, SourceRevision
+
+    session = InMemorySession()
+    repo = AsyncPostgresImmichRepository(session)  # type: ignore[arg-type]
+
+    account_id = uuid4()
+    item_id = uuid4()
+    asset_id = "migration-photo-1"
+    dt = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+
+    # 1. Creiamo lo stato esistente nel DB derivato da una precedente pipeline v1
+    v1_hash = compute_immich_v1_canonical_hash(
+        external_id=asset_id,
+        occurred_at=dt,
+        date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+        asset_type=ImmichAssetType.IMAGE,
+        albums=(),
+        description="Foto vacanza",
+        people=(),
+    )
+    v1_item = SourceItem(
+        id=item_id,
+        connector_account_id=account_id,
+        source_kind=IMMICH_SOURCE_KIND,
+        external_id=asset_id,
+        canonical_hash=v1_hash,
+        occurred_at=dt,
+        source_state=SourceItemState.ACTIVE,
+        last_observed_at=dt,
+    )
+    v1_rev = SourceRevision(
+        id=uuid4(),
+        source_item_id=item_id,
+        revision_number=1,
+        content_hash=v1_hash,
+        normalized_metadata={
+            "external_id": asset_id,
+            "asset_type": "IMAGE",
+            "occurred_at": dt.isoformat().replace("+00:00", "Z"),
+            "occurred_at_source": "dateTimeOriginal",
+            "description": "Foto vacanza",
+            "albums": [],
+            "people": [],
+        },
+        normalized_content={
+            "asset_id": asset_id,
+            "type": "IMAGE",
+            "description": "Foto vacanza",
+            "albums": [],
+            "people": [],
+        },
+        evidence={"provider": "immich", "version": "v1"},
+        pipeline_version="immich-meta-v1",
+        captured_at=dt,
+    )
+    session.add(v1_item)
+    session.add(v1_rev)
+
+    # 2. Prima osservazione v2 dell'asset SENZA nuovi metadati semantici:
+    # deve essere classificato unchanged, nessuna nuova revisione, canonical_hash intatto
+    v2_asset_same = ImmichNormalizedAsset(
+        external_id=asset_id,
+        occurred_at=dt,
+        date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+        asset_type=ImmichAssetType.IMAGE,
+        albums=(),
+        description="Foto vacanza",
+        people=(),
+        canonical_hash=compute_immich_canonical_hash(
+            external_id=asset_id,
+            occurred_at=dt,
+            date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+            asset_type=ImmichAssetType.IMAGE,
+            albums=(),
+            description="Foto vacanza",
+            people=(),
+            metadata={},
+        ),
+        provenance_payload={"metadata_only": True},
+        metadata={},
+    )
+
+    outcome1 = await repo.persist_asset_batch(account_id, [v2_asset_same])
+    assert outcome1.unchanged == 1
+    assert outcome1.updated == 0
+    assert outcome1.inserted == 0
+    assert v1_item.canonical_hash == v1_hash
+
+    # Verifica che non sia stata creata alcuna revisione 2
+    revs = list(session.revisions.values())
+    assert len(revs) == 1
+    assert revs[0].revision_number == 1
+
+    # 3. Seconda osservazione v2 CON nuovi metadati semantici (make, model, width, rating):
+    # deve creare esattamente la revisione 2 con schema_version 2 e aggiornare canonical_hash
+    v2_meta = {
+        "make": "Sony",
+        "model": "A7 IV",
+        "width_px": 7008,
+        "height_px": 4672,
+        "rating": 5,
+    }
+    v2_hash = compute_immich_canonical_hash(
+        external_id=asset_id,
+        occurred_at=dt,
+        date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+        asset_type=ImmichAssetType.IMAGE,
+        albums=(),
+        description="Foto vacanza",
+        people=(),
+        metadata=v2_meta,
+    )
+    v2_asset_enriched = ImmichNormalizedAsset(
+        external_id=asset_id,
+        occurred_at=dt,
+        date_source=ImmichDateSource.DATE_TIME_ORIGINAL,
+        asset_type=ImmichAssetType.IMAGE,
+        albums=(),
+        description="Foto vacanza",
+        people=(),
+        canonical_hash=v2_hash,
+        provenance_payload={"metadata_only": True},
+        metadata=v2_meta,
+    )
+
+    outcome2 = await repo.persist_asset_batch(account_id, [v2_asset_enriched])
+    assert outcome2.updated == 1
+    assert outcome2.unchanged == 0
+    assert outcome2.inserted == 0
+    assert v1_item.canonical_hash == v2_hash
+
+    revs2 = list(session.revisions.values())
+    assert len(revs2) == 2
+    rev2 = max(revs2, key=lambda r: r.revision_number)
+    assert rev2.revision_number == 2
+    assert rev2.pipeline_version == IMMICH_PIPELINE_VERSION
+    assert rev2.content_hash == v2_hash
+    assert rev2.normalized_metadata["schema_version"] == IMMICH_SCHEMA_VERSION
+    assert rev2.normalized_metadata["make"] == "Sony"
+
+    # 4. Replay successivo identico: invariato, nessuna revisione 3
+    outcome3 = await repo.persist_asset_batch(account_id, [v2_asset_enriched])
+    assert outcome3.unchanged == 1
+    assert outcome3.updated == 0
+    revs3 = list(session.revisions.values())
+    assert len(revs3) == 2
+
+
+@pytest.mark.asyncio
+async def test_immich_repository_tracks_invalid_outcome_atomically() -> None:
+    session = InMemorySession()
+    repo = AsyncPostgresImmichRepository(session)  # type: ignore[arg-type]
+
+    account_id = uuid4()
+    job_id = uuid4()
+    job = ImportJob(
+        id=job_id,
+        source_kind="immich",
+        connector_account_id=account_id,
+        mode="full",
+        status=ImportJobStatus.RUNNING,
+        checkpoint={"total_invalid": 1},
+    )
+    session.add(job)
+
+    valid_asset = _sample_asset("valid-asset-1")
+    outcome = await repo.persist_asset_batch(
+        account_id,
+        [valid_asset],
+        job_id=job_id,
+        checkpoint={"phase": "paginating", "total_invalid": 1},
+        invalid_count=2,
+    )
+
+    assert outcome.inserted == 1
+    assert outcome.invalid == 2
+    assert job.not_imported_items == 2
+    assert job.checkpoint["total_invalid"] == 3
+    assert job.checkpoint["missing_evaluation"] == "not_evaluated"
+
+
+@pytest.mark.asyncio
+async def test_immich_job_enrichment_unbounded_and_resume_tranche() -> None:
+    session = InMemorySession()
+    db = FakeDatabase(session)
+    owner_id = uuid4()
+    account_id = uuid4()
+    job_id = uuid4()
+
+    owner = OwnerAccount(
+        id=owner_id,
+        owner_slot=1,
+        username="enrich_user",
+        display_name="Enrich User",
+        password_hash="dummy_hash_for_test",  # noqa: S106
+    )
+    account = ConnectorAccount(
+        id=account_id,
+        owner_id=owner_id,
+        connector_kind="immich",
+        external_account_id="inst-enrich",
+        primary_email="user@enrich.test",
+        status=ConnectorAccountStatus.ACTIVE,
+    )
+    settings = _test_settings()
+    raw_creds = json.dumps({"base_url": "http://127.0.0.1:2283", "api_key": "enrich-key"}).encode(
+        "utf-8"
+    )
+    enc_creds = encrypt_payload(raw_creds, settings.source_credentials_encryption_key)
+    cred = SourceClientCredential(
+        owner_id=owner_id,
+        source_kind="immich",
+        auth_method="api_key",
+        client_type="api_token",
+        encrypted_credentials=enc_creds,
+        is_active=True,
+    )
+    session.add(owner)
+    session.add(account)
+    session.add(cred)
+
+    # Tranche 1: enrichment con budget richieste a 2 (50 elementi totali), item_limit=None
+    job1 = ImportJob(
+        id=job_id,
+        source_kind="immich",
+        connector_account_id=account_id,
+        mode="enrichment",
+        status=ImportJobStatus.PENDING,
+        checkpoint={"phase": "queued"},
+        policy_snapshot={
+            "import_all": True,
+            "item_limit": None,
+            "request_budget": 2,
+        },
+    )
+    session.add(job1)
+
+    mock_gw = MagicMock()
+    mock_gw.search_period_assets = AsyncMock(
+        side_effect=[
+            ([_sample_asset(f"enrich-p1-{i}") for i in range(25)], "cursor-page-2"),
+            ([_sample_asset(f"enrich-p2-{i}") for i in range(25)], "cursor-page-3"),
+            ([_sample_asset(f"enrich-p3-{i}") for i in range(10)], None),
+        ]
+    )
+
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,
+        job_id=str(job_id),
+        account_id=str(account_id),
+        mode="enrichment",
+        gateway_factory=lambda url, key: mock_gw,
+    )
+
+    final_job1 = await session.get(ImportJob, job_id)
+    assert final_job1.status == ImportJobStatus.COMPLETED_WITH_WARNINGS
+    assert final_job1.checkpoint["phase"] == "incomplete"
+    assert final_job1.checkpoint["cursor"] == "cursor-page-3"
+    assert final_job1.checkpoint["requests_completed"] == 2
+    assert final_job1.processed_items == 50
+
+    # Tranche 2: ripresa a partire dal cursore della tranche precedente (cursor-page-3)
+    job2_id = uuid4()
+    job2 = ImportJob(
+        id=job2_id,
+        source_kind="immich",
+        connector_account_id=account_id,
+        mode="enrichment",
+        status=ImportJobStatus.PENDING,
+        checkpoint={
+            "phase": "resuming",
+            "cursor": final_job1.checkpoint["cursor"],
+            "total_enumerated": final_job1.processed_items,
+            "total_inserted": final_job1.checkpoint["total_inserted"],
+            "total_updated": final_job1.checkpoint["total_updated"],
+            "total_unchanged": final_job1.checkpoint["total_unchanged"],
+            "total_duplicates": final_job1.checkpoint["total_duplicates"],
+        },
+        policy_snapshot={
+            "import_all": True,
+            "item_limit": None,
+            "request_budget": 2,
+        },
+    )
+    session.add(job2)
+
+    await execute_immich_job(
+        db,  # type: ignore[arg-type]
+        settings,
+        job_id=str(job2_id),
+        account_id=str(account_id),
+        mode="enrichment",
+        gateway_factory=lambda url, key: mock_gw,
+    )
+
+    final_job2 = await session.get(ImportJob, job2_id)
+    assert final_job2.status == ImportJobStatus.COMPLETED
+    assert final_job2.checkpoint["phase"] == "completed"
+    assert final_job2.checkpoint["scan_exhaustive"] is True
+    assert final_job2.processed_items == 60

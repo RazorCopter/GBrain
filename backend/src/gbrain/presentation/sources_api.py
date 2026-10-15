@@ -1113,34 +1113,98 @@ async def trigger_source_sync(
                 detail="Account Immich non connesso o non attivo. Esegui prima il test di connessione.",
             )
 
-        selection = body.selection or ("album" if body.album_id else "range")
-        item_limit = body.item_limit
+        enrichment = body.mode == "enrichment"
+        selection = (
+            "all" if enrichment else body.selection or ("album" if body.album_id else "range")
+        )
+        item_limit = None if (enrichment and body.item_limit is None) else body.item_limit
+        request_budget = (
+            body.request_budget if (not enrichment or body.request_budget is not None) else None
+        )
+        job_mode = "enrichment" if enrichment else "full"
+
+        initial_checkpoint: dict[str, Any] = {
+            "phase": "queued",
+            "cursor": None,
+            "album_offset": 0,
+            "total_enumerated": 0,
+            "total_inserted": 0,
+            "total_updated": 0,
+            "total_unchanged": 0,
+            "total_duplicates": 0,
+            "total_invalid": 0,
+            "total_missing": 0,
+            "missing_evaluation": "not_evaluated",
+            "pages_completed": 0,
+            "requests_completed": 0,
+            "item_limit": item_limit,
+            "request_budget": request_budget,
+            "batch_size": 25,
+        }
+
+        if body.resume_from_job_id is not None:
+            prev_job = await session.get(ImportJob, body.resume_from_job_id)
+            if (
+                prev_job is not None
+                and prev_job.connector_account_id == account.id
+                and prev_job.source_kind == "immich"
+                and isinstance(prev_job.checkpoint, dict)
+            ):
+                cp = prev_job.checkpoint
+                initial_checkpoint.update(
+                    {
+                        "phase": "resuming",
+                        "cursor": cp.get("cursor"),
+                        "album_offset": int(cp["album_offset"])
+                        if cp.get("album_offset") is not None
+                        else 0,
+                        "total_enumerated": int(cp["total_enumerated"])
+                        if cp.get("total_enumerated") is not None
+                        else 0,
+                        "total_inserted": int(cp["total_inserted"])
+                        if cp.get("total_inserted") is not None
+                        else 0,
+                        "total_updated": int(cp["total_updated"])
+                        if cp.get("total_updated") is not None
+                        else 0,
+                        "total_unchanged": int(cp["total_unchanged"])
+                        if cp.get("total_unchanged") is not None
+                        else (
+                            int(cp["total_duplicates"])
+                            if cp.get("total_duplicates") is not None
+                            else 0
+                        ),
+                        "total_duplicates": int(cp["total_duplicates"])
+                        if cp.get("total_duplicates") is not None
+                        else 0,
+                        "total_invalid": int(cp["total_invalid"])
+                        if cp.get("total_invalid") is not None
+                        else 0,
+                        "high_water_updated_at": cp.get("high_water_updated_at"),
+                    }
+                )
+
         immich_job = ImportJob(
             id=uuid.uuid4(),
             source_kind="immich",
             connector_account_id=account.id,
-            mode="full",
+            mode=job_mode,
             status=ImportJobStatus.PENDING,
-            checkpoint={
-                "phase": "queued",
-                "cursor": None,
-                "album_offset": 0,
-                "total_enumerated": 0,
-                "total_inserted": 0,
-                "total_duplicates": 0,
-                "pages_completed": 0,
-                "item_limit": item_limit,
-                "request_budget": body.request_budget,
-                "batch_size": 25,
-            },
+            checkpoint=initial_checkpoint,
             policy_snapshot={
                 "selection": selection,
                 "album_id": body.album_id if selection == "album" else None,
-                "after": body.period_after.isoformat() if body.period_after else None,
-                "before": body.period_before.isoformat() if body.period_before else None,
+                "after": body.period_after.isoformat()
+                if body.period_after and not enrichment
+                else None,
+                "before": body.period_before.isoformat()
+                if body.period_before and not enrichment
+                else None,
                 "import_all": selection == "all",
                 "item_limit": item_limit,
-                "request_budget": body.request_budget,
+                "request_budget": request_budget,
+                "pipeline_version": "immich-meta-v2",
+                "gps_policy": "withhold_exact",
                 "batch_size": 25,
                 "concurrency": 1,
             },
@@ -1158,20 +1222,31 @@ async def trigger_source_sync(
             ).defer_async(
                 job_id=str(immich_job.id),
                 account_id=str(account.id),
-                mode="full",
+                mode=job_mode,
             )
             immich_job.queue_job_id = queue_job_id
             await session.commit()
         except Exception as exc:
             logger.warning("Accodamento Procrastinate Immich non riuscito: %s", exc)
 
+        limit_desc = (
+            "senza limite asset"
+            if item_limit is None
+            else f"con limite totale di {item_limit} asset"
+        )
+        message = (
+            f"Job di analisi completa Immich (enrichment) avviato {limit_desc}."
+            if enrichment
+            else f"Job di sincronizzazione Immich avviato con limite totale di {item_limit} asset."
+        )
+
         return SourceSyncResponse(
             source_id="immich",
             job_id=immich_job.id,
             queue_job_id=queue_job_id,
             status="pending",
-            mode="full",
-            message=f"Job di sincronizzazione Immich avviato con limite totale di {item_limit} asset.",
+            mode=job_mode,
+            message=message,
         )
 
     if source_id != "gmail":
@@ -1214,6 +1289,12 @@ async def trigger_source_sync(
             status=job.status.value,
             mode=job.mode or "incremental",
             message=f"Job di sincronizzazione Gmail avviato in modalità {job.mode}.",
+        )
+
+    if body.item_limit is None or body.request_budget is None or body.mode == "enrichment":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Gmail richiede item_limit e request_budget numerici e non supporta enrichment.",
         )
 
     before_dt = body.period_before or datetime.now(UTC)

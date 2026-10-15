@@ -1405,6 +1405,24 @@ def test_immich_sources_endpoints_lifecycle() -> None:
     assert sync_data["source_id"] == "immich"
     assert sync_data["queue_job_id"] == 999
 
+    # 7b. Test sincronizzazione in modalità enrichment con item_limit e request_budget null
+    enrich_resp = client.post(
+        "/api/sources/immich/sync",
+        json={"mode": "enrichment", "item_limit": None, "request_budget": None},
+    )
+    assert enrich_resp.status_code == 200
+    enrich_data = enrich_resp.json()
+    assert enrich_data["source_id"] == "immich"
+    assert enrich_data["mode"] == "enrichment"
+    assert "analisi completa" in enrich_data["message"].lower()
+
+    # 7c. Test che Gmail rifiuti categoricamente enrichment o parametri null
+    gmail_bad_enrich = client.post(
+        "/api/sources/gmail/sync",
+        json={"mode": "enrichment", "item_limit": None, "request_budget": None},
+    )
+    assert gmail_bad_enrich.status_code in (400, 422)
+
     # 8. Consultazione items importati
     items_resp = client.get("/api/sources/immich/items")
     assert items_resp.status_code == 200

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Contratto OpenAPI: https://raw.githubusercontent.com/immich-app/immich/v3.3.3/open-api/immich-openapi-specs.json
+# SHA-256: 6c665f5d729a6c057385a187e33b8f1a9e86442caec2f5f0fc6ea483ccee3623
 import json
 from datetime import UTC, datetime
 
@@ -467,3 +469,140 @@ async def test_immich_fetch_album_bounded_to_limit() -> None:
         assert len(assets) == 25
         assert assets[0].external_id == "asset-0"
         assert assets[24].external_id == "asset-24"
+
+
+def test_immich_v3_openapi_fixture_contract_compliance() -> None:
+    from pathlib import Path
+
+    fixture_path = Path(__file__).parent / "fixtures" / "immich_openapi_v3.3.3.json"
+    assert fixture_path.exists(), "La fixture OpenAPI Immich 3.3.3 deve essere presente"
+
+    with fixture_path.open("r", encoding="utf-8") as f:
+        spec = json.load(f)
+
+    schemas = spec["components"]["schemas"]
+
+    # 1. Verifica presenza dei DTO chiave
+    assert "AssetResponseDto" in schemas
+    assert "ExifResponseDto" in schemas
+    assert "MetadataSearchDto" in schemas
+    assert "SearchAssetResponseDto" in schemas
+    assert "AlbumResponseDto" in schemas
+
+    asset_props = schemas["AssetResponseDto"]["properties"]
+    exif_props = schemas["ExifResponseDto"]["properties"]
+    search_props = schemas["MetadataSearchDto"]["properties"]
+
+    # 2. Verifica che withExif e withPeople siano supportati da MetadataSearchDto
+    assert "withExif" in search_props
+    assert search_props["withExif"]["type"] == "boolean"
+    assert "withPeople" in search_props
+    assert search_props["withPeople"]["type"] == "boolean"
+
+    # 3. Conferma limite architetturale: AssetResponseDto non contiene album inline
+    assert "albums" not in asset_props
+    assert "albumIds" not in asset_props
+
+    # 4. Verifica che i campi usati dal mapper esistano nello schema ufficiale
+    asset_fields = [
+        "checksum",
+        "originalFileName",
+        "originalMimeType",
+        "width",
+        "height",
+        "duration",
+        "fileCreatedAt",
+        "fileModifiedAt",
+        "updatedAt",
+        "localDateTime",
+        "isFavorite",
+        "isArchived",
+        "isTrashed",
+        "visibility",
+        "duplicateId",
+        "livePhotoVideoId",
+        "stack",
+    ]
+    for field in asset_fields:
+        assert field in asset_props, f"Campo {field} non trovato in AssetResponseDto"
+
+    exif_fields = [
+        "dateTimeOriginal",
+        "modifyDate",
+        "timeZone",
+        "make",
+        "model",
+        "lensModel",
+        "exposureTime",
+        "iso",
+        "focalLength",
+        "fNumber",
+        "orientation",
+        "city",
+        "state",
+        "country",
+        "rating",
+        "latitude",
+        "longitude",
+    ]
+    for field in exif_fields:
+        assert field in exif_props, f"Campo {field} non trovato in ExifResponseDto"
+
+    # 5. Verifica privacy: campi sensibili presenti nello spec ma esclusi dal nostro modello/hash
+    from gbrain.domain.immich import IMMICH_HASH_EXCLUDED_KEYS, IMMICH_V2_SEMANTIC_METADATA_KEYS
+
+    assert "originalPath" in asset_props  # path server
+    assert "ownerId" in asset_props  # identificativo utente
+    assert "originalPath" not in IMMICH_V2_SEMANTIC_METADATA_KEYS
+    assert "ownerId" not in IMMICH_V2_SEMANTIC_METADATA_KEYS
+    assert "latitude" not in IMMICH_V2_SEMANTIC_METADATA_KEYS
+    assert "longitude" not in IMMICH_V2_SEMANTIC_METADATA_KEYS
+    assert "remote_updated_at" in IMMICH_HASH_EXCLUDED_KEYS
+
+
+@pytest.mark.asyncio
+async def test_immich_gateway_skips_invalid_assets_and_tracks_count() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/server/version":
+            return httpx.Response(200, json={"major": 3, "minor": 3, "patch": 3})
+        if request.url.path == "/api/search/metadata":
+            return httpx.Response(
+                200,
+                json={
+                    "assets": {
+                        "count": 3,
+                        "total": 3,
+                        "items": [
+                            {
+                                "id": "valid-1",
+                                "type": "IMAGE",
+                                "fileCreatedAt": "2026-05-01T10:00:00Z",
+                                "localDateTime": "2026-05-01T12:00:00",
+                            },
+                            {
+                                "id": "",  # Non valido: ID vuoto
+                                "type": "IMAGE",
+                                "localDateTime": "2026-05-01T12:00:00",
+                            },
+                            {
+                                "id": "valid-2",
+                                "type": "IMAGE",
+                                "fileCreatedAt": "2026-05-01T10:00:00Z",
+                                "localDateTime": "2026-05-01T12:00:00",
+                            },
+                        ],
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://immich.test"
+    ) as client:
+        gw = ImmichGateway("https://immich.test", "key", client=client)
+        assets, _ = await gw.search_period_assets(None, None, limit=25)
+
+        assert len(assets) == 2
+        assert assets[0].external_id == "valid-1"
+        assert assets[1].external_id == "valid-2"
+        assert gw.last_invalid_count == 1

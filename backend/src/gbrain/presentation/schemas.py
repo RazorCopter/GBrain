@@ -553,13 +553,13 @@ class SourceSyncRequest(BaseModel):
     album_id: str | None = None
     period_after: datetime | None = None
     period_before: datetime | None = None
-    # I default e il range del contratto condiviso restano compatibili con Gmail.
-    # Il percorso Immich applica autonomamente batch remoto fisso a 25 e limite totale.
-    item_limit: int = Field(default=500, ge=1, le=50000)
-    request_budget: int = Field(default=200, ge=1, le=2000)
+    # null è ammesso per Immich enrichment; Gmail continua a validare i propri endpoint.
+    item_limit: int | None = Field(default=500, ge=1, le=50000)
+    request_budget: int | None = Field(default=200, ge=1, le=2000)
     batch_size: int = Field(default=25, ge=1, le=500)
     concurrency: int = Field(default=1, ge=1, le=1)
-    mode: Literal["full", "incremental", "reconciliation"] = "full"
+    mode: Literal["full", "incremental", "reconciliation", "enrichment"] = "full"
+    resume_from_job_id: UUID | None = None
 
     @model_validator(mode="after")
     def validate_selection(self) -> SourceSyncRequest:
@@ -567,7 +567,9 @@ class SourceSyncRequest(BaseModel):
         if selected is None:
             # Compatibilità multi-connettore: la validazione specifica Immich è attivata
             # soltanto quando il chiamante dichiara la selezione, oppure usa i suoi campi.
-            if self.album_id:
+            if self.mode == "enrichment":
+                selected = "all"
+            elif self.album_id:
                 selected = "album"
             elif self.period_after is not None or self.period_before is not None:
                 selected = "range"

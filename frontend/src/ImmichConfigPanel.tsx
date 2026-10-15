@@ -29,8 +29,13 @@ export function ImmichConfigPanel({ onClose }: ImmichConfigPanelProps) {
     const running = Boolean(status?.active_job && !terminal.has(status.active_job.status))
     const checkpoint = job?.checkpoint ?? {}
     const processed = Number(checkpoint.total_enumerated ?? job?.processed_items ?? 0)
-    const limit = Number(checkpoint.item_limit ?? itemLimit)
-    const percent = Math.min(100, limit > 0 ? Math.round((processed / limit) * 100) : 0)
+    const rawLimit = checkpoint.item_limit
+    const limit = rawLimit == null && job?.mode === 'enrichment' ? null : Number(rawLimit ?? itemLimit)
+    const percent = limit == null ? null : Math.min(100, limit > 0 ? Math.round((processed / limit) * 100) : 0)
+    const inserted = Number(checkpoint.total_inserted ?? 0)
+    const updated = Number(checkpoint.total_updated ?? 0)
+    const unchanged = Number(checkpoint.total_unchanged ?? checkpoint.total_duplicates ?? 0)
+    const invalid = Number(checkpoint.total_invalid ?? 0)
 
     async function refresh() {
         try {
@@ -81,6 +86,54 @@ export function ImmichConfigPanel({ onClose }: ImmichConfigPanelProps) {
         }
     }
 
+    async function startEnrichment() {
+        const confirmed = window.confirm(
+            'Attenzione: «Forza analisi completa» riesaminerà tutti i metadati dell\'intera libreria Immich dall\'inizio (senza limiti di asset o richieste).' +
+            '\n\nL\'operazione può richiedere molto tempo e un numero elevato di richieste alle API remote. Può comunque essere annullata in sicurezza tra un batch e l\'altro.\n\nConfermi l\'avvio?'
+        )
+        if (!confirmed) return
+
+        setStarting(true)
+        setError('')
+        try {
+            await api.triggerSourceSync('immich', {
+                selection: 'all',
+                item_limit: null,
+                request_budget: null,
+                batch_size: 25,
+                concurrency: 1,
+                mode: 'enrichment',
+            })
+            await refresh()
+        } catch (err) {
+            setError(err instanceof ApiError ? err.message : 'Avvio analisi completa Immich non riuscito.')
+        } finally {
+            setStarting(false)
+        }
+    }
+
+    async function resumeTranche() {
+        if (!job) return
+        setStarting(true)
+        setError('')
+        try {
+            await api.triggerSourceSync('immich', {
+                selection: 'all',
+                item_limit: null,
+                request_budget: null,
+                batch_size: 25,
+                concurrency: 1,
+                mode: 'enrichment',
+                resume_from_job_id: job.id,
+            })
+            await refresh()
+        } catch (err) {
+            setError(err instanceof ApiError ? err.message : 'Ripresa tranche Immich non riuscita.')
+        } finally {
+            setStarting(false)
+        }
+    }
+
     async function cancelImport() {
         if (!job) return
         setCancelling(true)
@@ -111,6 +164,7 @@ export function ImmichConfigPanel({ onClose }: ImmichConfigPanelProps) {
                     <p className="eyebrow">Immich · Metadata only</p>
                     <h2 id="immich-panel-title">Importazione libreria</h2>
                     <p>Gli originali restano in Immich. GBrain legge solo metadati, senza vision o ML.</p>
+                    <p>Le coordinate GPS esatte non vengono memorizzate; restano solo località testuali e indicazione di presenza.</p>
                 </div>
                 <button type="button" className="secondary compact" onClick={onClose}>Chiudi</button>
             </header>
@@ -120,6 +174,20 @@ export function ImmichConfigPanel({ onClose }: ImmichConfigPanelProps) {
                 <div className="immich-panel-grid">
                     <form className="immich-config-card" onSubmit={startImport}>
                         <h3>Nuova importazione</h3>
+                        <div className="analysis-callout">
+                            <strong>Metadata v2</strong>
+                            <p>Riesamina l'intera libreria dall'inizio. Può richiedere molto tempo e molte richieste, ma non ha un tetto arbitrario e può essere annullata tra i batch.</p>
+                            <div className="callout-actions">
+                                <button type="button" className="secondary" disabled={running || starting} onClick={() => void startEnrichment()}>
+                                    {starting ? 'Avvio…' : 'Forza analisi completa'}
+                                </button>
+                                {job?.status === 'completed_with_warnings' && checkpoint.phase === 'incomplete' && (
+                                    <button type="button" className="secondary" disabled={running || starting} onClick={() => void resumeTranche()}>
+                                        Riprendi tranche interrotta
+                                    </button>
+                                )}
+                            </div>
+                        </div>
                         <div className="selection-toggle">
                             <button type="button" className={selection === 'range' ? 'active' : ''} onClick={() => setSelection('range')}>Intervallo date</button>
                             <button type="button" className={selection === 'all' ? 'active' : ''} onClick={() => setSelection('all')}>Intera libreria</button>
@@ -141,11 +209,14 @@ export function ImmichConfigPanel({ onClose }: ImmichConfigPanelProps) {
                     <article className={`immich-progress-card ${running ? 'is-running' : ''}`}>
                         <div className="card-top-row"><h3>Progresso</h3><span className="status-pill active">{stateLabel}</span></div>
                         <strong className="immich-progress-value">{processed.toLocaleString('it-IT')}</strong>
-                        <span className="muted">asset elaborati su un massimo di {limit.toLocaleString('it-IT')}</span>
-                        <div className="immich-progress-track" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${percent}%` }} /></div>
+                        <span className="muted">{limit == null ? 'asset analizzati, senza limite' : `asset elaborati su un massimo di ${limit.toLocaleString('it-IT')}`}</span>
+                        <div className="immich-progress-track" role="progressbar" aria-valuenow={percent ?? undefined} aria-valuemin={0} aria-valuemax={100}><span className={percent == null ? 'indeterminate' : ''} style={{ width: `${percent ?? 100}%` }} /></div>
                         <div className="immich-metrics">
-                            <span><strong>{Number(checkpoint.total_inserted ?? job?.imported_items ?? 0)}</strong> importati</span>
-                            <span><strong>{Number(checkpoint.total_duplicates ?? job?.duplicate_items ?? 0)}</strong> già presenti</span>
+                            <span><strong>{inserted}</strong> prima analisi</span>
+                            <span><strong>{updated}</strong> aggiornati</span>
+                            <span><strong>{unchanged}</strong> invariati</span>
+                            <span><strong>{invalid}</strong> errori</span>
+                            <span><strong>non valutati</strong> mancanti</span>
                             <span><strong>{Number(checkpoint.pages_completed ?? 0)}</strong> batch</span>
                         </div>
                         {job?.error_detail && <p className="alert warning">{job.error_detail}</p>}

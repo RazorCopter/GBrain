@@ -150,6 +150,7 @@ class ImmichGateway:
             )
         self._api_key = clean_key
         self._custom_client = client
+        self.last_invalid_count: int = 0
 
     def _client(self) -> httpx.AsyncClient:
         if self._custom_client is not None:
@@ -462,11 +463,18 @@ class ImmichGateway:
             raw_assets = []
 
         selected_assets = raw_assets if limit is None else raw_assets[: min(max(limit, 1), 25)]
-        normalized = [
-            self.normalize_asset(asset, albums=(album_info,))
-            for asset in selected_assets
-            if isinstance(asset, dict)
-        ]
+        normalized: list[ImmichNormalizedAsset] = []
+        invalid_count = 0
+        for asset in selected_assets:
+            if not isinstance(asset, dict):
+                invalid_count += 1
+                continue
+            try:
+                normalized.append(self.normalize_asset(asset, albums=(album_info,)))
+            except (ValueError, ImmichGatewayError) as exc:
+                logger.warning("Scartato asset Immich non valido nell'album %s: %s", album_id, exc)
+                invalid_count += 1
+        self.last_invalid_count = invalid_count
         return album_info, normalized
 
     async def search_period_assets(
@@ -554,7 +562,18 @@ class ImmichGateway:
             )
 
         bounded = items[:bounded_limit]
-        normalized = [self.normalize_asset(a) for a in bounded if isinstance(a, dict)]
+        normalized: list[ImmichNormalizedAsset] = []
+        invalid_count = 0
+        for a in bounded:
+            if not isinstance(a, dict):
+                invalid_count += 1
+                continue
+            try:
+                normalized.append(self.normalize_asset(a))
+            except (ValueError, ImmichGatewayError) as exc:
+                logger.warning("Scartato asset Immich non valido durante la search: %s", exc)
+                invalid_count += 1
+        self.last_invalid_count = invalid_count
         if parsed_version == SUPPORTED_V3_VERSION:
             raw_next_cursor = assets_container.get("nextCursor")
             if raw_next_cursor is not None and not isinstance(raw_next_cursor, str):
